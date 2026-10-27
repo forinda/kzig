@@ -150,13 +150,17 @@ pub const Session = struct {
             w.writeAll("]}") catch |e| break :blk e;
         }) catch return error.OutOfMemory;
         var out: std.Io.Writer.Allocating = .init(a);
-        const auth: []const std.http.Header = if (s.client.authorization) |v| &.{.{ .name = "authorization", .value = v }} else &.{};
         const res = s.client.http.fetch(.{
             .location = .{ .url = s.endpoint orelse s.client.endpoint },
             .method = .POST,
             .payload = body.written(),
-            .headers = .{ .content_type = .{ .override = "application/json" } },
-            .privileged_headers = auth,
+            // `privileged_headers` aren't sent by std 0.17's client; the
+            // token goes in `authorization`, and no redirect carries it on.
+            .headers = .{
+                .content_type = .{ .override = "application/json" },
+                .authorization = if (s.client.authorization) |v| .{ .override = v } else .default,
+            },
+            .redirect_behavior = .unhandled,
             .response_writer = &out.writer,
         }) catch |err| {
             if (!builtin.is_test) std.log.err("db: libsql {s}: {t}", .{ s.client.endpoint, err });
@@ -315,4 +319,88 @@ test "libsql: a stream the server dropped fails the transaction; nothing half-co
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     try testing.expectEqual(0, (try pool.query(arena.allocator(), struct { v: i64 }, "SELECT v FROM kzig_lb", .{})).len);
+}
+
+/// Records each request's target, baton and authorization; answers as sqld.
+const FakeHrana = struct {
+    listener: std.Io.net.Server,
+    fut: std.Io.Future(void) = undefined,
+    log: [8][160]u8 = undefined,
+    n: usize = 0,
+
+    fn start(f: *FakeHrana) !void {
+        const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+        f.* = .{ .listener = try address.listen(testing.io, .{ .reuse_address = true }) };
+        f.fut = try testing.io.concurrent(serve, .{f});
+    }
+
+    fn stop(f: *FakeHrana) void {
+        f.fut.cancel(testing.io);
+        f.listener.deinit(testing.io);
+    }
+
+    fn port(f: *FakeHrana) u16 {
+        return f.listener.socket.address.getPort();
+    }
+
+    fn serve(f: *FakeHrana) void {
+        while (true) {
+            const stream = f.listener.accept(testing.io) catch return;
+            defer stream.close(testing.io);
+            var rbuf: [8192]u8 = undefined;
+            var wbuf: [8192]u8 = undefined;
+            var sr = stream.reader(testing.io, &rbuf);
+            var sw = stream.writer(testing.io, &wbuf);
+            var server = std.http.Server.init(&sr.interface, &sw.interface);
+            while (true) {
+                var req = server.receiveHead() catch break;
+                f.answer(&req) catch break;
+            }
+        }
+    }
+
+    fn answer(f: *FakeHrana, req: *std.http.Server.Request) !void {
+        var auth: []const u8 = "-";
+        var it = req.iterateHeaders();
+        while (it.next()) |h| if (std.ascii.eqlIgnoreCase(h.name, "authorization")) {
+            auth = h.value;
+        };
+        var line: [160]u8 = undefined;
+        const head = try std.fmt.bufPrint(&line, "{s} {s}", .{ req.head.target, auth });
+        var body_buf: [4096]u8 = undefined;
+        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena.deinit();
+        const body = try req.server.reader.bodyReader(&body_buf, req.head.transfer_encoding, req.head.content_length).allocRemaining(arena.allocator(), .limited(1 << 16));
+        const v = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), body, .{});
+        const baton = v.object.get("baton").?;
+        const logged = try std.fmt.bufPrint(&f.log[f.n], "{s} {s}", .{ head, if (baton == .string) baton.string else "null" });
+        f.log[f.n][logged.len] = 0;
+        f.n += 1;
+        // A stream's first answer names a replica to keep it on.
+        var reply: [512]u8 = undefined;
+        const text = try std.fmt.bufPrint(&reply,
+            \\{{"baton":"b{d}","base_url":"http://127.0.0.1:{d}/replica","results":[{{"type":"ok","response":{{"type":"execute","result":{{"cols":[],"rows":[],"affected_row_count":0,"last_insert_rowid":null}}}}}}]}}
+        , .{ f.n, f.port() });
+        try req.respond(text, .{ .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }} });
+    }
+
+    fn entry(f: *FakeHrana, i: usize) []const u8 {
+        return std.mem.sliceTo(&f.log[i], 0);
+    }
+};
+
+test "libsql: the token goes in Authorization; a stream follows the base_url its server names" {
+    var fake: FakeHrana = undefined;
+    try fake.start();
+    defer fake.stop();
+    var buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&buf, "http://127.0.0.1:{d}?authToken=tok", .{fake.port()});
+    var pool: db.Pool = try .init(testing.io, testing.allocator, .{ .url = url });
+    defer pool.deinit();
+    var tx = try pool.begin();
+    _ = try tx.exec("INSERT INTO t VALUES (?1)", .{1});
+    tx.conn.?.libsql.keep = false; // let close end the stream without a COMMIT round
+    tx.deinit();
+    try testing.expectEqualStrings("/v2/pipeline Bearer tok null", fake.entry(0));
+    try testing.expectEqualStrings("/replica/v2/pipeline Bearer tok b1", fake.entry(1));
 }
