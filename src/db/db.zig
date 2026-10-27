@@ -12,6 +12,7 @@
 //! try tx.commit();
 //! ```
 const std = @import("std");
+const builtin = @import("builtin");
 pub const pg = @import("pg.zig");
 pub const migrate = @import("migrate.zig");
 pub const Timestamp = @import("timestamp.zig").Timestamp;
@@ -62,6 +63,10 @@ pub const Options = struct {
     max_connections: u32 = 10,
     /// Server-side; 0 leaves the server's default.
     statement_timeout_ms: u32 = 0,
+    /// SQLite: how long a task waits for the one handle. Past it,
+    /// `ServiceUnavailable`, which is also what a task that uses the pool
+    /// while holding its own transaction gets instead of waiting forever.
+    acquire_timeout_ms: u32 = 30_000,
 };
 
 /// Which SQL a database speaks.
@@ -114,12 +119,13 @@ pub const Pool = struct {
     mutex: Io.Mutex = .init,
     idle: std.ArrayList(*pg.Conn) = .empty,
     permits: Io.Semaphore,
+    acquire_timeout_ms: u32 = 30_000,
 
     pub fn init(io: Io, gpa: Allocator, o: Options) !Pool {
         if (std.mem.startsWith(u8, o.url, "sqlite:")) {
             if (!has_sqlite) return error.SqliteNotBuilt;
             const conn = try sqlite.Conn.open(gpa, o.url["sqlite:".len..]);
-            return .{ .io = io, .gpa = gpa, .driver = .{ .sqlite = conn }, .arena = .init(gpa), .permits = .{ .permits = 1 } };
+            return .{ .io = io, .gpa = gpa, .driver = .{ .sqlite = conn }, .arena = .init(gpa), .permits = .{ .permits = 1 }, .acquire_timeout_ms = o.acquire_timeout_ms };
         }
         var arena: std.heap.ArenaAllocator = .init(gpa);
         errdefer arena.deinit();
@@ -145,12 +151,16 @@ pub const Pool = struct {
     }
 
     fn acquire(p: *Pool) !Conn {
+        if (p.driver == .sqlite) {
+            p.permits.waitTimeout(p.io, .{ .duration = .{ .raw = .fromMilliseconds(p.acquire_timeout_ms), .clock = .awake } }) catch {
+                if (!builtin.is_test) std.log.err("db: sqlite: no handle after {d} ms (the pool used inside its own transaction?)", .{p.acquire_timeout_ms});
+                return error.ServiceUnavailable;
+            };
+            return .{ .sqlite = p.driver.sqlite };
+        }
         p.permits.wait(p.io) catch return error.ServiceUnavailable;
         errdefer p.permits.post(p.io);
-        const config = switch (p.driver) {
-            .pg => |config| config,
-            .sqlite => |s| return .{ .sqlite = s },
-        };
+        const config = p.driver.pg;
         {
             p.mutex.lockUncancelable(p.io);
             defer p.mutex.unlock(p.io);
@@ -219,10 +229,21 @@ pub const Pool = struct {
     }
 
     pub fn begin(p: *Pool) !Tx {
+        return p.beginWith(.{});
+    }
+
+    /// `begin`, with SQL run on the same connection just before BEGIN and
+    /// just after the transaction ends (SQLite's foreign_keys pragma does
+    /// nothing inside one).
+    pub fn beginWith(p: *Pool, around: struct { before: []const u8 = "", after: []const u8 = "" }) !Tx {
         const c = try p.acquire();
         errdefer p.release(c);
-        try c.script("BEGIN");
-        return .{ .pool = p, .conn = c };
+        if (around.before.len > 0) try c.script(around.before);
+        errdefer if (around.after.len > 0) c.script(around.after) catch {};
+        // SQLite: take the write lock now. A deferred transaction that reads
+        // and then writes fails at once if another connection wrote between.
+        try c.script(if (c == .sqlite) "BEGIN IMMEDIATE" else "BEGIN");
+        return .{ .pool = p, .conn = c, .after = around.after };
     }
 };
 
@@ -230,6 +251,8 @@ pub const Pool = struct {
 pub const Tx = struct {
     pool: *Pool,
     conn: ?Conn,
+    /// Run once the transaction ends, before the connection goes back.
+    after: []const u8 = "",
 
     pub fn query(t: *Tx, a: Allocator, comptime T: type, text: []const u8, args: anytype) ![]T {
         return queryOn(t.conn orelse return error.TransactionDone, a, T, text, args);
@@ -256,10 +279,17 @@ pub const Tx = struct {
         return (t.conn orelse return error.TransactionDone).run(text, params, {}, ignoreRow);
     }
 
+    fn end(t: *Tx, c: Conn) void {
+        if (t.after.len > 0) c.script(t.after) catch |err| {
+            if (!builtin.is_test) std.log.err("db: after a transaction: {t}", .{err});
+        };
+        t.pool.release(c);
+    }
+
     pub fn commit(t: *Tx) !void {
         const c = t.conn orelse return error.TransactionDone;
         t.conn = null;
-        defer t.pool.release(c);
+        defer t.end(c);
         // After a failed statement Postgres answers COMMIT with a rollback
         // and no error; the caller must hear its writes are gone.
         if (c == .pg and c.pg.tx_status == 'E') {
@@ -272,7 +302,7 @@ pub const Tx = struct {
     pub fn rollback(t: *Tx) void {
         const c = t.conn orelse return;
         t.conn = null;
-        defer t.pool.release(c);
+        defer t.end(c);
         c.script("ROLLBACK") catch {};
     }
 

@@ -24,7 +24,10 @@ pub const Conn = struct {
             _ = c.sqlite3_close(h);
             return error.ServiceUnavailable;
         }
-        const conn = try gpa.create(Conn);
+        const conn = gpa.create(Conn) catch |err| {
+            _ = c.sqlite3_close(h);
+            return err;
+        };
         conn.* = .{ .handle = h.?, .gpa = gpa };
         errdefer conn.close();
         // Writers wait for each other instead of failing with SQLITE_BUSY.
@@ -48,9 +51,17 @@ pub const Conn = struct {
     /// query, rows changed otherwise.
     pub fn run(conn: *Conn, sql: []const u8, params: []const ?[]const u8, ctx: anytype, comptime row: anytype) Error!u64 {
         var stmt: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(conn.handle, sql.ptr, @intCast(sql.len), &stmt, null) != c.SQLITE_OK) return conn.fail();
+        var tail: [*c]const u8 = null;
+        if (c.sqlite3_prepare_v2(conn.handle, sql.ptr, @intCast(sql.len), &stmt, &tail) != c.SQLITE_OK) return conn.fail();
         const st = stmt orelse return 0; // only whitespace or a comment
         defer _ = c.sqlite3_finalize(st);
+        // One statement, as Postgres's extended protocol takes: a second one
+        // would otherwise be dropped without a word.
+        if (!onlyTrivia(sql[@intFromPtr(tail) - @intFromPtr(sql.ptr) ..])) {
+            if (!builtin.is_test) std.log.err("db: sqlite: one statement per query; use execScript for several", .{});
+            return error.DbError;
+        }
+        const before = c.sqlite3_total_changes64(conn.handle);
         if (c.sqlite3_bind_parameter_count(st) != params.len) {
             if (!builtin.is_test) std.log.err("db: sqlite: {d} parameters for {d} placeholders", .{ params.len, c.sqlite3_bind_parameter_count(st) });
             return error.DbError;
@@ -92,7 +103,9 @@ pub const Conn = struct {
             c.SQLITE_DONE => break,
             else => return conn.fail(),
         };
-        return if (c.sqlite3_stmt_readonly(st) != 0) rows else @intCast(c.sqlite3_changes64(conn.handle));
+        if (c.sqlite3_stmt_readonly(st) != 0) return rows;
+        // DDL changes no rows; sqlite3_changes would repeat the last DML's count.
+        return if (c.sqlite3_total_changes64(conn.handle) == before) 0 else @intCast(c.sqlite3_changes64(conn.handle));
     }
 
     /// Several statements, no parameters.
@@ -112,6 +125,22 @@ pub const Conn = struct {
         };
     }
 };
+
+/// Whitespace, `;` and comments only.
+fn onlyTrivia(rest: []const u8) bool {
+    var i: usize = 0;
+    while (i < rest.len) {
+        const ch = rest[i];
+        if (std.ascii.isWhitespace(ch) or ch == ';') {
+            i += 1;
+        } else if (std.mem.startsWith(u8, rest[i..], "--")) {
+            i = std.mem.findScalarPos(u8, rest, i, '\n') orelse rest.len;
+        } else if (std.mem.startsWith(u8, rest[i..], "/*")) {
+            i = if (std.mem.findPos(u8, rest, i + 2, "*/")) |e| e + 2 else rest.len;
+        } else return false;
+    }
+    return true;
+}
 
 fn bytes(ptr: ?*const anyopaque, len: c_int) []const u8 {
     const p: [*]const u8 = @ptrCast(ptr orelse return "");
@@ -238,4 +267,57 @@ test "sqlite: a file, written by many tasks at once" {
     try testing.expectEqual(0, failed.load(.acquire));
     const Count = struct { n: i64 };
     try testing.expectEqual(400, (try pool.queryOne(arena.allocator(), Count, "SELECT count(*) AS n FROM n", .{})).?.n);
+}
+
+test "sqlite: two statements in one exec are refused, not half run; DDL reports no rows" {
+    var pool: db.Pool = try .init(testing.io, testing.allocator, .{ .url = "sqlite::memory:" });
+    defer pool.deinit();
+    try pool.execScript("CREATE TABLE t (v integer)");
+    try testing.expectError(error.DbError, pool.exec("INSERT INTO t VALUES (1); INSERT INTO t VALUES (2)", .{}));
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqual(0, (try pool.queryOne(arena.allocator(), struct { n: i64 }, "SELECT count(*) AS n FROM t", .{})).?.n);
+    // A trailing semicolon or comment is fine.
+    try testing.expectEqual(1, try pool.exec("INSERT INTO t VALUES (1); -- done", .{}));
+    try testing.expectEqual(0, try pool.exec("CREATE TABLE u (v integer)", .{}));
+}
+
+test "sqlite: the pool used inside its own transaction times out instead of hanging" {
+    var pool: db.Pool = try .init(testing.io, testing.allocator, .{ .url = "sqlite::memory:", .acquire_timeout_ms = 50 });
+    defer pool.deinit();
+    var tx = try pool.begin();
+    defer tx.deinit();
+    try testing.expectError(error.ServiceUnavailable, pool.exec("SELECT 1", .{}));
+}
+
+test "sqlite: a transaction that reads then writes isn't undone by a writer from another pool" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", arena.allocator());
+    const url = try std.fmt.allocPrint(arena.allocator(), "sqlite:{s}/app.db", .{dir});
+    var app: db.Pool = try .init(testing.io, testing.allocator, .{ .url = url });
+    defer app.deinit();
+    var cli: db.Pool = try .init(testing.io, testing.allocator, .{ .url = url });
+    defer cli.deinit();
+    try app.execScript("CREATE TABLE n (v integer)");
+    const Other = struct {
+        fn run(p: *db.Pool, failed: *std.atomic.Value(u32)) void {
+            testing.io.sleep(.fromMilliseconds(20), .awake) catch {};
+            _ = p.exec("INSERT INTO n VALUES (?1)", .{2}) catch {
+                _ = failed.fetchAdd(1, .acq_rel);
+            };
+        }
+    };
+    var failed: std.atomic.Value(u32) = .init(0);
+    var tx = try app.begin();
+    defer tx.deinit();
+    var other = try testing.io.concurrent(Other.run, .{ &cli, &failed });
+    _ = try tx.query(arena.allocator(), struct { v: i64 }, "SELECT v FROM n", .{});
+    try testing.io.sleep(.fromMilliseconds(100), .awake);
+    _ = try tx.exec("INSERT INTO n VALUES (?1)", .{1});
+    try tx.commit();
+    other.await(testing.io);
+    try testing.expectEqual(0, failed.load(.acquire));
 }
