@@ -416,7 +416,13 @@ pub const S3 = struct {
         while (it.next()) |h| if (std.ascii.eqlIgnoreCase(h.name, "last-modified")) {
             reply.last_modified = parseHttpDate(h.value);
         };
-        if (method != .HEAD) {
+        // No body after HEAD, 204 or 304 (RFC 9110 §6.4.1), whatever the
+        // framing headers say. std's client would wait for one (until the
+        // connection closes) on a 204 without Content-Length, as SeaweedFS
+        // answers a DELETE: mark it read, which also keeps the connection.
+        if (reply.status == .no_content or reply.status == .not_modified) {
+            req.reader.state = .ready;
+        } else if (method != .HEAD) {
             var transfer: [8192]u8 = undefined;
             reply.body = try response.reader(&transfer).allocRemaining(a, .unlimited);
         }
@@ -752,4 +758,71 @@ test "S3 keeps the contract, against a bucket that checks every signature" {
 test "fromSettings names what is missing" {
     try testing.expectError(error.MissingS3Settings, S3.fromSettings(testing.io, testing.allocator, &.{}));
     try testing.expectError(error.MissingS3Settings, S3.fromSettings(testing.io, testing.allocator, &.{ .bucket = "b" }));
+}
+
+// Against a real bucket when `S3_TEST_ENDPOINT` is set (CI runs one):
+// `S3_TEST_BUCKET` is a scratch bucket this test empties first.
+test "S3 keeps the contract against a real bucket" {
+    var env = try testing.environ.createMap(testing.allocator);
+    defer env.deinit();
+    const endpoint = env.get("S3_TEST_ENDPOINT") orelse return error.SkipZigTest;
+    var s3: S3 = try .init(testing.io, testing.allocator, .{
+        .bucket = env.get("S3_TEST_BUCKET") orelse "kzig-test",
+        .region = env.get("S3_TEST_REGION") orelse "us-east-1",
+        .endpoint = endpoint,
+        .credentials = .{
+            .access_key_id = env.get("S3_TEST_ACCESS_KEY_ID") orelse "minioadmin",
+            .secret_access_key = env.get("S3_TEST_SECRET_ACCESS_KEY") orelse "minioadmin",
+        },
+    });
+    defer s3.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ((try s3.storage().list(a, .{})).files) |f| try s3.storage().delete(f.key);
+    try store.expectContract(s3.storage());
+
+    // The bucket itself checks the presigned link and its expiry.
+    try s3.storage().put("shared/note.txt", "hi there", .{ .content_type = "text/plain" });
+    const link = try s3.storage().url(a, "shared/note.txt", .{ .expires_in = 60 });
+    var body: std.Io.Writer.Allocating = .init(a);
+    var client: std.http.Client = .{ .allocator = testing.allocator, .io = testing.io };
+    defer client.deinit();
+    const res = try client.fetch(.{ .location = .{ .url = link }, .response_writer = &body.writer });
+    try testing.expectEqual(.ok, res.status);
+    try testing.expectEqualStrings("hi there", body.written());
+    const info = (try s3.storage().stat(a, "shared/note.txt")).?;
+    try testing.expectEqualStrings("text/plain", info.content_type.?);
+}
+
+fn bare204(server: *Io.net.Server) !void {
+    const conn = try server.accept(testing.io);
+    defer conn.close(testing.io);
+    var buf: [4096]u8 = undefined;
+    var r = conn.reader(testing.io, &buf);
+    while (true) {
+        const line = try r.interface.takeDelimiterInclusive('\n');
+        if (std.mem.trimEnd(u8, line, "\r\n").len == 0) break;
+    }
+    var wbuf: [128]u8 = undefined;
+    var w = conn.writer(testing.io, &wbuf);
+    try w.interface.writeAll("HTTP/1.1 204 No Content\r\nserver: bare\r\n\r\n");
+    try w.interface.flush();
+    // Keep-alive: the connection stays open.
+    try testing.io.sleep(.fromSeconds(2), .awake);
+}
+
+test "a 204 without Content-Length doesn't wait for the connection to close" {
+    const address = try Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try address.listen(testing.io, .{ .reuse_address = true });
+    defer server.deinit(testing.io);
+    var fut = try testing.io.concurrent(bare204, .{&server});
+    defer _ = fut.await(testing.io) catch {};
+    var buf: [64]u8 = undefined;
+    const endpoint = try std.fmt.bufPrint(&buf, "http://127.0.0.1:{d}", .{server.socket.address.getPort()});
+    var s3: S3 = try .init(testing.io, testing.allocator, .{ .bucket = "b", .endpoint = endpoint, .credentials = example });
+    defer s3.deinit();
+    const t0 = Io.Clock.awake.now(testing.io);
+    try s3.storage().delete("gone");
+    try testing.expect(t0.durationTo(Io.Clock.awake.now(testing.io)).toNanoseconds() < std.time.ns_per_s);
 }
