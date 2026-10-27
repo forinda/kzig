@@ -3,6 +3,7 @@ const context = @import("context.zig");
 const problem = @import("problem.zig");
 const router = @import("router.zig");
 pub const testing = @import("testing.zig");
+pub const config = @import("config.zig");
 pub const runtime = struct {
     pub const std = @import("runtime/std.zig");
 };
@@ -23,5 +24,6 @@ test {
     _ = problem;
     _ = router;
     _ = testing;
+    _ = config;
     _ = runtime.std;
 }
