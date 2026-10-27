@@ -9,6 +9,10 @@ const Ctx = context.Ctx;
 
 pub const Fn = *const fn (*Ctx, *Next) anyerror!void;
 
+/// Where an adapter's middleware runs (KickJS phases). `after_routes` runs
+/// only for requests no route matched, before the 404/405.
+pub const Phase = enum { before_global, after_global, before_routes, after_routes };
+
 /// One per step: each middleware gets its own `Next`, so a second
 /// `run()` is a no-op and can't skip past a step that stopped the chain.
 pub const Next = struct {

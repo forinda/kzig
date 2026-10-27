@@ -45,6 +45,8 @@ pub const Ctx = struct {
     io: ?std.Io = null,
     /// Set by the `requestId` middleware.
     request_id: ?[]const u8 = null,
+    /// Told about every error that becomes a response (adapters' `onError`).
+    on_error: ?*const fn (*Ctx, anyerror) void = null,
 
     pub const Params = struct {
         pub const max = 16;

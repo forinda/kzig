@@ -104,18 +104,34 @@ pub fn Router(comptime routes: []const Route) type {
         /// `handle` inside `global` middleware, which runs for every
         /// request, matched or not (KickJS's `app.use`).
         pub fn handleWith(comptime global: []const mw.Fn, ctx: *Ctx) void {
-            var next: mw.Next = .{ .ctx = ctx, .chain = global, .final = dispatch };
+            handlePhases(global, &.{}, ctx);
+        }
+
+        /// `handleWith`, plus `after_routes` middleware that runs only when
+        /// no route matched, before the 404/405 answer.
+        pub fn handlePhases(comptime global: []const mw.Fn, comptime after_routes: []const mw.Fn, ctx: *Ctx) void {
+            var next: mw.Next = .{ .ctx = ctx, .chain = global, .final = Dispatch(after_routes).run };
             next.run();
             ctx.finish();
         }
 
-        fn dispatch(ctx: *Ctx) !void {
-            const path = try normalizePath(ctx.arena, ctx.req.path);
-            const method = ctx.req.method;
-            if (try run(ctx, method, path)) return;
-            // HEAD falls back to GET; the runtime drops the body.
-            if (method == .HEAD and try run(ctx, .GET, path)) return;
+        fn Dispatch(comptime after_routes: []const mw.Fn) type {
+            return struct {
+                fn run(ctx: *Ctx) !void {
+                    const path = try normalizePath(ctx.arena, ctx.req.path);
+                    const method = ctx.req.method;
+                    if (try runRoute(ctx, method, path)) return;
+                    // HEAD falls back to GET; the runtime drops the body.
+                    if (method == .HEAD and try runRoute(ctx, .GET, path)) return;
+                    if (after_routes.len == 0) return unmatched(ctx);
+                    var next: mw.Next = .{ .ctx = ctx, .chain = after_routes, .final = unmatched };
+                    next.run();
+                }
+            };
+        }
 
+        fn unmatched(ctx: *Ctx) !void {
+            const path = try normalizePath(ctx.arena, ctx.req.path);
             var allow: std.ArrayList(u8) = .empty;
             var seen: std.EnumSet(std.http.Method) = .empty;
             inline for (routes) |r| {
@@ -134,7 +150,7 @@ pub fn Router(comptime routes: []const Route) type {
             try ctx.setHeader("allow", allow.items);
         }
 
-        fn run(ctx: *Ctx, method: std.http.Method, path: Path) !bool {
+        fn runRoute(ctx: *Ctx, method: std.http.Method, path: Path) !bool {
             inline for (routes) |r| {
                 if (r.method == method and try match(ctx, comptime patternSegments(r.path), path.segments)) {
                     if (r.middleware.len == 0) {
@@ -152,6 +168,7 @@ pub fn Router(comptime routes: []const Route) type {
 }
 
 pub fn handleError(ctx: *Ctx, err: anyerror) void {
+    if (ctx.on_error) |observe| observe(ctx, err);
     const p: ?problem.Problem = if (err == error.HttpProblem)
         ctx.problem
     else if (problem.statusOf(err)) |s|

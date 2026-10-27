@@ -72,7 +72,7 @@ pub fn App(comptime spec: anytype) type {
     checkFields(spec, &.{ "modules", "config", "api_prefix", "default_version", "health", "middleware", "contributors", "settings", "adapters" }, "App");
     const adapters = adapter_mod.order(di.unique(opt(spec, "adapters", @as([]const type, &.{}))));
     const global_contributors: []const type = contributor.types(if (@hasField(@TypeOf(spec), "contributors")) spec.contributors else .{}, "App");
-    const global_mw = if (@hasField(@TypeOf(spec), "middleware")) spec.middleware else .{};
+    const app_mw = if (@hasField(@TypeOf(spec), "middleware")) spec.middleware else .{};
     const Config = opt(spec, "config", struct {});
     const api_prefix: []const u8 = opt(spec, "api_prefix", @as([]const u8, "/api"));
     const default_version: u16 = opt(spec, "default_version", @as(u16, 1));
@@ -89,7 +89,14 @@ pub fn App(comptime spec: anytype) type {
     const sections = di.unique(section_list);
 
     comptime var listed: []const type = sections ++ &[_]type{ Process, ConfigReport } ++ adapters;
-    listed = listed ++ mwTypes(global_mw) ++ global_contributors;
+    comptime var adapter_contributors: []const type = &.{};
+    inline for (adapters) |A| {
+        if (@hasDecl(A, "contributors")) adapter_contributors = adapter_contributors ++ contributor.types(A.contributors, @typeName(A));
+        if (@hasDecl(A, "middleware")) inline for (A.middleware) |entry| {
+            listed = listed ++ mwTypes(.{entry.handler});
+        };
+    }
+    listed = listed ++ mwTypes(app_mw) ++ global_contributors ++ adapter_contributors;
     inline for (modules) |M| {
         if (!@hasDecl(M, "kzig_module")) @compileError(@typeName(M) ++ " is not a kzig.Module");
         listed = listed ++ M.services ++ M.controllers ++ M.contributors;
@@ -113,9 +120,13 @@ pub fn App(comptime spec: anytype) type {
         /// Adapters whose `beforeMount` ran; they get `shutdown`.
         mounted: usize = 0,
 
-        pub const routes: []const router.Route = buildRoutes(Self, modules, api_prefix, default_version, global_contributors);
+        pub const routes: []const router.Route = buildRoutes(Self, modules, api_prefix, default_version, .{ global_contributors, adapter_contributors });
         const Routes = router.Router(routes);
-        const global: []const mw.Fn = mwChain(Self, global_mw, "App");
+        // KickJS order: adapters' before_global, the App's middleware,
+        // adapters' after_global, then before_routes.
+        const global: []const mw.Fn = phase(Self, adapters, .before_global) ++ mwChain(Self, app_mw, "App") ++
+            phase(Self, adapters, .after_global) ++ phase(Self, adapters, .before_routes);
+        const after_routes: []const mw.Fn = phase(Self, adapters, .after_routes);
 
         /// Reads config from `env` and builds every service in place.
         /// `self` must not move afterwards: services point into it.
@@ -208,12 +219,23 @@ pub fn App(comptime spec: anytype) type {
         pub fn handle(self: *Self, ctx: *Ctx) void {
             ctx.app = self;
             ctx.io = self.get(Process).io;
-            Routes.handleWith(global, ctx);
+            ctx.on_error = observeError;
+            Routes.handlePhases(global, after_routes, ctx);
+            inline for (adapters) |A| {
+                if (@hasDecl(A, "onResponse")) self.get(A).onResponse(ctx);
+            }
+        }
+
+        fn observeError(ctx: *Ctx, err: anyerror) void {
+            const self = appOf(Self, ctx);
+            inline for (adapters) |A| {
+                if (@hasDecl(A, "onError")) self.get(A).onError(ctx, err);
+            }
         }
     };
 }
 
-fn buildRoutes(comptime AppT: type, comptime modules: []const type, comptime api_prefix: []const u8, comptime default_version: u16, comptime global_contributors: []const type) []const router.Route {
+fn buildRoutes(comptime AppT: type, comptime modules: []const type, comptime api_prefix: []const u8, comptime default_version: u16, comptime outer: [2][]const type) []const router.Route {
     comptime {
         var list: []const router.Route = &.{};
         var owners: []const []const u8 = &.{};
@@ -244,7 +266,8 @@ fn buildRoutes(comptime AppT: type, comptime modules: []const type, comptime api
                     const chain = (if (@hasDecl(C, "middleware")) mwChain(AppT, C.middleware, where) else &[_]mw.Fn{}) ++
                         (if (@hasField(@TypeOf(r), "middleware")) mwChain(AppT, r.middleware, where) else &[_]mw.Fn{});
                     const P = contributor.Plan(.{
-                        global_contributors,
+                        outer[0],
+                        outer[1],
                         M.contributors,
                         if (@hasDecl(C, "contributors")) contributor.types(C.contributors, where) else &.{},
                         if (@hasField(@TypeOf(r), "contributors")) contributor.types(r.contributors, where) else &.{},
@@ -255,6 +278,23 @@ fn buildRoutes(comptime AppT: type, comptime modules: []const type, comptime api
             }
         }
         const result = list;
+        return result;
+    }
+}
+
+/// Adapter middleware for one phase, in adapter order. An entry is
+/// `.{ .phase = …, .handler = … }`; the phase defaults to `after_global`.
+fn phase(comptime AppT: type, comptime adapters: []const type, comptime p: mw.Phase) []const mw.Fn {
+    comptime {
+        var out: []const mw.Fn = &.{};
+        for (adapters) |A| {
+            if (!@hasDecl(A, "middleware")) continue;
+            for (A.middleware) |entry| {
+                const entry_phase: mw.Phase = if (@hasField(@TypeOf(entry), "phase")) entry.phase else .after_global;
+                if (entry_phase == p) out = out ++ .{mwFn(AppT, entry.handler, @typeName(A))};
+            }
+        }
+        const result = out;
         return result;
     }
 }

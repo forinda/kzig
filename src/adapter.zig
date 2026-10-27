@@ -165,3 +165,126 @@ test "depends_on orders adapters" {
     const sorted = comptime order(&.{ QueueAdapter, DbAdapter, CacheAdapter });
     try testing.expect(sorted[0] == DbAdapter and sorted[1] == CacheAdapter and sorted[2] == QueueAdapter);
 }
+
+const Ctx = @import("context.zig").Ctx;
+const Next = @import("middleware.zig").Next;
+const testing_rt = @import("testing.zig");
+
+fn mark(ctx: *Ctx, m: []const u8) !void {
+    const prev = for (ctx.res.headers.items) |h| {
+        if (std.mem.eql(u8, h.name, "x-trail")) break h.value;
+    } else null;
+    try ctx.setHeader("x-trail", if (prev) |p| try std.fmt.allocPrint(ctx.arena, "{s},{s}", .{ p, m }) else m);
+}
+
+fn Marker(comptime m: []const u8) fn (*Ctx, *Next) anyerror!void {
+    return struct {
+        fn f(ctx: *Ctx, next: *Next) anyerror!void {
+            try mark(ctx, m);
+            next.run();
+        }
+    }.f;
+}
+
+const Observed = struct {
+    errors: u32 = 0,
+    last_status: u16 = 0,
+};
+
+const PhaseAdapter = struct {
+    observed: *Observed,
+    pub const middleware = .{
+        .{ .phase = .before_global, .handler = Marker("bg") },
+        .{ .handler = Marker("ag") }, // after_global by default, as in KickJS
+        .{ .phase = .before_routes, .handler = Marker("br") },
+        .{ .phase = .after_routes, .handler = Marker("ar") },
+    };
+    pub const contributors = .{Level("adapter")};
+    pub fn onError(self: *PhaseAdapter, _: *Ctx, _: anyerror) void {
+        self.observed.errors += 1;
+    }
+    pub fn onResponse(self: *PhaseAdapter, ctx: *Ctx) void {
+        self.observed.last_status = @backingInt(ctx.res.status);
+    }
+};
+
+fn Level(comptime v: []const u8) type {
+    return struct {
+        pub const key = "level";
+        pub fn resolve(_: *@This(), _: *Ctx) []const u8 {
+            return v;
+        }
+    };
+}
+
+const PhaseController = struct {
+    pub const routes = .{
+        .{ .method = .GET, .path = "/", .handler = "index" },
+        .{ .method = .GET, .path = "/boom", .handler = "boom" },
+    };
+    pub fn index(_: *PhaseController, ctx: *Ctx, got: struct { level: []const u8 }) !void {
+        try mark(ctx, "h");
+        try mark(ctx, got.level);
+    }
+    pub fn boom(_: *PhaseController, _: *Ctx) !void {
+        return error.Conflict;
+    }
+};
+
+fn PhaseApp(comptime module_contributors: anytype) type {
+    return app.App(.{
+        .modules = &.{app.Module(.{ .name = "P", .path = "/p", .controllers = &.{PhaseController}, .services = &.{Observed}, .contributors = module_contributors })},
+        .adapters = &.{PhaseAdapter},
+        .middleware = .{Marker("app")},
+        .contributors = .{Level("global")},
+        .health = false,
+    });
+}
+
+fn phaseGet(comptime A: type, a: *A, target: []const u8) !testing_rt.TestResponse {
+    return testing_rt.request(testing.allocator, a, .{ .target = target });
+}
+
+fn bootPlain(comptime A: type, a: *A) !void {
+    var env: std.process.Environ.Map = .init(testing.allocator);
+    defer env.deinit();
+    try a.init(testing.io, testing.allocator, &env);
+}
+
+test "phases run in KickJS order" {
+    const A = PhaseApp(.{});
+    var a: A = undefined;
+    try bootPlain(A, &a);
+    defer a.deinit();
+    var hit = try phaseGet(A, &a, "/api/v1/p");
+    defer hit.deinit();
+    try testing.expectEqualStrings("bg,app,ag,br,h,adapter", hit.header("x-trail").?);
+    var miss = try phaseGet(A, &a, "/nope");
+    defer miss.deinit();
+    try testing.expectEqual(std.http.Status.not_found, miss.status);
+    try testing.expectEqualStrings("bg,app,ag,br,ar", miss.header("x-trail").?);
+}
+
+test "adapter contributor sits between module and global" {
+    const A = PhaseApp(.{Level("module")});
+    var a: A = undefined;
+    try bootPlain(A, &a);
+    defer a.deinit();
+    var hit = try phaseGet(A, &a, "/api/v1/p");
+    defer hit.deinit();
+    try testing.expectEqualStrings("bg,app,ag,br,h,module", hit.header("x-trail").?);
+}
+
+test "onError sees handler errors and onResponse the final status" {
+    const A = PhaseApp(.{});
+    var a: A = undefined;
+    try bootPlain(A, &a);
+    defer a.deinit();
+    var boom = try phaseGet(A, &a, "/api/v1/p/boom");
+    defer boom.deinit();
+    try testing.expectEqual(1, a.get(Observed).errors);
+    try testing.expectEqual(409, a.get(Observed).last_status);
+    var ok = try phaseGet(A, &a, "/api/v1/p");
+    defer ok.deinit();
+    try testing.expectEqual(204, a.get(Observed).last_status);
+}

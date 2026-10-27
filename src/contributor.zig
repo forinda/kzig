@@ -61,9 +61,9 @@ pub fn types(comptime entries: anytype, comptime where: []const u8) []const type
     }
 }
 
-/// `levels` from lowest to highest precedence: global, module, controller,
-/// method. `handler_got` is the handler's `got` struct, if it takes one.
-pub fn Plan(comptime levels: [4][]const type, comptime handler_got: ?type, comptime where: []const u8) type {
+/// `levels` from lowest to highest precedence: global, adapter, module,
+/// controller, method. `handler_got` is the handler's `got` struct, if any.
+pub fn Plan(comptime levels: [5][]const type, comptime handler_got: ?type, comptime where: []const u8) type {
     comptime {
         var merged: []const type = &.{};
         for (levels) |level| {
