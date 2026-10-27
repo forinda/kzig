@@ -60,6 +60,9 @@ after M6.
 | `S3Settings` requires `S3_BUCKET` | Every `S3_*` field optional; `S3.fromSettings` names the missing one when S3 is chosen | Settings are listed at comptime, and a disk app must boot without them |
 | Streams, ranges, multipart uploads, upload forms, `compose`, tus, credential providers | Not ported: whole bodies, fixed keys | file-storage-api needs none of them |
 | Disk `put` under a file (`a.txt/b`): ENOTDIR, a 500 | `error.InvalidKey` (400) | The key can't name a file there; a client can fix it |
+| kick/db's schema, query builder and generated migrations | SQL strings with `$1` arguments, rows decoded into structs; migrations written by hand | The layers above SQL come later (see Later) |
+| `pg` driver, TLS | A Postgres client in Zig, no TLS (`sslmode=require` is refused) | No dependency; reach the server over a private network or a local proxy for now |
+| A DB adapter always reports health | `onHealthCheck` may return null; no database configured, nothing on `/health/ready` | task-api runs without a database |
 
 Kept for parity even where Zig would allow otherwise: route middleware runs **after** validation.
 
@@ -312,10 +315,25 @@ Follow-ups:
 Not covered: IPv6 literal S3 endpoints (std.http.Client takes host names; name the address in
 `/etc/hosts`), and a timeout on connecting itself (Io.Threaded can't time out a connect yet).
 
+### M13 — Database
+
+- [x] `kzig.db`: a Postgres client in Zig (SCRAM-SHA-256, MD5, cleartext; extended protocol),
+      a pool, transactions, arguments from Zig values and rows decoded into structs by column
+      name; a unique violation is 409, a dead connection 503
+- [x] `kzig.db.migrate`: kick/db's migration folders and `kick_migrations` bookkeeping (hashes,
+      batches, a lock), `latest`, `rollback`, `status`; applied on boot in development and test,
+      a pending one stops the boot elsewhere
+- [x] `kzig db new|migrate|rollback|status`; CI runs the database tests against Postgres 17
+- [x] task-api `users` on it (task-kickdb-api): `postgres` on `/health/ready`, the routes 503
+      without `DATABASE_URL`
+
+Not covered: TLS, binary result format, `LISTEN`/`NOTIFY`, `COPY`.
+
 ### Later
 
 SSE, a WebSocket broker (Redis), serverless cron triggers,
-queues, database layer, a third engine (`io_uring`, edge).
+queues, a third engine (`io_uring`, edge). The ORM, in layers on `kzig.db`: a comptime
+table schema, a typed query builder, relations, and migrations generated from schema diffs.
 
 ## Open questions
 

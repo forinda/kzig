@@ -256,6 +256,39 @@ object over `max_object_bytes` (256 MiB) isn't read. The disk driver refuses key
 through a symbolic link. task-api's `files` module picks
 the driver from `STORAGE_DRIVER`.
 
+## Database
+
+kick/db on Postgres: `kzig.db.Pool` speaks the Postgres protocol itself (no libpq), with
+SCRAM-SHA-256 auth, parameters and rows decoded into structs by column name.
+
+```zig
+var pool: kzig.db.Pool = try .init(io, gpa, .{ .url = "postgres://app:secret@localhost/app" });
+defer pool.deinit();
+const users = try pool.query(arena, User, "SELECT id, email FROM users WHERE active = $1", .{true});
+const one = try pool.queryOne(arena, User, "SELECT id, email FROM users WHERE id = $1", .{id}); // ?User
+var tx = try pool.begin();
+defer tx.deinit(); // rolls back unless committed
+_ = try tx.exec("UPDATE users SET active = false WHERE id = $1", .{id});
+try tx.commit();
+```
+
+Arguments are ints, floats, bools, strings, enums (by name) and optionals (NULL). A unique
+violation is `error.Conflict` (409); a server that can't be reached is `error.ServiceUnavailable`
+(503). No TLS yet: `sslmode=require` is refused.
+
+Migrations use kick/db's layout — `db/migrations/<YYYYMMDD_HHMMSS>_<name>/up.sql` and
+`down.sql` — and its `kick_migrations` table, so the two can share a database.
+`kzig.db.migrate.onBoot` applies pending ones (or, with `.fail_if_pending`, refuses to start);
+the CLI runs them by hand:
+
+```console
+$ kzig db new create_users   # db/migrations/20261027_120000_create_users/{up,down}.sql
+$ kzig db migrate            # DATABASE_URL; also: rollback (last batch), status
+```
+
+task-api's `users` module and `DbAdapter` show the whole setup: migrations on boot in
+development, `postgres` on `/health/ready`, and 503s when `DATABASE_URL` isn't set.
+
 ## WebSockets
 
 KickJS's `@forinda/kickjs-ws`: a gateway in a module's `.gateways`, at `/ws` + its `path`.
@@ -344,6 +377,7 @@ $ kzig add httpz             # serve on http.zig; `kzig add swagger` puts Swagge
 $ kzig build                 # zig build -Doptimize=ReleaseSafe
 $ kzig start --port 8080     # the built app, NODE_ENV=production
 $ kzig rm module task
+$ kzig db migrate            # see Database
 ```
 
 `kzig g module` writes KickJS's REST module — `GET /` (filter/sort/page), `GET /:id`, `POST /`
