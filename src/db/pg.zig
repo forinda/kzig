@@ -261,19 +261,26 @@ pub const Conn = struct {
                 };
         }
         // The client certificate, read for this handshake only.
-        var cert_arena: std.heap.ArenaAllocator = .init(c.gpa);
-        defer cert_arena.deinit();
-        const client_auth: ?tls.Client.ClientAuth = if (cfg.sslcert) |cert_path| blk: {
-            const ca = cert_arena.allocator();
+        // The key's PEM, its base64 and DER live in one scratch buffer, zeroed
+        // before it's freed; so is the key's copy in `client_auth`.
+        const scratch: []u8 = if (cfg.sslcert != null) try c.gpa.alloc(u8, 256 * 1024) else &.{};
+        defer if (scratch.len > 0) {
+            std.crypto.secureZero(u8, scratch);
+            c.gpa.free(scratch);
+        };
+        var fba: std.heap.FixedBufferAllocator = .init(scratch);
+        var client_auth: ?tls.Client.ClientAuth = if (cfg.sslcert) |cert_path| blk: {
+            const ca = fba.allocator();
             const cwd = Io.Dir.cwd();
-            const cert_pem = cwd.readFileAlloc(c.io, cert_path, ca, .limited(1 << 20)) catch |err| return tlsConfig("sslcert", cert_path, err);
-            const key_pem = cwd.readFileAlloc(c.io, cfg.sslkey.?, ca, .limited(1 << 20)) catch |err| return tlsConfig("sslkey", cfg.sslkey.?, err);
+            const cert_pem = cwd.readFileAlloc(c.io, cert_path, ca, .limited(64 << 10)) catch |err| return tlsConfig("sslcert", cert_path, err);
+            const key_pem = cwd.readFileAlloc(c.io, cfg.sslkey.?, ca, .limited(16 << 10)) catch |err| return tlsConfig("sslkey", cfg.sslkey.?, err);
             break :blk .{
                 .chain = keys.parseChain(ca, cert_pem) catch |err| return tlsConfig("sslcert", cert_path, err),
                 .key = keys.PrivateKey.parsePem(ca, key_pem) catch |err| return tlsConfig("sslkey", cfg.sslkey.?, err),
                 .io = c.io,
             };
         } else null;
+        defer if (client_auth) |*auth| std.crypto.secureZero(u8, std.mem.asBytes(&auth.key));
         var entropy: [tls.Client.Options.entropy_len]u8 = undefined;
         c.io.random(&entropy);
         c.tls = tls.Client.init(&c.reader.interface, &c.writer.interface, .{
@@ -437,12 +444,15 @@ pub const Conn = struct {
                             if (cfg.channel_binding == .require and (scram == null or !scram.?.bound())) return error.ChannelBindingRequired;
                         },
                         3 => {
+                            // libpq: with require, only a SASL request gets an answer.
+                            if (cfg.channel_binding == .require) return error.ChannelBindingRequired;
                             if (!may_send_password) return insecure("a cleartext password");
                             try c.begin('p');
                             try c.cstr(cfg.password);
                             try c.send();
                         },
                         5 => {
+                            if (cfg.channel_binding == .require) return error.ChannelBindingRequired;
                             if (!may_send_password) return insecure("an MD5 password");
                             if (m.body.len < 8) return c.lost();
                             const hashed = md5Password(cfg.user, cfg.password, m.body[4..8].*);
@@ -1337,6 +1347,33 @@ test "channel_binding=require: no TLS, no PLUS, or no SCRAM at all is refused" {
     {
         const f = try Fake.start(Script.trust);
         var cfg = f.config(.disable);
+        cfg.channel_binding = .require;
+        try testing.expectError(error.ChannelBindingRequired, Conn.connect(testing.io, testing.allocator, cfg));
+        try f.finish();
+    }
+}
+
+test "channel_binding=require refuses a password request before sending anything" {
+    const Script = struct {
+        fn cleartext(s: Io.net.Stream) anyerror!void {
+            var buf: [512]u8 = undefined;
+            _ = try Fake.readStartup(s, &buf);
+            try Fake.send(s, "R\x00\x00\x00\x08\x00\x00\x00\x03");
+            var one: [1]u8 = undefined;
+            try testing.expectError(error.EndOfStream, Fake.readExact(s, &one));
+        }
+        fn md5(s: Io.net.Stream) anyerror!void {
+            var buf: [512]u8 = undefined;
+            _ = try Fake.readStartup(s, &buf);
+            try Fake.send(s, "R\x00\x00\x00\x0c\x00\x00\x00\x05salt");
+            var one: [1]u8 = undefined;
+            try testing.expectError(error.EndOfStream, Fake.readExact(s, &one));
+        }
+    };
+    inline for (.{ Script.cleartext, Script.md5 }) |script| {
+        const f = try Fake.start(script);
+        var cfg = f.config(.disable);
+        cfg.insecure_auth = true;
         cfg.channel_binding = .require;
         try testing.expectError(error.ChannelBindingRequired, Conn.connect(testing.io, testing.allocator, cfg));
         try f.finish();

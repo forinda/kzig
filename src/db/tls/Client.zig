@@ -382,6 +382,10 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
     var end_point: [64]u8 = undefined;
     var end_point_len: u8 = 0;
     var cert_requested = false;
+    // kzig: Certificate, CertificateVerify and Finished, and their record:
+    // one pair of buffers for every cipher.
+    var auth_clear: [tls.max_ciphertext_inner_record_len]u8 = undefined;
+    var auth_record: [@as(usize, tls.record_header_len) + tls.max_ciphertext_inner_record_len + 16]u8 = undefined;
     var req_ctx: [255]u8 = undefined;
     var req_ctx_len: usize = 0;
     var scheme_ok = false;
@@ -633,7 +637,8 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                     // kzig: the server wants a client certificate.
                     .certificate_request => {
                         if (tls_version != .tls_1_3) return error.TlsClientAuthUnsupported;
-                        if (cipher_state != .handshake or handshake_state != .certificate) return error.TlsUnexpectedMessage;
+                        // Once, and before the server's Certificate (RFC 8446 §4.3.2).
+                        if (cipher_state != .handshake or handshake_state != .certificate or cert_requested or cert_index > 0) return error.TlsUnexpectedMessage;
                         switch (handshake_cipher) {
                             inline else => |*p| p.transcript_hash.update(wrapped_handshake),
                         }
@@ -744,7 +749,9 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                         crypto.hash.sha2.Sha512.hash(certd.buf, end_point[0..64], .{});
                                         end_point_len = 64;
                                     },
-                                    .curveEd25519 => end_point_len = 0,
+                                    // No hash (Ed25519), or one Postgres would compute
+                                    // differently (SHA-224): no channel binding.
+                                    .curveEd25519, .sha224WithRSAEncryption, .ecdsa_with_SHA224 => end_point_len = 0,
                                     else => {
                                         crypto.hash.sha2.Sha256.hash(certd.buf, end_point[0..32], .{});
                                         end_point_len = 32;
@@ -972,9 +979,9 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                     const handshake_hash = p.transcript_hash.peek();
                                     // kzig: Certificate and CertificateVerify when asked for,
                                     // then Finished, in one record (handshake sequence 0).
-                                    var clear: [tls.max_ciphertext_inner_record_len]u8 = undefined;
+                                    const clear = &auth_clear;
                                     var clear_len: usize = 0;
-                                    if (cert_requested) clear_len = try clientAuthMessages(&clear, &p.transcript_hash, options.client_auth, scheme_ok, req_ctx[0..req_ctx_len]);
+                                    if (cert_requested) clear_len = try clientAuthMessages(clear, &p.transcript_hash, options.client_auth, scheme_ok, req_ctx[0..req_ctx_len]);
                                     const fin_hash = p.transcript_hash.peek();
                                     const verify_data = tls.hmac(P.Hmac, &fin_hash, pv.client_finished_key);
                                     const fin = .{@backingInt(tls.HandshakeType.finished)} ++ array(u24, u8, verify_data);
@@ -984,12 +991,12 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                     clear[clear_len] = @backingInt(tls.ContentType.handshake);
                                     clear_len += 1;
 
-                                    var finished_buf: [@as(usize, tls.record_header_len) + tls.max_ciphertext_inner_record_len + P.AEAD.tag_length]u8 = undefined;
+                                    comptime assert(P.AEAD.tag_length <= 16);
                                     const wrapped_len = clear_len + P.AEAD.tag_length;
-                                    finished_buf[0] = @backingInt(tls.ContentType.application_data);
-                                    mem.writeInt(u16, finished_buf[1..3], @backingInt(tls.ProtocolVersion.tls_1_2), .big);
-                                    mem.writeInt(u16, finished_buf[3..5], @intCast(wrapped_len), .big);
-                                    const finished_msg = finished_buf[0 .. tls.record_header_len + wrapped_len];
+                                    auth_record[0] = @backingInt(tls.ContentType.application_data);
+                                    mem.writeInt(u16, auth_record[1..3], @backingInt(tls.ProtocolVersion.tls_1_2), .big);
+                                    mem.writeInt(u16, auth_record[3..5], @intCast(wrapped_len), .big);
+                                    const finished_msg = auth_record[0 .. tls.record_header_len + wrapped_len];
                                     const ad = finished_msg[0..tls.record_header_len];
                                     const ciphertext = finished_msg[tls.record_header_len..][0..clear_len];
                                     const auth_tag = finished_msg[finished_msg.len - P.AEAD.tag_length ..][0..P.AEAD.tag_length];

@@ -410,7 +410,10 @@ after their exports.
       an empty Certificate when asked and none is configured
 - [x] CI: a `cert` pg_hba user signs in with EC and RSA certificates, refused without one
 
-Not covered: encrypted private keys, client certificates on TLS 1.2, Ed25519 keys, CRLs.
+Not covered: encrypted private keys, client certificates on TLS 1.2 (a TLS 1.2 server that asks
+for one is refused, as std's client does), Ed25519 keys, CRLs, RSA blinding (the exponentiation is
+constant-time), a check that `sslkey` matches `sslcert`, channel binding to SHA-224- or
+Ed25519-signed server certificates.
 
 ### Later
 
