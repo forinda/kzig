@@ -41,8 +41,10 @@ step "module names that shadow template names: query, page, error"
 zig build test
 
 step "kzig dev rebuilds and restarts on change"
+set -m # its own process group, so `kill -- -$DEV` below is a terminal's Ctrl-C
 PORT=39811 "$KZIG" dev > dev.log 2>&1 &
 DEV=$!
+set +m
 waitfor() { # seconds command…
   local until=$((SECONDS + $1)); shift
   until "$@" >/dev/null 2>&1; do
@@ -56,7 +58,13 @@ edit 's/Hello {s} from kzig!/Hi {s} from kzig!/' src/modules/hello/hello.service
 waitfor 180 says "Hi World"
 edit 's/Hi {s} from kzig!/Hello {s} from kzig!/' src/modules/hello/hello.service.zig
 waitfor 180 says "Hello World"
-kill -INT $DEV
+# Editor swap files aren't sources.
+restarts=$(grep -c restarted dev.log)
+touch src/modules/hello/.hello.service.zig.swp
+sleep 2
+[ "$(grep -c restarted dev.log)" = "$restarts" ] || { echo "a swap file restarted the app" >&2; cat dev.log >&2; kill $DEV; exit 1; }
+rm src/modules/hello/.hello.service.zig.swp
+kill -INT -- -$DEV
 wait $DEV
 if curl -sf localhost:39811/api/v1/hello >/dev/null 2>&1; then echo "the app outlived kzig dev" >&2; exit 1; fi
 grep -q "restarted" dev.log

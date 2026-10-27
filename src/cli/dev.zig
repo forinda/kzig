@@ -29,7 +29,7 @@ pub fn run(io: Io, gpa: Allocator, arena: Allocator, environ: *const std.process
     if (env.get("NODE_ENV") == null) try env.put("NODE_ENV", "development");
 
     signals.install();
-    var seen = try snapshot(io, gpa, cwd);
+    var seen = snapshot(io, gpa, cwd) orelse 0;
     var app: ?std.process.Child = null;
     defer if (app) |*c| stop(io, c);
 
@@ -37,7 +37,12 @@ pub fn run(io: Io, gpa: Allocator, arena: Allocator, environ: *const std.process
     while (signals.count() == 0) {
         // ponytail: polls every 300 ms; inotify/kqueue would wake at once.
         io.sleep(.fromMilliseconds(300), .awake) catch break;
-        const now = try snapshot(io, gpa, cwd);
+        if (app) |c| if (exited(c.id.?)) {
+            app = null;
+            try say(out, "[kzig dev] the app exited; waiting for a change\n", .{});
+        };
+        // A directory removed mid-walk: look again on the next tick.
+        const now = snapshot(io, gpa, cwd) orelse continue;
         if (now == seen) continue;
         seen = now;
         try say(out, "\n[kzig dev] change detected, rebuilding…\n", .{});
@@ -45,9 +50,10 @@ pub fn run(io: Io, gpa: Allocator, arena: Allocator, environ: *const std.process
             try say(out, "[kzig dev] build failed; the running app keeps serving\n", .{});
             continue;
         }
+        if (signals.count() != 0) break;
         if (app) |*c| stop(io, c);
         app = try start(io, argv, &env, out);
-        try say(out, "[kzig dev] restarted\n", .{});
+        if (app != null) try say(out, "[kzig dev] restarted\n", .{});
     }
     try say(out, "\n[kzig dev] stopping\n", .{});
 }
@@ -64,14 +70,42 @@ fn build(io: Io, out: *Io.Writer) !bool {
     return term.success();
 }
 
-fn start(io: Io, argv: []const []const u8, env: *const std.process.Environ.Map, out: *Io.Writer) !std.process.Child {
+/// The app gets its own process group: Ctrl-C reaches kzig only, and the
+/// app sees exactly one SIGTERM (a second one makes a kzig app skip its drain).
+fn start(io: Io, argv: []const []const u8, env: *const std.process.Environ.Map, out: *Io.Writer) !?std.process.Child {
     try say(out, "[kzig dev] {s}\n", .{argv[0]});
-    return std.process.spawn(io, .{ .argv = argv, .environ_map = env });
+    return std.process.spawn(io, .{ .argv = argv, .environ_map = env, .pgid = 0 }) catch |err| {
+        try say(out, "[kzig dev] can't start {s}: {t}; waiting for a change\n", .{ argv[0], err });
+        return null;
+    };
 }
 
-/// SIGTERM, then wait: a kzig app drains its requests and exits.
+/// SIGTERM and let the app drain; SIGKILL if it is still up after the grace.
 fn stop(io: Io, child: *std.process.Child) void {
-    child.kill(io);
+    const pid = child.id orelse return;
+    std.posix.kill(pid, .TERM) catch {};
+    for (0..stop_grace_ms / 50) |_| {
+        if (exited(pid)) {
+            child.id = null;
+            return;
+        }
+        io.sleep(.fromMilliseconds(50), .awake) catch {};
+    }
+    std.posix.kill(pid, .KILL) catch {};
+    _ = child.wait(io) catch {};
+}
+
+const stop_grace_ms = 10_000;
+
+/// Reaps `pid` if it has exited, without blocking.
+fn exited(pid: std.posix.pid_t) bool {
+    var status: if (builtin.link_libc) c_int else i32 = undefined;
+    const rc = std.posix.system.wait4(pid, &status, std.posix.W.NOHANG, null);
+    return switch (std.posix.errno(rc)) {
+        .SUCCESS => rc != 0,
+        .INTR => false,
+        else => true,
+    };
 }
 
 /// The executable's name from build.zig: `addExecutable(.{ .name = "x"`.
@@ -85,15 +119,18 @@ fn binName(io: Io, arena: Allocator, cwd: Io.Dir) !?[]const u8 {
 }
 
 /// A hash of every watched file's path, size and modification time.
-fn snapshot(io: Io, gpa: Allocator, cwd: Io.Dir) !u64 {
+/// Only Zig sources count: editor swap and backup files would restart the app
+/// while you type. Null when the walk fails (a directory removed under it).
+fn snapshot(io: Io, gpa: Allocator, cwd: Io.Dir) ?u64 {
     var h: std.hash.Wyhash = .init(0);
     for ([_][]const u8{ "build.zig", "build.zig.zon" }) |f| hashFile(io, cwd, f, &h);
     var src = cwd.openDir(io, "src", .{ .iterate = true }) catch return h.final();
     defer src.close(io);
-    var walker = try src.walk(gpa);
+    var walker = src.walk(gpa) catch return null;
     defer walker.deinit();
-    while (try walker.next(io)) |entry| {
+    while (walker.next(io) catch return null) |entry| {
         if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.path, ".zig") and !std.mem.endsWith(u8, entry.path, ".zon")) continue;
         h.update(entry.path);
         hashFile(io, src, entry.path, &h);
     }
