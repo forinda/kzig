@@ -218,6 +218,7 @@ fn collectIn(nodes: []const Node, n: u32, segments: []const []const u8, i: usize
 pub fn Router(comptime routes: []const Route) type {
     const tree = buildTree(routes);
     const methods = comptime blk: {
+        @setEvalBranchQuota(1_000_000);
         var m: [routes.len]std.http.Method = undefined;
         for (routes, &m) |r, *o| o.* = r.method;
         break :blk m;
@@ -292,6 +293,7 @@ pub fn Router(comptime routes: []const Route) type {
 
         /// Per route: its params from the path, then its middleware and handler.
         const runners = blk: {
+            @setEvalBranchQuota(1_000_000);
             var out: [routes.len]*const fn (*Ctx, []const []const u8) anyerror!void = undefined;
             for (routes, &out) |r, *o| o.* = Runner(r).run;
             break :blk out;
@@ -300,7 +302,9 @@ pub fn Router(comptime routes: []const Route) type {
         fn Runner(comptime r: Route) type {
             return struct {
                 fn run(ctx: *Ctx, segments: []const []const u8) anyerror!void {
-                    _ = try match(ctx, comptime patternSegments(r.path), segments);
+                    // The tree matched it; this fills its params.
+                    const fits = try match(ctx, comptime patternSegments(r.path), segments);
+                    std.debug.assert(fits);
                     if (r.middleware.len == 0) return r.handler(ctx);
                     var next: mw.Next = .{ .ctx = ctx, .chain = r.middleware, .final = r.handler };
                     next.run();
@@ -608,4 +612,19 @@ test "the tree picks what the linear scan picked, for every path and method" {
         }
     }
     try testing.expectEqual(1 + 10 + 100 + 1000 + 10000, checked);
+}
+
+fn bigTable(comptime n: usize) [n]Route {
+    @setEvalBranchQuota(1_000_000);
+    var out: [n]Route = undefined;
+    for (&out, 0..) |*r, i| r.* = route(.GET, std.fmt.comptimePrint("/r{d}/:id", .{i}), nothing);
+    return out;
+}
+
+test "a 600-route table compiles and matches its last route" {
+    const routes = comptime bigTable(600);
+    const R = Router(&routes);
+    var res = runTest(R, .GET, "/r599/7", &.{});
+    defer res.deinit();
+    try testing.expectEqual(.no_content, res.res.status);
 }
