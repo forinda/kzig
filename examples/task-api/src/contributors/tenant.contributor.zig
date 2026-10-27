@@ -2,17 +2,18 @@ const std = @import("std");
 const kzig = @import("kzig");
 const auth = @import("../auth.zig");
 
+const TenantDatabase = @import("../db/tenant.database.zig").TenantDatabase;
+
 pub const Tenant = struct { id: []const u8, name: []const u8 };
 
+/// The `tenants` registry.
 pub const TenantRepository = struct {
-    const rows = [_]struct { []const u8, Tenant }{
-        .{ "acme", .{ .id = "tenant-acme", .name = "Acme Corp" } },
-        .{ "globex", .{ .id = "tenant-globex", .name = "Globex" } },
-    };
+    database: *TenantDatabase,
 
-    pub fn findBySubdomain(_: *TenantRepository, slug: []const u8) ?Tenant {
-        for (rows) |r| if (std.mem.eql(u8, r[0], slug)) return r[1];
-        return null;
+    pub fn findBySubdomain(self: *TenantRepository, arena: std.mem.Allocator, slug: []const u8) !?Tenant {
+        const db = try self.database.client();
+        const row = try db.selectFrom(.tenants).select(.{ .id, .name }).where(.subdomain, .eq, slug).executeTakeFirst(arena) orelse return null;
+        return .{ .id = row.id, .name = row.name };
     }
 };
 
@@ -28,7 +29,7 @@ pub const LoadTenant = struct {
         for (got.user.tenants) |t| {
             if (std.mem.eql(u8, t, slug)) break;
         } else return ctx.fail(.not_found, "Unknown tenant");
-        return self.repo.findBySubdomain(slug) orelse ctx.fail(.not_found, "Unknown tenant");
+        return try self.repo.findBySubdomain(ctx.arena, slug) orelse ctx.fail(.not_found, "Unknown tenant");
     }
 };
 

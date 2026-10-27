@@ -209,6 +209,7 @@ test "files: storage:<driver> on /health/ready" {
 test "files: production defaults to S3 and won't boot without S3_BUCKET" {
     var env: std.process.Environ.Map = .init(testing.allocator);
     defer env.deinit();
+    try env.put("DB_FILE", ":memory:"); // not ./data/app.db
     for ([_][2][]const u8{
         .{ "NODE_ENV", "production" },                               .{ "APP_PUBLIC_URL", "https://api.example.com" },
         .{ "TRANSACTIONAL_MAIL_PASSWORD", "a-long-password" },       .{ "TRANSACTIONAL_MAIL_FROM", "a@example.com" },

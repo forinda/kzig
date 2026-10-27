@@ -46,7 +46,7 @@ pub const ProjectController = struct {
     }
 
     pub fn create(self: *ProjectController, ctx: *kzig.Ctx, got: struct { tenant: tenant.Tenant, body: repo.CreateProject }) !void {
-        try ctx.created(try self.projects.create(got.tenant.id, got.body));
+        try ctx.created(try self.projects.create(ctx.arena, got.tenant.id, got.body));
     }
 
     pub fn import(self: *ProjectController, ctx: *kzig.Ctx, got: struct { tenant: tenant.Tenant, body: ImportProjects }) !struct {

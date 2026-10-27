@@ -1,0 +1,10 @@
+{
+  "id": "20261015_232849_seed_tenants",
+  "name": "seed_tenants",
+  "createdAt": "2026-10-15T23:28:49.957Z",
+  "reviewed": true,
+  "dialect": "sqlite",
+  "previousId": "20261015_232845_init",
+  "downIsDraft": false,
+  "empty": true
+}

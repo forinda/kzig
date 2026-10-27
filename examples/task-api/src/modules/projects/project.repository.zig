@@ -1,12 +1,9 @@
 const std = @import("std");
 const kzig = @import("kzig");
+const TenantSchema = @import("../../db/tenant.schema.zig").TenantSchema;
+const TenantDatabase = @import("../../db/tenant.database.zig").TenantDatabase;
 
-pub const Project = struct {
-    id: []const u8,
-    workspaceId: []const u8,
-    title: []const u8,
-    description: ?[]const u8 = null,
-};
+pub const Project = TenantSchema.Table(.projects).Row;
 
 pub const CreateProject = struct {
     title: []const u8,
@@ -18,62 +15,27 @@ pub const CreateProject = struct {
     }
 };
 
-/// In memory, shared by concurrent requests, so every access holds the lock.
-/// Every query is scoped to one workspace.
+/// No tenant filter of its own in kick/db (its column tenancy adds one);
+/// here every query names the workspace.
 pub const ProjectRepository = struct {
-    process: *const kzig.Process,
-    mutex: std.Io.Mutex = .init,
-    rows: std.ArrayList(Project) = .empty,
-    /// Owns the rows' strings for the app's lifetime.
-    strings: std.heap.ArenaAllocator = undefined,
-
-    pub fn init(self: *ProjectRepository) void {
-        self.strings = .init(self.process.gpa);
-    }
-
-    pub fn deinit(self: *ProjectRepository) void {
-        self.rows.deinit(self.process.gpa);
-        self.strings.deinit();
-    }
+    database: *TenantDatabase,
 
     pub fn list(self: *ProjectRepository, arena: std.mem.Allocator, workspace_id: []const u8) ![]const Project {
-        self.mutex.lockUncancelable(self.process.io);
-        defer self.mutex.unlock(self.process.io);
-        var out: std.ArrayList(Project) = .empty;
-        for (self.rows.items) |p| if (std.mem.eql(u8, p.workspaceId, workspace_id)) try out.append(arena, p);
-        return out.items;
+        const db = try self.database.client();
+        return db.selectFrom(.projects).where(.workspaceId, .eq, workspace_id).orderBy(.createdAt, .asc).execute(arena);
     }
 
-    pub fn create(self: *ProjectRepository, workspace_id: []const u8, input: CreateProject) !Project {
-        self.mutex.lockUncancelable(self.process.io);
-        defer self.mutex.unlock(self.process.io);
-        return self.insert(workspace_id, input);
+    pub fn create(self: *ProjectRepository, arena: std.mem.Allocator, workspace_id: []const u8, input: CreateProject) !Project {
+        const db = try self.database.client();
+        return db.insertInto(.projects).values(.{ .workspaceId = workspace_id, .title = input.title, .description = input.description }).returningAll().executeTakeFirstOrThrow(arena);
     }
 
     /// Idempotent by title within the workspace: an existing title is kept,
-    /// and every requested row comes back.
+    /// and every requested row comes back as stored.
     pub fn importMany(self: *ProjectRepository, arena: std.mem.Allocator, workspace_id: []const u8, inputs: []const CreateProject) ![]const Project {
-        self.mutex.lockUncancelable(self.process.io);
-        defer self.mutex.unlock(self.process.io);
+        const db = try self.database.client();
         const out = try arena.alloc(Project, inputs.len);
-        for (inputs, out) |input, *slot| slot.* = self.find(workspace_id, input.title) orelse try self.insert(workspace_id, input);
+        for (inputs, out) |input, *slot| slot.* = try db.upsert(arena, .projects, .{ .workspaceId = workspace_id, .title = input.title, .description = input.description }, .{ .target = .{ .workspaceId, .title }, .update = .none });
         return out;
-    }
-
-    fn find(self: *ProjectRepository, workspace_id: []const u8, title: []const u8) ?Project {
-        for (self.rows.items) |p| if (std.mem.eql(u8, p.workspaceId, workspace_id) and std.mem.eql(u8, p.title, title)) return p;
-        return null;
-    }
-
-    fn insert(self: *ProjectRepository, workspace_id: []const u8, input: CreateProject) !Project {
-        const a = self.strings.allocator();
-        const p: Project = .{
-            .id = try a.print("p-{d}", .{self.rows.items.len + 1}),
-            .workspaceId = try a.dupe(u8, workspace_id),
-            .title = try a.dupe(u8, input.title),
-            .description = if (input.description) |d| try a.dupe(u8, d) else null,
-        };
-        try self.rows.append(self.process.gpa, p);
-        return p;
     }
 };

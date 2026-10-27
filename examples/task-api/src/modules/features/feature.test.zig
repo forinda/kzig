@@ -39,6 +39,7 @@ test "takes a provided value instead of the environment" {
 test "secrets fail closed: no dev default outside development and test" {
     var env: std.process.Environ.Map = .init(testing.allocator);
     defer env.deinit();
+    try env.put("DB_FILE", ":memory:"); // not ./data/app.db
     try env.put("NODE_ENV", "production");
     const App = @import("../../main.zig").App;
     const app = try testing.allocator.create(App);

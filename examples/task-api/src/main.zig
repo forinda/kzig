@@ -9,6 +9,7 @@ const FileSettings = @import("modules/files/file.settings.zig").FileSettings;
 const CronErrorsAdapter = @import("adapters/cron-errors.adapter.zig").CronErrorsAdapter;
 const StorageAdapter = @import("adapters/storage.adapter.zig").StorageAdapter;
 const DbAdapter = @import("adapters/db.adapter.zig").DbAdapter;
+const TenantDbAdapter = @import("adapters/tenant-db.adapter.zig").TenantDbAdapter;
 
 pub const App = kzig.App(.{
     .modules = modules,
@@ -27,6 +28,7 @@ pub const App = kzig.App(.{
         CronErrorsAdapter,
         StorageAdapter,
         DbAdapter,
+        TenantDbAdapter,
     },
     .middleware = .{
         kzig.middleware.requestId(),
@@ -61,6 +63,7 @@ test {
     _ = @import("modules/crons/cron.test.zig");
     _ = @import("modules/users/user.test.zig");
     _ = @import("db/schema.test.zig");
+    _ = @import("db/tenant.schema.test.zig");
     _ = @import("modules/workspaces/workspace.test.zig");
     // kzig:tests
 }

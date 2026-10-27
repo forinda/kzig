@@ -32,6 +32,9 @@ pub fn bootWith(vars: []const [2][]const u8, overrides: anytype) !TestApp {
     var env: std.process.Environ.Map = .init(testing.allocator);
     defer env.deinit();
     try env.put("NODE_ENV", "test");
+    // The tenant registry's SQLite database: fresh and migrated per test.
+    try env.put("DB_FILE", ":memory:");
+    try env.put("SQLITE_MIGRATIONS_DIR", "examples/task-api/db/sqlite-migrations");
     for (vars) |v| try env.put(v[0], v[1]);
     const app = try testing.allocator.create(App);
     errdefer testing.allocator.destroy(app);

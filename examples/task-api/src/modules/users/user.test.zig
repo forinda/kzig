@@ -99,6 +99,7 @@ test "users: production refuses to boot with pending migrations" {
     defer testing.allocator.free(dir);
     var app_env: std.process.Environ.Map = .init(testing.allocator);
     defer app_env.deinit();
+    try app_env.put("DB_FILE", ":memory:"); // not ./data/app.db
     for ([_][2][]const u8{
         .{ "NODE_ENV", "production" },                               .{ "APP_PUBLIC_URL", "https://api.example.com" },
         .{ "TRANSACTIONAL_MAIL_PASSWORD", "a-long-password" },       .{ "TRANSACTIONAL_MAIL_FROM", "a@example.com" },

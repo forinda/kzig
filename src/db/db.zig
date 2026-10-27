@@ -68,6 +68,8 @@ pub const Options = struct {
 pub const Dialect = enum { postgres, sqlite };
 
 const has_sqlite = @import("kzig_options").sqlite;
+/// Built with `-Dsqlite`: `sqlite:` URLs open.
+pub const sqlite_built = has_sqlite;
 const sqlite = if (has_sqlite) @import("sqlite.zig") else struct {
     pub const Conn = void;
 };

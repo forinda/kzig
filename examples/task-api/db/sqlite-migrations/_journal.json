@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "id": "20261015_232845_init",
+      "tag": "init",
+      "hash": "sha256:d37374673b7be555c9d3292ce64bf915967298e8aeee59e2782d01e187fadbff",
+      "createdAt": "2026-10-15T23:28:45.944Z"
+    },
+    {
+      "id": "20261015_232849_seed_tenants",
+      "tag": "seed_tenants",
+      "hash": "sha256:326026b86daf62dfa41fa085380a731c965d0200c7169cff81941ba2edf9583e",
+      "createdAt": "2026-10-15T23:28:49.959Z"
+    },
+    {
+      "id": "20261016_191035_workspace_tenant_key",
+      "tag": "workspace_tenant_key",
+      "hash": "sha256:67f72acc0c7e1037c8745ba015083f111ef6f399625944bef96c358bea3a7015",
+      "createdAt": "2026-10-16T19:10:35.610Z"
+    },
+    {
+      "id": "20261016_220159_project_title_unique",
+      "tag": "project_title_unique",
+      "hash": "sha256:70df57e8a3abd3c2975867f635a641460dd2aff5f8ea0803b5f4a0f6532f1709",
+      "createdAt": "2026-10-16T22:01:59.099Z"
+    }
+  ]
+}

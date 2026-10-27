@@ -9,6 +9,12 @@ const auth: Header = .{ .name = "authorization", .value = "Bearer token-all" };
 const acme_only: Header = .{ .name = "authorization", .value = "Bearer token-acme" };
 const json_body: Header = .{ .name = "content-type", .value = "application/json" };
 
+/// The archive's SQLite database, in memory, migrated on boot (needs -Dsqlite).
+fn boot() !test_app.TestApp {
+    if (!kzig.db.sqlite_built) return error.SkipZigTest;
+    return test_app.boot(&.{});
+}
+
 fn tenant(slug: []const u8) Header {
     return .{ .name = "x-tenant", .value = slug };
 }
@@ -20,7 +26,7 @@ const Project = struct { id: []const u8, workspaceId: []const u8, title: []const
 const List = struct { tenant: []const u8, projects: []const Project };
 
 test "rejects requests without a token" {
-    const t = try test_app.boot(&.{});
+    const t = try boot();
     defer t.deinit();
     var res = try t.request(.{ .target = "/api/v1/projects", .headers = &.{tenant("acme")} });
     defer res.deinit();
@@ -28,7 +34,7 @@ test "rejects requests without a token" {
 }
 
 test "answers 404 for an unknown tenant" {
-    const t = try test_app.boot(&.{});
+    const t = try boot();
     defer t.deinit();
     var res = try t.request(.{ .target = "/api/v1/projects", .headers = &.{ tenant("nope"), auth } });
     defer res.deinit();
@@ -36,7 +42,7 @@ test "answers 404 for an unknown tenant" {
 }
 
 test "answers a tenant the user does not belong to like an unknown one (404, no enumeration)" {
-    const t = try test_app.boot(&.{});
+    const t = try boot();
     defer t.deinit();
     var ok = try t.request(.{ .target = "/api/v1/projects", .headers = &.{ tenant("acme"), acme_only } });
     defer ok.deinit();
@@ -50,7 +56,7 @@ test "answers a tenant the user does not belong to like an unknown one (404, no 
 }
 
 test "keeps each tenant's projects apart" {
-    const t = try test_app.boot(&.{});
+    const t = try boot();
     defer t.deinit();
     var created = try t.request(.{ .method = .POST, .target = "/api/v1/projects", .headers = &.{ tenant("acme"), auth, json_body }, .body = "{\"title\":\"Rocket skates\"}" });
     defer created.deinit();
@@ -85,7 +91,7 @@ fn idOf(rows: []const Project, title: []const u8) []const u8 {
 }
 
 test "imports idempotently: a title the workspace has is skipped, and every row comes back" {
-    const t = try test_app.boot(&.{});
+    const t = try boot();
     defer t.deinit();
     const Rows = struct { projects: []const Project };
     var first = try import(t, "acme", &.{ "Anvil", "Magnet" });
@@ -110,7 +116,7 @@ test "imports idempotently: a title the workspace has is skipped, and every row 
 }
 
 test "an invalid project is 422 with field errors" {
-    const t = try test_app.boot(&.{});
+    const t = try boot();
     defer t.deinit();
     var res = try t.request(.{ .method = .POST, .target = "/api/v1/projects", .headers = &.{ tenant("acme"), auth, json_body }, .body = "{\"title\":\"\"}" });
     defer res.deinit();

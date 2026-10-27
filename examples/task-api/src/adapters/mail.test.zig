@@ -21,6 +21,7 @@ const production = [_][2][]const u8{
 fn envOf(pairs: []const [2][]const u8) !std.process.Environ.Map {
     var env: std.process.Environ.Map = .init(testing.allocator);
     errdefer env.deinit();
+    try env.put("DB_FILE", ":memory:"); // not ./data/app.db
     for (pairs) |p| try env.put(p[0], p[1]);
     return env;
 }
@@ -102,5 +103,6 @@ test "ready reports each mail adapter" {
     try testing.expectEqual(.service_unavailable, res.status);
     try testing.expectEqualStrings("{\"status\":\"degraded\",\"checks\":[" ++
         "{\"name\":\"MailAdapter:transactional\",\"status\":\"down\"},{\"name\":\"MailAdapter:marketing\",\"status\":\"down\"}," ++
-        "{\"name\":\"storage:disk\",\"status\":\"up\"}]}", res.body);
+        "{\"name\":\"storage:disk\",\"status\":\"up\"}" ++
+        (if (@import("kzig").db.sqlite_built) ",{\"name\":\"sqlite\",\"status\":\"up\"}" else "") ++ "]}", res.body);
 }

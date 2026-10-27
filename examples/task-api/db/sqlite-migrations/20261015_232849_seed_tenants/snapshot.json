@@ -1,0 +1,94 @@
+{
+  "version": 1,
+  "dialect": "sqlite",
+  "tables": {
+    "projects": {
+      "name": "projects",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "nullable": false,
+          "default": "gen_random_uuid()",
+          "primaryKey": true
+        },
+        "tenantId": {
+          "name": "tenantId",
+          "type": "text",
+          "nullable": false,
+          "default": null,
+          "primaryKey": false
+        },
+        "title": {
+          "name": "title",
+          "type": "varchar(200)",
+          "nullable": false,
+          "default": null,
+          "primaryKey": false
+        },
+        "description": {
+          "name": "description",
+          "type": "text",
+          "nullable": true,
+          "default": null,
+          "primaryKey": false
+        },
+        "createdAt": {
+          "name": "createdAt",
+          "type": "timestamp",
+          "nullable": false,
+          "default": "CURRENT_TIMESTAMP",
+          "primaryKey": false
+        }
+      },
+      "indexes": [
+        {
+          "name": "projects_tenant_idx",
+          "columns": [
+            "tenantId"
+          ],
+          "unique": false
+        }
+      ],
+      "foreignKeys": [],
+      "checks": []
+    },
+    "tenants": {
+      "name": "tenants",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "varchar(64)",
+          "nullable": false,
+          "default": null,
+          "primaryKey": true
+        },
+        "name": {
+          "name": "name",
+          "type": "varchar(120)",
+          "nullable": false,
+          "default": null,
+          "primaryKey": false
+        },
+        "subdomain": {
+          "name": "subdomain",
+          "type": "varchar(63)",
+          "nullable": false,
+          "default": null,
+          "primaryKey": false
+        }
+      },
+      "indexes": [
+        {
+          "name": "tenants_subdomain_unique",
+          "columns": [
+            "subdomain"
+          ],
+          "unique": true
+        }
+      ],
+      "foreignKeys": [],
+      "checks": []
+    }
+  }
+}

@@ -29,6 +29,7 @@ test "is not served in production" {
     var key_buf: [64]u8 = undefined;
     var env: std.process.Environ.Map = .init(testing.allocator);
     defer env.deinit();
+    try env.put("DB_FILE", ":memory:"); // not ./data/app.db
     try env.put("NODE_ENV", "production");
     try env.put("APP_PUBLIC_URL", "https://api.example.com");
     try env.put("API_KEY", "prod-api-key-0123456789abcdef0123456");
@@ -55,6 +56,7 @@ test "is not served when NODE_ENV is unset" {
     var key_buf: [64]u8 = undefined;
     var env: std.process.Environ.Map = .init(testing.allocator);
     defer env.deinit();
+    try env.put("DB_FILE", ":memory:"); // not ./data/app.db
     try env.put("APP_PUBLIC_URL", "https://api.example.com");
     try env.put("API_KEY", "prod-api-key-0123456789abcdef0123456");
     try env.put("SIGNING_SECRET", "prod-signing-secret-0123456789abcdef");
