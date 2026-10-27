@@ -361,30 +361,41 @@ fn refuseCascadingRebuild(pool: *db.Pool, a: Allocator, id: []const u8, sql: []c
     // Tables dropped outright lose their rows before they go too.
     var emptied: std.ArrayList([]const u8) = .empty;
     try emptied.appendSlice(a, rebuilt);
-    var dropped: std.ArrayList([]const u8) = .empty;
+    const dropped = try droppedTables(a, sql);
+    for (dropped) |name| if (!contains(rebuilt, name)) try emptied.append(a, name);
+    if (emptied.items.len == 0) return;
+    const Name = struct { name: []const u8 };
+    for (try pool.query(a, Name, "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '\\_cf\\_%' ESCAPE '\\'", .{})) |t| {
+        if (contains(dropped, t.name)) continue;
+        for (try pool.query(a, Name, "SELECT \"table\" AS name FROM pragma_foreign_key_list(?1)", .{t.name})) |k| if (contains(emptied.items, k.name)) {
+            if (!builtin.is_test) std.log.err("migration {s} rebuilds or drops {s}, which {s} references: on D1 its DROP would run their ON DELETE (foreign keys are always on); make the change in steps that don't rebuild it", .{ id, k.name, t.name });
+            return error.RebuildOfReferencedTable;
+        };
+    }
+}
+
+/// `DROP TABLE [IF EXISTS] "<name>"` names, `""` unescaped; not the
+/// rebuilds' `_kick_new_` tables.
+pub fn droppedTables(a: Allocator, sql: []const u8) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
     var i: usize = 0;
     while (std.mem.findPos(u8, sql, i, "DROP TABLE ")) |at| {
         var j = at + "DROP TABLE ".len;
         if (std.mem.startsWith(u8, sql[j..], "IF EXISTS ")) j += "IF EXISTS ".len;
         i = j;
         if (j >= sql.len or sql[j] != '"') continue;
-        const end = std.mem.findScalarPos(u8, sql, j + 1, '"') orelse break;
-        const name = sql[j + 1 .. end];
-        i = end;
-        if (std.mem.startsWith(u8, name, "_kick_new_") or contains(rebuilt, name)) continue;
-        try dropped.append(a, name);
-        try emptied.append(a, name);
+        var name: std.ArrayList(u8) = .empty;
+        j += 1;
+        while (j < sql.len) : (j += 1) {
+            if (sql[j] == '"') {
+                if (j + 1 < sql.len and sql[j + 1] == '"') j += 1 else break;
+            }
+            try name.append(a, sql[j]);
+        }
+        i = j;
+        if (!std.mem.startsWith(u8, name.items, "_kick_new_")) try out.append(a, name.items);
     }
-    if (emptied.items.len == 0) return;
-    const Name = struct { name: []const u8 };
-    for (try pool.query(a, Name, "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '\\_cf\\_%' ESCAPE '\\'", .{})) |t| {
-        if (contains(dropped.items, t.name)) continue;
-        const list = try std.fmt.allocPrint(a, "SELECT \"table\" AS name FROM pragma_foreign_key_list(?1)", .{});
-        for (try pool.query(a, Name, list, .{t.name})) |k| if (contains(emptied.items, k.name)) {
-            if (!builtin.is_test) std.log.err("migration {s} rebuilds or drops {s}, which {s} references: on D1 its DROP would run their ON DELETE (foreign keys are always on); make the change in steps that don't rebuild it", .{ id, k.name, t.name });
-            return error.RebuildOfReferencedTable;
-        };
-    }
+    return out.items;
 }
 
 fn contains(list: []const []const u8, x: []const u8) bool {

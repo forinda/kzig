@@ -1,4 +1,4 @@
-//! Cloudflare D1 over its REST API (`POST …/d1/database/<id>/query`):
+//! Cloudflare D1 over its REST API (`POST …/d1/database/<id>/raw`):
 //! `d1://<account id>/<database id>?token=…`. D1 has no interactive
 //! transactions; a batch is one, and migrations go as batches.
 
@@ -44,8 +44,13 @@ pub const Client = struct {
             const eq = std.mem.findScalar(u8, kv, '=') orelse return error.InvalidDatabaseUrl;
             if (std.mem.eql(u8, kv[0..eq], "token")) token = kv[eq + 1 ..] else if (std.mem.eql(u8, kv[0..eq], "endpoint")) base = std.mem.trimEnd(u8, kv[eq + 1 ..], "/") else return error.InvalidDatabaseUrl;
         }
-        c.endpoint = try std.fmt.allocPrint(a, "{s}/accounts/{s}/d1/database/{s}/query", .{ base, account, database });
-        c.authorization = try std.mem.concat(a, u8, &.{ "Bearer ", token orelse return error.InvalidDatabaseUrl });
+        // `/raw`: rows as arrays, so column order and duplicate names survive.
+        c.endpoint = try std.fmt.allocPrint(a, "{s}/accounts/{s}/d1/database/{s}/raw", .{ base, account, database });
+        const t = token orelse return error.InvalidDatabaseUrl;
+        // Sent as a header: printable ASCII only.
+        if (t.len == 0) return error.InvalidDatabaseUrl;
+        for (t) |ch| if (ch < 0x21 or ch > 0x7e) return error.InvalidDatabaseUrl;
+        c.authorization = try std.mem.concat(a, u8, &.{ "Bearer ", t });
         return c;
     }
 
@@ -64,9 +69,12 @@ pub const Client = struct {
         try checkParams(params);
         const result = try c.post(a, body.written());
         const first = if (result.len > 0) result[0] else return 0;
-        const rows = (field(first, "results") orelse return error.DbDecode);
-        if (rows != .array) return error.DbDecode;
-        if (rows.array.items.len == 0) {
+        const results = field(first, "results") orelse return error.DbDecode;
+        const cols_v = field(results, "columns") orelse .null;
+        const rows_v = field(results, "rows") orelse .null;
+        const cols: []const std.json.Value = if (cols_v == .array) cols_v.array.items else &.{};
+        const rows: []const std.json.Value = if (rows_v == .array) rows_v.array.items else &.{};
+        if (rows.len == 0) {
             const changes = field(field(first, "meta") orelse .null, "changes") orelse return 0;
             return switch (changes) {
                 .number_string => |t| std.fmt.parseInt(u64, t, 10) catch 0,
@@ -74,17 +82,15 @@ pub const Client = struct {
                 else => 0,
             };
         }
-        // Rows are objects: the first one's keys name the columns.
-        const first_row = rows.array.items[0];
-        if (first_row != .object) return error.DbDecode;
-        const names = first_row.object.keys();
+        const names = try a.alloc([]const u8, cols.len);
+        for (cols, names) |col, *n| n.* = if (col == .string) col.string else return error.DbDecode;
         const values = try a.alloc(?[]const u8, names.len);
-        for (rows.array.items) |r| {
-            if (r != .object) return error.DbDecode;
-            for (names, values) |n, *out| out.* = try cell(a, r.object.get(n) orelse .null);
+        for (rows) |r| {
+            if (r != .array or r.array.items.len != names.len) return error.DbDecode;
+            for (r.array.items, values) |x, *out| out.* = try cell(a, x);
             try row(ctx, names, values);
         }
-        return rows.array.items.len;
+        return rows.len;
     }
 
     /// Several statements, no parameters (D1 runs them as a batch).
@@ -117,6 +123,7 @@ pub const Client = struct {
     /// The request; its `result` array, or the error D1 reports.
     fn post(c: *Client, a: Allocator, body: []const u8) Error![]const std.json.Value {
         var out: std.Io.Writer.Allocating = .init(a);
+        @import("libsql.zig").refreshTlsClock(&c.http, c.io);
         const res = c.http.fetch(.{
             .location = .{ .url = c.endpoint },
             .method = .POST,
@@ -141,7 +148,9 @@ pub const Client = struct {
             if (!builtin.is_test) std.log.err("db: d1: HTTP {d}: {s}", .{ @backingInt(res.status), message });
             if (std.mem.find(u8, message, "UNIQUE constraint failed") != null) return error.Conflict;
             // Not a statement's error: the token, the database, the service.
-            if (res.status == .unauthorized or res.status == .forbidden or @backingInt(res.status) >= 500) return error.ServiceUnavailable;
+            // Rate limits (Cloudflare's API allows ~1200 requests / 5 min) too.
+            const code = @backingInt(res.status);
+            if (code == 401 or code == 403 or code == 408 or code == 429 or code >= 500) return error.ServiceUnavailable;
             return error.DbError;
         }
         const result = field(v, "result") orelse return &.{};
@@ -150,17 +159,36 @@ pub const Client = struct {
 };
 
 fn checkParams(params: []const ?[]const u8) Error!void {
-    if (params.len <= max_params) return;
-    if (!builtin.is_test) std.log.err("db: d1: {d} parameters in one statement; D1 binds at most {d}", .{ params.len, max_params });
-    return error.TooManyParameters;
+    if (params.len > max_params) {
+        if (!builtin.is_test) std.log.err("db: d1: {d} parameters in one statement; D1 binds at most {d}", .{ params.len, max_params });
+        return error.TooManyParameters;
+    }
+    // JSON carries text as UTF-8; D1's API has no way to send other bytes.
+    for (params) |p| if (p) |v| if (!std.unicode.utf8ValidateSlice(v)) {
+        if (!builtin.is_test) std.log.err("db: d1: a parameter isn't UTF-8 text (D1's API can't bind bytes)", .{});
+        return error.DbError;
+    };
+}
+
+/// A parameter: a canonical integer D1 can hold exactly as a JSON number
+/// (a string would bind as TEXT, and `LIMIT '5'` is a datatype mismatch),
+/// anything else as a string.
+fn writeParam(w: *std.Io.Writer, p: ?[]const u8) !void {
+    const v = p orelse return w.writeAll("null");
+    if (@import("sqlite_int.zig").canonicalInt(v)) |n| if (@abs(n) <= (1 << 53)) return w.writeAll(v);
+    try std.json.Stringify.value(v, .{}, w);
 }
 
 fn writeStmt(w: *std.Io.Writer, s: Stmt) !void {
     try w.writeAll("{\"sql\":");
     try std.json.Stringify.value(s.sql, .{}, w);
     if (s.params.len > 0) {
-        try w.writeAll(",\"params\":");
-        try std.json.Stringify.value(s.params, .{}, w);
+        try w.writeAll(",\"params\":[");
+        for (s.params, 0..) |p, i| {
+            if (i > 0) try w.writeByte(',');
+            try writeParam(w, p);
+        }
+        try w.writeByte(']');
     }
     try w.writeByte('}');
 }
@@ -248,6 +276,8 @@ const FakeD1 = if (@import("kzig_options").sqlite) struct {
     conn: *sqlite.Conn,
     fut: std.Io.Future(void) = undefined,
     requests: std.atomic.Value(u32) = .init(0),
+    /// Answer every request with this status (rate limits, outages).
+    status: std.http.Status = .ok,
     last_auth: [64]u8 = undefined,
     last_auth_len: usize = 0,
 
@@ -292,13 +322,16 @@ const FakeD1 = if (@import("kzig_options").sqlite) struct {
             f.last_auth_len = @min(h.value.len, f.last_auth.len);
             @memcpy(f.last_auth[0..f.last_auth_len], h.value[0..f.last_auth_len]);
         };
-        const path_ok = std.mem.eql(u8, req.head.target, "/accounts/acct/d1/database/dbid/query");
+        const path_ok = std.mem.eql(u8, req.head.target, "/accounts/acct/d1/database/dbid/raw");
         var body_buf: [4096]u8 = undefined;
         const body = try req.server.reader.bodyReader(&body_buf, req.head.transfer_encoding, req.head.content_length).allocRemaining(a, .limited(1 << 20));
         const v = try std.json.parseFromSliceLeaky(std.json.Value, a, body, .{});
         var out: std.Io.Writer.Allocating = .init(a);
         var status: std.http.Status = .ok;
-        if (!path_ok) {
+        if (f.status != .ok) {
+            status = f.status;
+            try out.writer.writeAll("{\"result\":[],\"success\":false,\"errors\":[{\"code\":971,\"message\":\"Please wait and consider throttling your request speed\"}],\"messages\":[]}");
+        } else if (!path_ok) {
             status = .not_found;
             try out.writer.writeAll("{\"result\":[],\"success\":false,\"errors\":[{\"code\":7404,\"message\":\"no such database\"}],\"messages\":[]}");
         } else if (v.object.get("batch")) |batch| {
@@ -336,44 +369,54 @@ const FakeD1 = if (@import("kzig_options").sqlite) struct {
         try w.writeAll("}],\"messages\":[]}");
     }
 
-    /// One `{sql, params}`: rows as objects, as D1 returns them.
+    /// One `{sql, params}`, answered as D1's `/raw` does.
     fn one(f: *FakeD1, a: std.mem.Allocator, stmt: std.json.Value, w: *std.Io.Writer) !void {
         const sql = stmt.object.get("sql").?.string;
         var params: std.ArrayList(?[]const u8) = .empty;
-        if (stmt.object.get("params")) |ps| for (ps.array.items) |p| try params.append(a, switch (p) {
-            .null => null,
-            .string => |t| t,
-            .integer => |n| try std.fmt.allocPrint(a, "{d}", .{n}),
-            else => return error.BadParam,
-        });
+        var ints: std.ArrayList(bool) = .empty;
+        // As D1 binds them: a JSON string as TEXT, a number as INTEGER.
+        if (stmt.object.get("params")) |ps| for (ps.array.items) |p| {
+            try ints.append(a, p == .integer);
+            try params.append(a, switch (p) {
+                .null => null,
+                .string => |t| t,
+                .integer => |n| try std.fmt.allocPrint(a, "{d}", .{n}),
+                else => return error.BadParam,
+            });
+        };
+        f.conn.ints = ints.items;
+        defer f.conn.ints = null;
+        // `/raw`'s shape: column names once, rows as arrays.
         const Rows = struct {
-            w: *std.Io.Writer,
+            columns: std.Io.Writer.Allocating,
+            rows: std.Io.Writer.Allocating,
             first: bool = true,
             fn add(r: *@This(), names: []const []const u8, values: []const ?[]const u8) error{OutOfMemory}!void {
                 r.write(names, values) catch return error.OutOfMemory;
             }
             fn write(r: *@This(), names: []const []const u8, values: []const ?[]const u8) !void {
-                try r.w.writeAll(if (r.first) "{" else ",{");
+                if (r.first) for (names, 0..) |n, i| {
+                    if (i > 0) try r.columns.writer.writeByte(',');
+                    try std.json.Stringify.value(n, .{}, &r.columns.writer);
+                };
+                try r.rows.writer.writeAll(if (r.first) "[" else ",[");
                 r.first = false;
-                for (names, values, 0..) |n, val, i| {
-                    if (i > 0) try r.w.writeByte(',');
-                    try std.json.Stringify.value(n, .{}, r.w);
-                    try r.w.writeByte(':');
+                for (values, 0..) |val, i| {
+                    if (i > 0) try r.rows.writer.writeByte(',');
                     if (val) |x| {
-                        if (@import("sqlite_int.zig").canonicalInt(x) != null) try r.w.writeAll(x) else try std.json.Stringify.value(x, .{}, r.w);
-                    } else try r.w.writeAll("null");
+                        if (@import("sqlite_int.zig").canonicalInt(x) != null) try r.rows.writer.writeAll(x) else try std.json.Stringify.value(x, .{}, &r.rows.writer);
+                    } else try r.rows.writer.writeAll("null");
                 }
-                try r.w.writeByte('}');
+                try r.rows.writer.writeByte(']');
             }
         };
-        try w.writeAll("{\"results\":[");
-        var rows: Rows = .{ .w = w };
+        var rows: Rows = .{ .columns = .init(a), .rows = .init(a) };
         // Several statements without parameters run as a script (D1 batches them).
         const changes = if (params.items.len == 0 and std.mem.countScalar(u8, std.mem.trimEnd(u8, sql, " \n;"), ';') > 0) blk: {
             try f.conn.script(sql);
             break :blk 0;
         } else try f.conn.run(sql, params.items, &rows, Rows.add);
-        try w.print("],\"success\":true,\"meta\":{{\"changes\":{d},\"last_row_id\":0}}}}", .{if (rows.first) changes else 0});
+        try w.print("{{\"results\":{{\"columns\":[{s}],\"rows\":[{s}]}},\"success\":true,\"meta\":{{\"changes\":{d},\"last_row_id\":0}}}}", .{ rows.columns.written(), rows.rows.written(), if (rows.first) changes else 0 });
     }
 } else void;
 
@@ -466,4 +509,36 @@ test "d1: migrations as one batch each; a failing one leaves nothing; a rebuild 
     );
     try testing.expectError(error.RebuildOfReferencedTable, migrate.latest(&pool, a, try migrate.load(testing.io, a, dir), o));
     try testing.expectEqual(1, (try pool.queryOne(a, struct { n: i64 }, "SELECT count(*) AS n FROM posts", .{})).?.n);
+}
+
+test "d1: duplicate column names keep their order; LIMIT takes a parameter; 429 is ServiceUnavailable; non-UTF-8 is refused" {
+    if (FakeD1 == void) return error.SkipZigTest;
+    var fake: FakeD1 = undefined;
+    try fake.start();
+    defer fake.stop();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var pool = try fakePool(&fake, a);
+    defer pool.deinit();
+    try testing.expectEqual(1, (try pool.queryOne(a, struct { id: i64 }, "SELECT 1 AS id, 2 AS id LIMIT ?1", .{1})).?.id);
+    const before = fake.requests.load(.acquire);
+    try testing.expectError(error.DbError, pool.exec("SELECT ?1", .{@as([]const u8, "a\xffb")}));
+    try testing.expectEqual(before, fake.requests.load(.acquire));
+    fake.status = .too_many_requests;
+    try testing.expectError(error.ServiceUnavailable, pool.exec("SELECT 1", .{}));
+}
+
+test "d1: dropped table names, quotes doubled" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const got = try @import("migrate.zig").droppedTables(arena.allocator(), "DROP TABLE \"a\"\"b\";\nDROP TABLE IF EXISTS \"c\";");
+    try testing.expectEqual(2, got.len);
+    try testing.expectEqualStrings("a\"b", got[0]);
+    try testing.expectEqualStrings("c", got[1]);
+}
+
+test "d1 URLs: a token must be there and be a header value" {
+    try testing.expectError(error.InvalidDatabaseUrl, Client.init(testing.io, testing.allocator, "d1://a/b?token="));
+    try testing.expectError(error.InvalidDatabaseUrl, Client.init(testing.io, testing.allocator, "d1://a/b?token=x\ny"));
 }

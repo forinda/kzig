@@ -12,6 +12,9 @@ const Error = pg.Error;
 pub const Conn = struct {
     handle: *c.sqlite3,
     gpa: Allocator,
+    /// Tests' fake D1 binds as D1 does: these params as integers, the rest
+    /// as text (instead of the canonical-integer rule).
+    ints: ?[]const bool = null,
 
     /// `path` as SQLite takes it: a file, or `:memory:`.
     pub fn open(gpa: Allocator, path: []const u8) !*Conn {
@@ -75,7 +78,7 @@ pub const Conn = struct {
             const at: c_int = @intCast(i);
             // The params are alive until the statement is finalized: no copy.
             const rc = if (param) |v|
-                (if (canonicalInt(v)) |n| c.sqlite3_bind_int64(st, at, n) else c.sqlite3_bind_text64(st, at, v.ptr, v.len, null, c.SQLITE_UTF8))
+                (if ((if (conn.ints) |ints| (if (ints[i - 1]) canonicalInt(v) else null) else canonicalInt(v))) |n| c.sqlite3_bind_int64(st, at, n) else c.sqlite3_bind_text64(st, at, v.ptr, v.len, null, c.SQLITE_UTF8))
             else
                 c.sqlite3_bind_null(st, at);
             if (rc != c.SQLITE_OK) return conn.fail();

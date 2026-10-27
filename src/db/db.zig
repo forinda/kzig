@@ -249,7 +249,9 @@ pub const Pool = struct {
     /// D1 only: statements in one transaction, all or none.
     pub fn batch(p: *Pool, stmts: []const d1.Stmt) !void {
         if (p.driver != .d1) return error.BatchUnsupported;
-        return p.driver.d1.batch(stmts);
+        const c = try p.acquire();
+        defer p.release(c);
+        return c.d1.batch(stmts);
     }
 
     /// Migrations go as batches (`batch`) instead of transactions.
