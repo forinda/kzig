@@ -21,15 +21,22 @@ fn indexOf(comptime types: []const type, comptime T: type) ?usize {
     return null;
 }
 
-/// The service a field is wired to, or null for a plain field.
-fn depOf(comptime services: []const type, comptime S: type, comptime name: []const u8, comptime F: type) ?usize {
-    const p = switch (@typeInfo(F)) {
+/// The service a field is wired to, or null for a plain field. `*S`,
+/// `*const S`, `?*S` and `?*const S` wire to service `S`; a pointer to
+/// anything else needs a default (a callback, a string) or it's an error.
+fn depOf(comptime services: []const type, comptime S: type, comptime name: []const u8, comptime F: type, comptime has_default: bool) ?usize {
+    const P = switch (@typeInfo(F)) {
+        .optional => |o| o.child,
+        else => F,
+    };
+    const p = switch (@typeInfo(P)) {
         .pointer => |p| p,
         else => return null,
     };
     if (p.size != .one) return null;
-    return indexOf(services, p.child) orelse
-        @compileError(@typeName(S) ++ "." ++ name ++ ": no service " ++ @typeName(p.child));
+    if (indexOf(services, p.child)) |i| return i;
+    if (has_default) return null;
+    @compileError(@typeName(S) ++ "." ++ name ++ ": no service " ++ @typeName(p.child));
 }
 
 /// Service indices with every service after its dependencies.
@@ -52,8 +59,8 @@ fn initOrder(comptime services: []const type) [services.len]usize {
                 const saved = w.path;
                 w.path = w.path ++ @typeName(S) ++ " -> ";
                 const info = @typeInfo(S).@"struct";
-                for (info.field_names, info.field_types) |name, F| {
-                    if (depOf(services, S, name, F)) |d| w.visit(d);
+                for (info.field_names, info.field_types, info.field_attrs) |name, F, attrs| {
+                    if (depOf(services, S, name, F, attrs.defaultValue(F) != null)) |d| w.visit(d);
                 }
                 w.path = saved;
                 w.state[i] = .done;
@@ -116,7 +123,7 @@ pub fn Container(comptime listed: []const type) type {
                 const seeded = comptime isSeed(Seeds, S);
                 const info = @typeInfo(S).@"struct";
                 inline for (info.field_names, info.field_types, info.field_attrs) |name, F, attrs| {
-                    if (comptime depOf(services, S, name, F)) |d| {
+                    if (comptime depOf(services, S, name, F, attrs.defaultValue(F) != null)) |d| {
                         @field(self.instances[i], name) = &self.instances[d];
                     } else if (!seeded) {
                         @field(self.instances[i], name) = comptime attrs.defaultValue(F) orelse
@@ -263,4 +270,25 @@ test "unique removes duplicates" {
     const u = comptime unique(&.{ Repo, Log, Repo, Service, Log });
     try testing.expectEqual(3, u.len);
     try testing.expect(u[0] == Repo and u[1] == Log and u[2] == Service);
+}
+
+test "optional service pointer is wired" {
+    const Unlisted = struct {};
+    const Opt = struct { repo: ?*Repo = null, unlisted: ?*Unlisted = null };
+    var c: Container(&.{ Opt, Repo, Log }) = undefined;
+    try c.initWith(.{Log{}});
+    defer c.deinit();
+    try testing.expectEqual(c.get(Repo), c.get(Opt).repo.?);
+    try testing.expectEqual(null, c.get(Opt).unlisted);
+}
+
+fn noop() void {}
+
+test "a defaulted pointer to a non-service is a plain field" {
+    const Cb = struct { cb: *const fn () void = &noop, name: *const [2]u8 = "hi" };
+    var c: Container(&.{Cb}) = undefined;
+    try c.initWith(.{});
+    defer c.deinit();
+    try testing.expectEqual(&noop, c.get(Cb).cb);
+    try testing.expectEqualStrings("hi", c.get(Cb).name);
 }

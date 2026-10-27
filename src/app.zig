@@ -55,6 +55,7 @@ pub fn App(comptime spec: anytype) type {
     const Config = opt(spec, "config", struct {});
     const api_prefix: []const u8 = opt(spec, "api_prefix", @as([]const u8, "/api"));
     const default_version: u16 = opt(spec, "default_version", @as(u16, 1));
+    if (api_prefix.len > 0 and api_prefix[0] != '/') @compileError("api_prefix must be empty or start with '/': \"" ++ api_prefix ++ "\"");
     const modules: []const type = @as([]const type, spec.modules) ++
         (if (opt(spec, "health", true)) &[_]type{health.Module} else &[_]type{});
 
@@ -114,6 +115,7 @@ fn buildRoutes(comptime AppT: type, comptime modules: []const type, comptime api
         var list: []const router.Route = &.{};
         var owners: []const []const u8 = &.{};
         for (modules) |M| {
+            if (M.path.len > 0 and M.path[0] != '/') @compileError(M.name ++ ": module path must be empty or start with '/': \"" ++ M.path ++ "\"");
             const mount = (if (M.prefix) api_prefix else "") ++ switch (M.version) {
                 .default => std.fmt.comptimePrint("/v{d}", .{default_version}),
                 .none => "",

@@ -51,4 +51,6 @@ const compile_errors = [_][2][]const u8{
     .{ "duplicate_route", "duplicate route GET /api/v1/x/:key" },
     .{ "override_outside_test", "App overrides are only allowed in tests" },
     .{ "unknown_module_option", "Module has no option .paths" },
+    .{ "module_path_without_slash", "M: module path must be empty or start with '/'" },
+    .{ "api_prefix_without_slash", "api_prefix must be empty or start with '/'" },
 };

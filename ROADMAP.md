@@ -92,6 +92,15 @@ Follow-ups:
 - [x] `examples` build step; example tests run under `zig build test`
 - [x] **Acceptance:** `examples/minimal-api` ported with its three tests
 
+Follow-ups:
+
+- [ ] Clear compile errors for `pub const init: S = .{}`, non-function handlers, handlers
+      without `self`, and non-`pub` handlers
+- [ ] `App.routes` usable outside `App.handle` (thunks assume `ctx.app`)
+- [ ] A `Config` override in tests skips reading env
+- [ ] Config parsing rejects `1_000`, `inf`, `nan`; bools case-insensitive
+- [ ] Document: don't call `deinit` after a failed `init`
+
 ### M3 — Middleware and contributors
 
 - [ ] Middleware `fn (*Ctx, *Next) !void` with `next.run()`, so it can wrap the handler
