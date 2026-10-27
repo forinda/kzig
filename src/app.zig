@@ -154,6 +154,7 @@ pub fn App(comptime spec: anytype) type {
 
         container: Services,
         config_arena: std.heap.ArenaAllocator,
+        health_cache: HealthCache = .{},
         /// Adapters whose `beforeMount` ran; they get `shutdown`.
         mounted: usize = 0,
 
@@ -176,6 +177,9 @@ pub fn App(comptime spec: anytype) type {
         pub fn initWith(self: *Self, io: std.Io, gpa: std.mem.Allocator, env: *const std.process.Environ.Map, overrides: anytype) !void {
             if (@typeInfo(@TypeOf(overrides)).@"struct".field_names.len > 0 and !builtin.is_test)
                 @compileError("App overrides are only allowed in tests");
+            // `self` is usually `undefined` before init: no field default applies.
+            self.health_cache = .{};
+            self.mounted = 0;
             self.config_arena = .init(gpa);
             errdefer self.config_arena.deinit();
             const arena = self.config_arena.allocator();
@@ -239,13 +243,41 @@ pub fn App(comptime spec: anytype) type {
             self.get(Process).draining.store(true, .release);
         }
 
+        const checked = blk: {
+            var out: []const type = &.{};
+            for (adapters) |A| {
+                if (@hasDecl(A, "onHealthCheck")) out = out ++ .{A};
+            }
+            break :blk out;
+        };
+
+        /// Probes within a second share one run (KickJS caches 1 s); a run
+        /// checks every adapter at once, a check over 2 s counts as down.
+        const HealthCache = struct {
+            mutex: std.Io.Mutex = .init,
+            at_ms: ?i64 = null,
+            results: [checked.len]health.HealthCheck = undefined,
+        };
+
         fn healthChecks(ptr: *anyopaque, arena: std.mem.Allocator) anyerror![]const health.HealthCheck {
             const self: *Self = @ptrCast(@alignCast(ptr));
-            var out: std.ArrayList(health.HealthCheck) = .empty;
-            inline for (adapters) |A| {
-                if (@hasDecl(A, "onHealthCheck")) try out.append(arena, self.get(A).onHealthCheck());
+            const io = self.get(Process).io;
+            const cache = &self.health_cache;
+            cache.mutex.lockUncancelable(io);
+            defer cache.mutex.unlock(io);
+            if (cache.at_ms == null or nowMs(io) - cache.at_ms.? >= 1000) {
+                var slots: [checked.len]health.Slot = @splat(.{});
+                var group: std.Io.Group = .init;
+                inline for (checked, 0..) |A, i| {
+                    group.concurrent(io, health.runCheck(A), .{ self.get(A), &slots[i] }) catch
+                        slots[i].store(self.get(A).onHealthCheck());
+                }
+                health.waitAll(io, &slots, 2000);
+                group.cancel(io);
+                inline for (checked, 0..) |A, i| cache.results[i] = slots[i].get() orelse .{ .name = @typeName(A), .status = .down };
+                cache.at_ms = nowMs(io);
             }
-            return out.items;
+            return arena.dupe(health.HealthCheck, &cache.results);
         }
 
         /// The server is listening: adapter `afterStart`.
@@ -531,6 +563,10 @@ const ParamSource = struct {
         return arena.dupe([]const u8, &.{v});
     }
 };
+
+fn nowMs(io: std.Io) i64 {
+    return @intCast(@divTrunc(std.Io.Clock.awake.now(io).toNanoseconds(), std.time.ns_per_ms));
+}
 
 fn appOf(comptime AppT: type, ctx: *Ctx) *AppT {
     return @ptrCast(@alignCast(ctx.app.?));

@@ -115,7 +115,8 @@ pub fn Server(comptime App: type) type {
                 self.permits.post(io);
             }
             var deadline: std.atomic.Value(i64) = .init(std.math.maxInt(i64));
-            var dog = if (self.options.head_timeout_ms > 0 or self.options.body_timeout_ms > 0)
+            // Also with client timeouts off: the shutdown cutoff runs through it.
+            var dog = if (self.options.head_timeout_ms > 0 or self.options.body_timeout_ms > 0 or self.options.shutdown_timeout_ms > 0)
                 io.concurrent(watchdog, .{ io, stream, &deadline, &self.drain_deadline }) catch null
             else
                 null;
@@ -272,15 +273,59 @@ pub fn serve(comptime App: type, app: *App, io: Io, gpa: std.mem.Allocator, opti
     while (signals.count() == 0 and !stopped.load(.acquire)) {
         io.sleep(.fromMilliseconds(100), .awake) catch break;
     }
-    if (!stopped.load(.acquire)) {
-        if (!builtin.is_test) std.log.info("shutting down: draining connections", .{});
-        server.shutdown();
+    if (stopped.load(.acquire)) return fut.await(io);
+    if (!builtin.is_test) std.log.info("shutting down: draining connections", .{});
+    server.shutdown();
+
+    // A socket is cut at shutdown_timeout_ms, but a handler that never does
+    // I/O can't be. Freeing services under it would be worse than leaving:
+    // give it a second more, then exit without running deinit.
+    var drain: Drain = .{};
+    try drain.start(io, &fut);
+    if (!drain.wait(io, options.shutdown_timeout_ms +| 1000)) {
+        std.log.err("shutdown: requests still running after {d} ms; exiting", .{options.shutdown_timeout_ms});
+        exitNow(1);
     }
-    return fut.cancel(io) catch |err| switch (err) {
-        error.Canceled => {},
-        else => err,
-    };
+    drain.finish(io);
 }
+
+/// Exit from anywhere, including a signal handler: no atexit handlers, no
+/// stdio locks (libc `exit` takes them).
+fn exitNow(code: u8) noreturn {
+    if (builtin.link_libc) std.c._exit(code);
+    if (builtin.os.tag == .linux) std.os.linux.exit_group(code);
+    std.process.exit(code);
+}
+
+/// Waits for a cancelled `run` to finish its requests in flight, in the
+/// background, so the wait can be bounded.
+const Drain = struct {
+    done: std.atomic.Value(bool) = .init(false),
+    task: Io.Future(void) = undefined,
+
+    fn start(self: *Drain, io: Io, fut: *Io.Future(anyerror!void)) !void {
+        self.task = try io.concurrent(cancelRun, .{ io, fut, &self.done });
+    }
+
+    /// Whether `run` finished within `ms`.
+    fn wait(self: *Drain, io: Io, ms: u32) bool {
+        const until = nowMs(io) + ms;
+        while (!self.done.load(.acquire)) {
+            if (nowMs(io) >= until) return false;
+            io.sleep(.fromMilliseconds(10), .awake) catch return self.done.load(.acquire);
+        }
+        return true;
+    }
+
+    fn finish(self: *Drain, io: Io) void {
+        self.task.await(io);
+    }
+
+    fn cancelRun(io: Io, fut: *Io.Future(anyerror!void), done: *std.atomic.Value(bool)) void {
+        fut.cancel(io) catch {};
+        done.store(true, .release);
+    }
+};
 
 fn runUntilStopped(comptime App: type) fn (*Server(App), *std.atomic.Value(bool)) anyerror!void {
     return struct {
@@ -293,6 +338,7 @@ fn runUntilStopped(comptime App: type) fn (*Server(App), *std.atomic.Value(bool)
 
 const signals = struct {
     var received: std.atomic.Value(u32) = .init(0);
+    var installed: std.atomic.Value(bool) = .init(false);
 
     fn count() u32 {
         return received.load(.acquire);
@@ -300,7 +346,7 @@ const signals = struct {
 
     fn handler(_: std.posix.SIG) callconv(.c) void {
         // Only async-signal-safe work here: the server polls the counter.
-        if (received.fetchAdd(1, .acq_rel) > 0) std.process.exit(130);
+        if (received.fetchAdd(1, .acq_rel) > 0) exitNow(130);
     }
 
     fn install() void {
@@ -313,6 +359,7 @@ const signals = struct {
         };
         std.posix.sigaction(.INT, &act, null);
         std.posix.sigaction(.TERM, &act, null);
+        installed.store(true, .release);
     }
 };
 
@@ -651,6 +698,12 @@ const LifecycleApp = struct {
                 return ctx.req.body;
             }
         }.f),
+        router.route(.GET, "/stuck", struct {
+            fn f(_: *Ctx) ![]const u8 {
+                try testing.io.sleep(.fromMilliseconds(2500), .awake);
+                return "late";
+            }
+        }.f),
     });
 
     pub fn handle(_: *LifecycleApp, ctx: *Ctx) void {
@@ -781,7 +834,8 @@ test "serve shuts down on SIGTERM" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     var app: LifecycleApp = .{};
     var fut = try testing.io.concurrent(serveErased, .{&app});
-    try testing.io.sleep(.fromMilliseconds(100), .awake);
+    // Raising before the handler is installed would kill the test runner.
+    while (!signals.installed.load(.acquire)) try testing.io.sleep(.fromMilliseconds(5), .awake);
     try std.posix.raise(.TERM);
     try fut.await(testing.io);
     try testing.expect(app.drained);
@@ -789,4 +843,35 @@ test "serve shuts down on SIGTERM" {
 
 fn serveErased(app: *LifecycleApp) anyerror!void {
     return serve(LifecycleApp, app, testing.io, testing.allocator, .{ .port = 0 });
+}
+
+test "shutdown cuts a stuck body even with client timeouts off" {
+    var r: Running = .{};
+    try r.start(.{ .head_timeout_ms = 0, .body_timeout_ms = 0, .shutdown_timeout_ms = 200 });
+    const s = try r.connect();
+    defer s.close(testing.io);
+    try send(s, "POST /echo HTTP/1.1\r\nhost: x\r\ncontent-length: 100\r\n\r\nabc");
+    try testing.io.sleep(.fromMilliseconds(50), .awake);
+    const t0 = Io.Clock.awake.now(testing.io);
+    r.srv.shutdown();
+    try r.finish();
+    try testing.expect(elapsedMs(t0) < 1500);
+}
+
+test "draining gives up on a handler still running after the grace period" {
+    var r: Running = .{};
+    try r.start(.{ .shutdown_timeout_ms = 100 });
+    const s = try r.connect();
+    defer s.close(testing.io);
+    try send(s, "GET /stuck HTTP/1.1\r\nhost: x\r\n\r\n");
+    try testing.io.sleep(.fromMilliseconds(50), .awake);
+    r.srv.shutdown();
+    var drain: Drain = .{};
+    try drain.start(testing.io, &r.fut);
+    const t0 = Io.Clock.awake.now(testing.io);
+    try testing.expect(!drain.wait(testing.io, 300));
+    try testing.expect(elapsedMs(t0) < 1000);
+    // Let the stuck handler end so the test cleans up.
+    drain.finish(testing.io);
+    r.srv.deinit();
 }

@@ -10,6 +10,39 @@ pub const HealthCheck = struct {
     status: enum { up, down },
 };
 
+/// One check's result, written by the task running it.
+pub const Slot = struct {
+    done: std.atomic.Value(bool) = .init(false),
+    value: HealthCheck = undefined,
+
+    pub fn store(self: *Slot, v: HealthCheck) void {
+        self.value = v;
+        self.done.store(true, .release);
+    }
+
+    pub fn get(self: *const Slot) ?HealthCheck {
+        return if (self.done.load(.acquire)) self.value else null;
+    }
+};
+
+pub fn runCheck(comptime A: type) fn (*A, *Slot) void {
+    return struct {
+        fn f(a: *A, slot: *Slot) void {
+            slot.store(a.onHealthCheck());
+        }
+    }.f;
+}
+
+/// Until every slot is done or `ms` passed.
+pub fn waitAll(io: std.Io, slots: []const Slot, ms: i64) void {
+    const start = std.Io.Clock.awake.now(io);
+    for (slots) |*s| while (s.get() == null) {
+        const elapsed = @divTrunc(start.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds(), std.time.ns_per_ms);
+        if (elapsed >= ms) return;
+        io.sleep(.fromMilliseconds(5), .awake) catch return;
+    };
+}
+
 /// How the health controller reaches the app's adapters; seeded by `App`.
 pub const Probe = struct {
     /// Set by App (optional only so DI treats it as a plain field).
@@ -114,4 +147,66 @@ test "draining is 503 and live says draining" {
     var live = try testing_rt.request(testing.allocator, &a, .{ .target = "/health/live" });
     defer live.deinit();
     try testing.expectEqualStrings("draining", (try live.json(struct { status: []const u8 })).status);
+}
+
+var slow_runs: std.atomic.Value(u32) = .init(0);
+
+fn Slow(comptime ms: i64, comptime label: []const u8) type {
+    return struct {
+        process: *const app.Process,
+        pub fn onHealthCheck(self: *@This()) HealthCheck {
+            _ = slow_runs.fetchAdd(1, .monotonic);
+            self.process.io.sleep(.fromMilliseconds(ms), .awake) catch return .{ .name = label, .status = .down };
+            return .{ .name = label, .status = .up };
+        }
+    };
+}
+
+fn elapsedMs(io: std.Io, since: std.Io.Timestamp) i64 {
+    return @intCast(@divTrunc(since.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds(), std.time.ns_per_ms));
+}
+
+test "checks run concurrently" {
+    const A = app.App(.{ .modules = &.{}, .adapters = &.{ Slow(300, "a"), Slow(300, "b") } });
+    var a: A = undefined;
+    var env: std.process.Environ.Map = .init(testing.allocator);
+    defer env.deinit();
+    try a.init(testing.io, testing.allocator, &env);
+    defer a.deinit();
+    const t0 = std.Io.Clock.awake.now(testing.io);
+    var res = try testing_rt.request(testing.allocator, &a, .{ .target = "/health/ready" });
+    defer res.deinit();
+    try testing.expectEqual(std.http.Status.ok, res.status);
+    try testing.expect(elapsedMs(testing.io, t0) < 550);
+}
+
+test "a check slower than the timeout is down" {
+    const A = app.App(.{ .modules = &.{}, .adapters = &.{ Slow(3000, "slow"), Slow(0, "fast") } });
+    var a: A = undefined;
+    var env: std.process.Environ.Map = .init(testing.allocator);
+    defer env.deinit();
+    try a.init(testing.io, testing.allocator, &env);
+    defer a.deinit();
+    const t0 = std.Io.Clock.awake.now(testing.io);
+    var res = try testing_rt.request(testing.allocator, &a, .{ .target = "/health/ready" });
+    defer res.deinit();
+    try testing.expectEqual(std.http.Status.service_unavailable, res.status);
+    try testing.expect(std.mem.indexOf(u8, res.body, "{\"name\":\"slow\",\"status\":\"down\"}") != null);
+    try testing.expect(std.mem.indexOf(u8, res.body, "{\"name\":\"fast\",\"status\":\"up\"}") != null);
+    try testing.expect(elapsedMs(testing.io, t0) < 2600);
+}
+
+test "probes within a second share one run" {
+    const A = app.App(.{ .modules = &.{}, .adapters = &.{Slow(0, "c")} });
+    var a: A = undefined;
+    var env: std.process.Environ.Map = .init(testing.allocator);
+    defer env.deinit();
+    try a.init(testing.io, testing.allocator, &env);
+    defer a.deinit();
+    const before = slow_runs.load(.monotonic);
+    for (0..3) |_| {
+        var res = try testing_rt.request(testing.allocator, &a, .{ .target = "/health/ready" });
+        res.deinit();
+    }
+    try testing.expectEqual(before + 1, slow_runs.load(.monotonic));
 }

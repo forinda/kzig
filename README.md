@@ -205,10 +205,14 @@ HTTP/1.1 503 Service Unavailable
 ```
 
 `kzig.Plugin(.{ .modules, .adapters, .middleware, .contributors, .settings })` bundles them.
-On SIGINT/SIGTERM `serve` stops accepting, health answers `draining`, requests in flight finish
-(cut after `shutdown_timeout_ms`, 30 s) and idle connections close; then `app.deinit()` runs
-adapters' `shutdown` in reverse dependency order. A contributor's `dispose(self, *V)` runs after
-each response — KickJS's request scope.
+On SIGINT/SIGTERM `serve` stops accepting new connections, requests in flight finish (their
+sockets are cut after `shutdown_timeout_ms`, 30 s; a handler still running a second later makes
+the process exit with status 1 rather than free services under it) and idle connections close;
+then `app.deinit()` runs adapters' `shutdown` in reverse dependency order. `/health/*` answer
+`draining` from the moment shutdown begins, to requests already in flight. `/health/ready` runs
+every adapter's check at once, counts one slower than 2 s as down, and shares a run between
+probes within a second. A contributor's `dispose(self, *V)` runs when its handler returns,
+before the response is written — a response body must not borrow memory `dispose` frees.
 
 ## Testing
 

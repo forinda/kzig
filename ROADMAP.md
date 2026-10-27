@@ -175,6 +175,14 @@ Follow-ups:
 - [ ] Adapter `when` (conditional adapters) and `introspect` / DevTools tabs
 - [ ] The signal flag is polled every 100 ms; wake at once (self-pipe / signalfd)
 - [ ] `Io.Threaded` has no connect timeout; the mail check races a sleep instead
+- [ ] `preStopDelay`: keep accepting for a while after draining starts, so load balancers see
+      `/health/ready` answer 503 `draining`
+- [ ] Clear compile errors for adapter hooks with the wrong signature; accept `void` and `!void`
+      for both `beforeMount` and `shutdown`
+- [ ] Keep cancel protection through `lingerClose`
+- [ ] Mail check: IPv6 literal hosts (parse an IP before `HostName`)
+- [ ] A section `validate` error is passed through instead of reported as `OutOfMemory`
+- [ ] `serve` restores the previous signal handlers; skip `afterStart` when already draining
 
 ### M6 — http.zig runtime
 
