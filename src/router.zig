@@ -155,7 +155,7 @@ fn internalError(ctx: *Ctx, err: anyerror) void {
     ctx.json(.{
         .message = "Internal Server Error",
         .requestId = ctx.requestId(),
-        .@"error" = if (builtin.mode == .debug) @errorName(err) else null,
+        .@"error" = @as(?[]const u8, if (builtin.mode == .debug) @errorName(err) else null),
     }) catch {
         ctx.res.body = "{\"message\":\"Internal Server Error\"}";
         ctx.res.sent = true;

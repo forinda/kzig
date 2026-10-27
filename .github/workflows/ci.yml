@@ -10,6 +10,7 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
+        optimize: [Debug, ReleaseSafe]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -17,4 +18,4 @@ jobs:
         with:
           version: 0.17.0
       - run: zig fmt --check .
-      - run: zig build test --summary all
+      - run: zig build test -Doptimize=${{ matrix.optimize }} --summary all
