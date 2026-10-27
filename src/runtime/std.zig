@@ -23,6 +23,9 @@ pub const Options = struct {
     head_timeout_ms: u32 = 60_000,
     /// Time to receive the body, and again to write the response. 0 disables.
     body_timeout_ms: u32 = 300_000,
+    /// After `shutdown`, how long in-flight requests may take before their
+    /// sockets are shut down.
+    shutdown_timeout_ms: u32 = 30_000,
 };
 
 pub fn Server(comptime App: type) type {
@@ -35,6 +38,9 @@ pub fn Server(comptime App: type) type {
         options: Options,
         listener: Io.net.Server,
         permits: Io.Semaphore,
+        draining: std.atomic.Value(bool) = .init(false),
+        /// Caps every connection's deadline once draining.
+        drain_deadline: std.atomic.Value(i64) = .init(std.math.maxInt(i64)),
 
         /// `app` is an `*App` (or a `Router(...)` value) and must outlive the server.
         pub fn init(io: Io, gpa: std.mem.Allocator, app: *App, options: Options) !Self {
@@ -57,17 +63,20 @@ pub fn Server(comptime App: type) type {
             return self.listener.socket.address.getPort();
         }
 
-        /// Accepts until canceled; canceling also cancels open connections.
+        /// Accepts until canceled; canceling also cancels open connections,
+        /// except requests in flight, which finish first (see `shutdown`).
         pub fn run(self: *Self) !void {
             const io = self.io;
             var group: Io.Group = .init;
             defer group.cancel(io);
+            if (@hasDecl(App, "started")) self.app.started(.{ .port = self.port() });
             while (true) {
                 // Taken before accept, so a full server leaves new clients in
                 // the kernel backlog instead of spawning without bound.
                 try self.permits.wait(io);
                 const stream = self.listener.accept(io) catch |err| {
                     self.permits.post(io);
+                    if (self.draining.load(.acquire)) return;
                     if (!acceptRetryable(err)) return err;
                     if (!builtin.is_test) std.log.warn("accept: {t}", .{err});
                     // Back off so fd exhaustion doesn't spin; draining
@@ -84,6 +93,21 @@ pub fn Server(comptime App: type) type {
             }
         }
 
+        /// Starts a graceful shutdown (KickJS `app.shutdown()`): stop taking
+        /// connections, tell the app it is draining, answer in-flight
+        /// requests with `connection: close` and cut any still running after
+        /// `shutdown_timeout_ms`. Then cancel `run`: idle connections close at
+        /// once, in-flight requests finish first. Callable from any thread.
+        pub fn shutdown(self: *Self) void {
+            if (self.draining.swap(true, .acq_rel)) return;
+            if (self.options.shutdown_timeout_ms > 0)
+                self.drain_deadline.store(nowMs(self.io) + self.options.shutdown_timeout_ms, .monotonic);
+            if (@hasDecl(App, "beginDrain")) self.app.beginDrain();
+            // Wakes a blocked accept on Linux; elsewhere cancelling `run` does.
+            const listener: Io.net.Stream = .{ .socket = self.listener.socket };
+            listener.shutdown(self.io, .both) catch {};
+        }
+
         fn serveConnection(self: *Self, stream: Io.net.Stream) void {
             const io = self.io;
             defer {
@@ -92,7 +116,7 @@ pub fn Server(comptime App: type) type {
             }
             var deadline: std.atomic.Value(i64) = .init(std.math.maxInt(i64));
             var dog = if (self.options.head_timeout_ms > 0 or self.options.body_timeout_ms > 0)
-                io.concurrent(watchdog, .{ io, stream, &deadline }) catch null
+                io.concurrent(watchdog, .{ io, stream, &deadline, &self.drain_deadline }) catch null
             else
                 null;
             defer if (dog) |*d| d.cancel(io) catch {};
@@ -119,8 +143,13 @@ pub fn Server(comptime App: type) type {
                     writeRaw(&sw.interface, status);
                     return lingerClose(io, stream, &sr.interface);
                 };
-                switch (self.serveRequest(&req, arena.allocator(), &deadline) catch return) {
-                    .keep_alive => {},
+                // A request in flight is answered even if `run` is canceled for
+                // shutdown; only waiting for the next head is a cancel point.
+                const prev = io.swapCancelProtection(.blocked);
+                const next = self.serveRequest(&req, arena.allocator(), &deadline);
+                _ = io.swapCancelProtection(prev);
+                switch (next catch return) {
+                    .keep_alive => if (self.draining.load(.acquire)) return,
                     .close => return,
                     .linger => return lingerClose(io, stream, &sr.interface),
                 }
@@ -138,7 +167,7 @@ pub fn Server(comptime App: type) type {
                 .value = try arena.dupe(u8, h.value),
             });
             const method = req.head.method;
-            const keep_alive = req.head.keep_alive;
+            const client_keep_alive = req.head.keep_alive;
 
             const max = self.options.max_body_bytes;
             const content_length = req.head.content_length;
@@ -204,6 +233,7 @@ pub fn Server(comptime App: type) type {
                 out[n] = .{ .name = h.name, .value = h.value };
                 n += 1;
             }
+            const keep_alive = client_keep_alive and !self.draining.load(.acquire);
             try req.respond(content, .{ .status = status, .keep_alive = keep_alive, .extra_headers = out[0..n] });
             return if (keep_alive) .keep_alive else .close;
         }
@@ -224,6 +254,67 @@ pub fn Server(comptime App: type) type {
         }
     };
 }
+
+/// Runs `app` until SIGINT or SIGTERM, then shuts down gracefully: the
+/// server drains (see `Server.shutdown`) and `serve` returns, so the caller's
+/// `defer app.deinit()` runs adapter `shutdown` hooks. A second signal exits
+/// at once with status 130.
+pub fn serve(comptime App: type, app: *App, io: Io, gpa: std.mem.Allocator, options: Options) !void {
+    var server: Server(App) = try .init(io, gpa, app, options);
+    defer server.deinit();
+    signals.install();
+    if (!builtin.is_test) std.log.info("listening on http://{s}:{d}", .{ options.host, server.port() });
+
+    var stopped: std.atomic.Value(bool) = .init(false);
+    var fut = try io.concurrent(runUntilStopped(App), .{ &server, &stopped });
+    // ponytail: the signal flag is polled every 100 ms; a self-pipe or
+    // signalfd would wake at once.
+    while (signals.count() == 0 and !stopped.load(.acquire)) {
+        io.sleep(.fromMilliseconds(100), .awake) catch break;
+    }
+    if (!stopped.load(.acquire)) {
+        if (!builtin.is_test) std.log.info("shutting down: draining connections", .{});
+        server.shutdown();
+    }
+    return fut.cancel(io) catch |err| switch (err) {
+        error.Canceled => {},
+        else => err,
+    };
+}
+
+fn runUntilStopped(comptime App: type) fn (*Server(App), *std.atomic.Value(bool)) anyerror!void {
+    return struct {
+        fn f(server: *Server(App), stopped: *std.atomic.Value(bool)) anyerror!void {
+            defer stopped.store(true, .release);
+            return server.run();
+        }
+    }.f;
+}
+
+const signals = struct {
+    var received: std.atomic.Value(u32) = .init(0);
+
+    fn count() u32 {
+        return received.load(.acquire);
+    }
+
+    fn handler(_: std.posix.SIG) callconv(.c) void {
+        // Only async-signal-safe work here: the server polls the counter.
+        if (received.fetchAdd(1, .acq_rel) > 0) std.process.exit(130);
+    }
+
+    fn install() void {
+        if (builtin.os.tag == .windows) return;
+        received.store(0, .release);
+        const act: std.posix.Sigaction = .{
+            .handler = .{ .handler = handler },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        std.posix.sigaction(.INT, &act, null);
+        std.posix.sigaction(.TERM, &act, null);
+    }
+};
 
 /// What to do with a connection after a request.
 const Next = enum {
@@ -281,9 +372,9 @@ fn arm(io: Io, deadline: *std.atomic.Value(i64), timeout_ms: u32) void {
 /// Shuts the socket down once the deadline passes, which unblocks the
 /// connection's pending read or write. Socket-level timeouts don't work here:
 /// Io.Threaded treats the resulting EAGAIN as a bug and panics.
-fn watchdog(io: Io, stream: Io.net.Stream, deadline: *std.atomic.Value(i64)) Io.Cancelable!void {
+fn watchdog(io: Io, stream: Io.net.Stream, deadline: *std.atomic.Value(i64), drain_deadline: *std.atomic.Value(i64)) Io.Cancelable!void {
     while (true) {
-        const left = deadline.load(.monotonic) - nowMs(io);
+        const left = @min(deadline.load(.monotonic), drain_deadline.load(.monotonic)) - nowMs(io);
         if (left <= 0) {
             stream.shutdown(io, .both) catch {};
             return;
@@ -537,4 +628,165 @@ test "framing headers from a handler are not sent" {
     try testing.expectEqual(1, std.mem.count(u8, out, "content-length"));
     try testing.expect(std.mem.indexOf(u8, out, "content-length: 2\r\n") != null);
     try testing.expect(std.mem.indexOf(u8, out, "transfer-encoding") == null);
+}
+
+const LifecycleApp = struct {
+    port: u16 = 0,
+    drained: bool = false,
+
+    const R = router.Router(&.{
+        router.route(.GET, "/slow", struct {
+            fn f(_: *Ctx) ![]const u8 {
+                try testing.io.sleep(.fromMilliseconds(200), .awake);
+                return "done";
+            }
+        }.f),
+        router.route(.GET, "/hello", struct {
+            fn f(_: *Ctx) []const u8 {
+                return "hi";
+            }
+        }.f),
+        router.route(.POST, "/echo", struct {
+            fn f(ctx: *Ctx) []const u8 {
+                return ctx.req.body;
+            }
+        }.f),
+    });
+
+    pub fn handle(_: *LifecycleApp, ctx: *Ctx) void {
+        (R{}).handle(ctx);
+    }
+    pub fn started(self: *LifecycleApp, info: @import("../adapter.zig").StartInfo) void {
+        self.port = info.port;
+    }
+    pub fn beginDrain(self: *LifecycleApp) void {
+        self.drained = true;
+    }
+};
+
+const Running = struct {
+    app: LifecycleApp = .{},
+    srv: Server(LifecycleApp) = undefined,
+    fut: Io.Future(anyerror!void) = undefined,
+
+    fn start(self: *Running, opts: Options) !void {
+        var o = opts;
+        o.port = 0;
+        self.srv = try .init(testing.io, testing.allocator, &self.app, o);
+        self.fut = try testing.io.concurrent(runErased, .{&self.srv});
+    }
+    fn runErased(srv: *Server(LifecycleApp)) anyerror!void {
+        return srv.run();
+    }
+    fn connect(self: *Running) !Io.net.Stream {
+        const addr = try Io.net.IpAddress.parse("127.0.0.1", self.srv.port());
+        return addr.connect(testing.io, .{ .mode = .stream });
+    }
+    /// As `serve` does after `shutdown`: cancel `run`, which waits for
+    /// requests in flight.
+    fn finish(self: *Running) !void {
+        self.fut.cancel(testing.io) catch {};
+        self.srv.deinit();
+    }
+};
+
+fn send(stream: Io.net.Stream, raw: []const u8) !void {
+    var wbuf: [256]u8 = undefined;
+    var w = stream.writer(testing.io, &wbuf);
+    try w.interface.writeAll(raw);
+    try w.interface.flush();
+}
+
+fn readAll(stream: Io.net.Stream) ![]u8 {
+    var rbuf: [1024]u8 = undefined;
+    var r = stream.reader(testing.io, &rbuf);
+    return r.interface.allocRemaining(testing.allocator, .limited(64 * 1024));
+}
+
+fn elapsedMs(since: Io.Timestamp) i64 {
+    return @intCast(@divTrunc(since.durationTo(Io.Clock.awake.now(testing.io)).toNanoseconds(), std.time.ns_per_ms));
+}
+
+test "started is called with the port" {
+    var r: Running = .{};
+    try r.start(.{});
+    // run calls started before accepting; a request proves it got there.
+    const s = try r.connect();
+    try send(s, "GET /hello HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n");
+    const out = try readAll(s);
+    testing.allocator.free(out);
+    s.close(testing.io);
+    try testing.expectEqual(r.srv.port(), r.app.port);
+    r.srv.shutdown();
+    try r.finish();
+}
+
+test "shutdown lets an in-flight request finish" {
+    var r: Running = .{};
+    try r.start(.{});
+    const s = try r.connect();
+    defer s.close(testing.io);
+    try send(s, "GET /slow HTTP/1.1\r\nhost: x\r\n\r\n");
+    try testing.io.sleep(.fromMilliseconds(50), .awake);
+    r.srv.shutdown();
+    const out = try readAll(s);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.endsWith(u8, out, "\r\n\r\ndone"));
+    try testing.expect(std.mem.indexOf(u8, out, "connection: close") != null);
+    try testing.expect(r.app.drained);
+    try r.finish();
+}
+
+test "idle keep-alive connections close on shutdown" {
+    var r: Running = .{};
+    try r.start(.{});
+    const s = try r.connect();
+    defer s.close(testing.io);
+    try send(s, "GET /hello HTTP/1.1\r\nhost: x\r\n\r\n");
+    try testing.io.sleep(.fromMilliseconds(50), .awake);
+    const t0 = Io.Clock.awake.now(testing.io);
+    r.srv.shutdown();
+    try r.finish();
+    const out = try readAll(s);
+    defer testing.allocator.free(out);
+    try testing.expectEqual(1, std.mem.count(u8, out, "HTTP/1.1 200"));
+    try testing.expect(elapsedMs(t0) < 1000);
+}
+
+test "a stuck request is cut at shutdown_timeout_ms" {
+    var r: Running = .{};
+    try r.start(.{ .shutdown_timeout_ms = 200 });
+    const s = try r.connect();
+    defer s.close(testing.io);
+    // Half a body: the server waits for the rest.
+    try send(s, "POST /echo HTTP/1.1\r\nhost: x\r\ncontent-length: 100\r\n\r\nabc");
+    try testing.io.sleep(.fromMilliseconds(50), .awake);
+    const t0 = Io.Clock.awake.now(testing.io);
+    r.srv.shutdown();
+    try r.finish();
+    try testing.expect(elapsedMs(t0) < 1500);
+}
+
+test "new connections are refused after shutdown" {
+    var r: Running = .{};
+    try r.start(.{});
+    const port = r.srv.port();
+    r.srv.shutdown();
+    try r.finish();
+    const addr = try Io.net.IpAddress.parse("127.0.0.1", port);
+    try testing.expectError(error.ConnectionRefused, addr.connect(testing.io, .{ .mode = .stream }));
+}
+
+test "serve shuts down on SIGTERM" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var app: LifecycleApp = .{};
+    var fut = try testing.io.concurrent(serveErased, .{&app});
+    try testing.io.sleep(.fromMilliseconds(100), .awake);
+    try std.posix.raise(.TERM);
+    try fut.await(testing.io);
+    try testing.expect(app.drained);
+}
+
+fn serveErased(app: *LifecycleApp) anyerror!void {
+    return serve(LifecycleApp, app, testing.io, testing.allocator, .{ .port = 0 });
 }
