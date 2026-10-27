@@ -49,6 +49,11 @@ write_seq: u64,
 received_close_notify: bool,
 allow_truncation_attacks: bool,
 application_cipher: tls.ApplicationCipher,
+/// kzig: RFC 5929 `tls-server-end-point`: the hash of the server's
+/// certificate (SHA-256, or SHA-384/512 when it was signed with those), for
+/// SCRAM channel binding. Empty for an Ed25519 certificate (no hash defined).
+server_end_point: [64]u8 = undefined,
+server_end_point_len: u8 = 0,
 
 /// If non-null, ssl secrets are logged to a stream. Creating such a log file
 /// allows other programs with access to that file to decrypt all traffic over
@@ -356,6 +361,8 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
     };
     var handshake_state: HandshakeState = .hello;
     var alpn_selected = false;
+    var end_point: [64]u8 = undefined;
+    var end_point_len: u8 = 0;
     var handshake_cipher: tls.HandshakeCipher = undefined;
     var main_cert_pub_key: CertificatePublicKey = undefined;
     var tls12_negotiated_group: ?tls.NamedGroup = null;
@@ -675,6 +682,22 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                             };
                             const subject = try subject_cert.parse();
                             if (cert_index == 0) {
+                                // kzig: tls-server-end-point, from the leaf's DER.
+                                switch (subject.signature_algorithm) {
+                                    .sha384WithRSAEncryption, .ecdsa_with_SHA384 => {
+                                        crypto.hash.sha2.Sha384.hash(certd.buf, end_point[0..48], .{});
+                                        end_point_len = 48;
+                                    },
+                                    .sha512WithRSAEncryption, .ecdsa_with_SHA512 => {
+                                        crypto.hash.sha2.Sha512.hash(certd.buf, end_point[0..64], .{});
+                                        end_point_len = 64;
+                                    },
+                                    .curveEd25519 => end_point_len = 0,
+                                    else => {
+                                        crypto.hash.sha2.Sha256.hash(certd.buf, end_point[0..32], .{});
+                                        end_point_len = 32;
+                                    },
+                                }
                                 // Verify the host on the first certificate.
                                 switch (options.host) {
                                     .no_verification => {},
@@ -973,6 +996,8 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                 },
                             },
                             .tls_version = tls_version,
+                            .server_end_point = end_point,
+                            .server_end_point_len = end_point_len,
                             .read_seq = switch (tls_version) {
                                 .tls_1_3 => 0,
                                 .tls_1_2 => read_seq,

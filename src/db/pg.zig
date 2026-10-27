@@ -22,6 +22,12 @@ pub const SslMode = enum { disable, allow, prefer, require, verify_ca, verify_fu
 /// (Postgres 17) starts TLS at once with ALPN `postgresql`, a round trip less.
 pub const SslNegotiation = enum { postgres, direct };
 
+/// libpq's `channel_binding`: SCRAM-SHA-256-PLUS ties the sign-in to this TLS
+/// session (the server's certificate), so a man in the middle with his own
+/// certificate can't relay it. `prefer` uses it when TLS is on and the server
+/// offers it; `require` refuses anything else.
+pub const ChannelBinding = enum { disable, prefer, require };
+
 pub const Config = struct {
     host: []const u8 = "127.0.0.1",
     port: u16 = 5432,
@@ -33,6 +39,7 @@ pub const Config = struct {
     statement_timeout_ms: u32 = 0,
     sslmode: SslMode = .prefer,
     sslnegotiation: SslNegotiation = .postgres,
+    channel_binding: ChannelBinding = .prefer,
     /// PEM file of the CAs to trust (`verify-ca`, `verify-full`); the
     /// system's when null.
     sslrootcert: ?[]const u8 = null,
@@ -66,6 +73,8 @@ pub const Config = struct {
                     c.sslmode = std.meta.stringToEnum(SslMode, buf[0..mode.len]) orelse return error.InvalidDatabaseUrl;
                 } else if (std.mem.startsWith(u8, pair, "sslnegotiation=")) {
                     c.sslnegotiation = std.meta.stringToEnum(SslNegotiation, pair["sslnegotiation=".len..]) orelse return error.InvalidDatabaseUrl;
+                } else if (std.mem.startsWith(u8, pair, "channel_binding=")) {
+                    c.channel_binding = std.meta.stringToEnum(ChannelBinding, pair["channel_binding=".len..]) orelse return error.InvalidDatabaseUrl;
                 } else if (std.mem.eql(u8, pair, "insecure_auth=true")) {
                     c.insecure_auth = true;
                 } else if (std.mem.startsWith(u8, pair, "sslrootcert=")) {
@@ -109,6 +118,8 @@ pub const Error = error{
     InsecureAuth,
     /// sslmode require or stronger, and the server has no TLS.
     TlsRefused,
+    /// channel_binding=require, and the sign-in wasn't SCRAM-SHA-256-PLUS.
+    ChannelBindingRequired,
     /// The handshake failed: the certificate didn't verify, or the server
     /// speaks no TLS we do.
     TlsHandshakeFailed,
@@ -390,7 +401,11 @@ pub const Conn = struct {
                     switch (code) {
                         // A SCRAM exchange that skipped the server's proof
                         // isn't a server that knows the password.
-                        0 => if (scram != null and !proven) return error.DbAuthFailed,
+                        0 => {
+                            if (scram != null and !proven) return error.DbAuthFailed;
+                            // Trust or a password: nothing bound the session.
+                            if (cfg.channel_binding == .require and (scram == null or !scram.?.bound())) return error.ChannelBindingRequired;
+                        },
                         3 => {
                             if (!may_send_password) return insecure("a cleartext password");
                             try c.begin('p');
@@ -406,13 +421,23 @@ pub const Conn = struct {
                             try c.send();
                         },
                         10 => {
-                            if (std.mem.find(u8, m.body[4..], "SCRAM-SHA-256\x00") == null) return error.UnsupportedAuth;
+                            const mechs = m.body[4..];
+                            const offers_plus = std.mem.find(u8, mechs, "SCRAM-SHA-256-PLUS\x00") != null;
+                            const end_point = if (c.tls) |*t| t.server_end_point[0..t.server_end_point_len] else "";
+                            const can_bind = cfg.channel_binding != .disable and end_point.len > 0;
+                            const plus = can_bind and offers_plus;
+                            if (cfg.channel_binding == .require and !plus) return error.ChannelBindingRequired;
+                            if (!plus and std.mem.find(u8, mechs, "SCRAM-SHA-256\x00") == null) return error.UnsupportedAuth;
                             var nonce_bytes: [18]u8 = undefined;
                             c.io.random(&nonce_bytes);
                             scram = Scram.init(nonce_bytes);
+                            // RFC 5802 §6: `y` says we could bind but the server
+                            // offered no PLUS, so a stripped offer is caught.
+                            scram.?.gs2 = if (plus) "p=tls-server-end-point,," else if (can_bind) "y,," else "n,,";
+                            if (plus) scram.?.cbind = end_point;
                             const first = scram.?.clientFirst();
                             try c.begin('p');
-                            try c.cstr("SCRAM-SHA-256");
+                            try c.cstr(if (plus) "SCRAM-SHA-256-PLUS" else "SCRAM-SHA-256");
                             try c.int32(@intCast(first.len));
                             try c.out.appendSlice(c.gpa, first);
                             try c.send();
@@ -667,12 +692,21 @@ pub const Scram = struct {
     server_signature: [HmacSha256.mac_length]u8 = undefined,
     /// `clientFinal` ran: `server_signature` is set.
     answered: bool = false,
+    /// RFC 5802's GS2 header: `n,,`, `y,,` or `p=tls-server-end-point,,`.
+    gs2: []const u8 = "n,,",
+    /// Channel-binding data (the server certificate's hash) with `p=`.
+    cbind: []const u8 = "",
     user: []const u8 = "",
 
     pub fn init(random: [18]u8) Scram {
         var s: Scram = .{ .nonce_len = 24 };
         _ = std.base64.standard.Encoder.encode(s.nonce_buf[0..24], &random);
         return s;
+    }
+
+    /// Signed in with SCRAM-SHA-256-PLUS.
+    pub fn bound(s: *const Scram) bool {
+        return s.cbind.len > 0;
     }
 
     fn nonce(s: *const Scram) []const u8 {
@@ -683,7 +717,7 @@ pub const Scram = struct {
     pub fn clientFirst(s: *Scram) []const u8 {
         const bare = std.fmt.bufPrint(&s.first_bare, "n={s},r={s}", .{ s.user, s.nonce() }) catch unreachable;
         s.first_bare_len = bare.len;
-        return std.fmt.bufPrint(&s.message, "n,,{s}", .{bare}) catch unreachable;
+        return std.fmt.bufPrint(&s.message, "{s}{s}", .{ s.gs2, bare }) catch unreachable;
     }
 
     /// From the server's `r=…,s=…,i=…`: the proof, and the signature the
@@ -716,7 +750,14 @@ pub const Scram = struct {
         Sha256.hash(&client_key, &stored_key, .{});
 
         var without_proof_buf: [256]u8 = undefined;
-        const without_proof = std.fmt.bufPrint(&without_proof_buf, "c=biws,r={s}", .{server_nonce}) catch return error.BadServerMessage;
+        // c=: the GS2 header and, when bound, the certificate hash.
+        var cb_raw: [128]u8 = undefined;
+        if (s.gs2.len + s.cbind.len > cb_raw.len) return error.BadServerMessage;
+        @memcpy(cb_raw[0..s.gs2.len], s.gs2);
+        @memcpy(cb_raw[s.gs2.len..][0..s.cbind.len], s.cbind);
+        var cb_b64: [std.base64.standard.Encoder.calcSize(128)]u8 = undefined;
+        const cb = std.base64.standard.Encoder.encode(&cb_b64, cb_raw[0 .. s.gs2.len + s.cbind.len]);
+        const without_proof = std.fmt.bufPrint(&without_proof_buf, "c={s},r={s}", .{ cb, server_nonce }) catch return error.BadServerMessage;
         var auth_buf: [512]u8 = undefined;
         const auth = std.fmt.bufPrint(&auth_buf, "{s},{s},{s}", .{ s.first_bare[0..s.first_bare_len], server_first, without_proof }) catch return error.BadServerMessage;
 
@@ -1226,4 +1267,48 @@ test "sslnegotiation=direct: TLS from the first byte, ALPN postgresql; needs ssl
     cfg.sslnegotiation = .direct;
     try testing.expectError(error.TlsHandshakeFailed, Conn.connect(testing.io, testing.allocator, cfg));
     try f.finish();
+}
+
+test "SCRAM channel binding: the GS2 header and the certificate hash go into c=" {
+    var s: Scram = .{ .user = "", .gs2 = "p=tls-server-end-point,,", .cbind = "\x01\x02\x03" };
+    const nonce = "rOprNGfwEbeRWgbNEkqO";
+    @memcpy(s.nonce_buf[0..nonce.len], nonce);
+    s.nonce_len = nonce.len;
+    try testing.expectEqualStrings("p=tls-server-end-point,,n=,r=rOprNGfwEbeRWgbNEkqO", s.clientFirst());
+    const final = try s.clientFinal("pencil", "r=rOprNGfwEbeRWgbNEkqO%hvY,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096");
+    var want: [64]u8 = undefined;
+    const b64 = std.base64.standard.Encoder.encode(&want, "p=tls-server-end-point,,\x01\x02\x03");
+    var prefix: [96]u8 = undefined;
+    try testing.expect(std.mem.startsWith(u8, final, try std.fmt.bufPrint(&prefix, "c={s},r=", .{b64})));
+}
+
+test "channel_binding=require: no TLS, no PLUS, or no SCRAM at all is refused" {
+    const Script = struct {
+        fn plainScram(s: Io.net.Stream) anyerror!void {
+            var buf: [512]u8 = undefined;
+            _ = try Fake.readStartup(s, &buf);
+            try Fake.send(s, "R\x00\x00\x00\x17\x00\x00\x00\x0aSCRAM-SHA-256\x00\x00");
+            var one: [1]u8 = undefined;
+            Fake.readExact(s, &one) catch {};
+        }
+        fn trust(s: Io.net.Stream) anyerror!void {
+            var buf: [512]u8 = undefined;
+            _ = try Fake.readStartup(s, &buf);
+            try Fake.send(s, Fake.auth_ok);
+        }
+    };
+    {
+        const f = try Fake.start(Script.plainScram);
+        var cfg = f.config(.disable);
+        cfg.channel_binding = .require;
+        try testing.expectError(error.ChannelBindingRequired, Conn.connect(testing.io, testing.allocator, cfg));
+        try f.finish();
+    }
+    {
+        const f = try Fake.start(Script.trust);
+        var cfg = f.config(.disable);
+        cfg.channel_binding = .require;
+        try testing.expectError(error.ChannelBindingRequired, Conn.connect(testing.io, testing.allocator, cfg));
+        try f.finish();
+    }
 }
