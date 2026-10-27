@@ -7,6 +7,7 @@ const MailAdapter = @import("adapters/mail.adapter.zig").MailAdapter;
 const mail = @import("adapters/mail.settings.zig");
 const FileSettings = @import("modules/files/file.settings.zig").FileSettings;
 const CronErrorsAdapter = @import("adapters/cron-errors.adapter.zig").CronErrorsAdapter;
+const StorageAdapter = @import("adapters/storage.adapter.zig").StorageAdapter;
 
 pub const App = kzig.App(.{
     .modules = modules,
@@ -23,6 +24,7 @@ pub const App = kzig.App(.{
         MailAdapter("transactional", mail.TransactionalMail),
         MailAdapter("marketing", mail.MarketingMail),
         CronErrorsAdapter,
+        StorageAdapter,
     },
     .middleware = .{
         kzig.middleware.requestId(),

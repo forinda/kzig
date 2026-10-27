@@ -83,7 +83,7 @@ pub const FilesController = struct {
     }
 
     pub fn remove(self: *FilesController, ctx: *kzig.Ctx, got: struct { params: FileId }) !void {
-        if (!try self.files.remove(got.params.id)) return ctx.fail(.not_found, null);
+        if (!try self.files.remove(ctx.arena, got.params.id)) return ctx.fail(.not_found, null);
     }
 
     fn send(self: *FilesController, ctx: *kzig.Ctx, id: []const u8) !void {

@@ -3,13 +3,18 @@ const kzig = @import("kzig");
 /// file-storage-api's env: `UPLOAD_DIR`, `MAX_UPLOAD_BYTES`, `API_KEY`,
 /// `SIGNING_SECRET`, `PUBLIC_URL`. The two secrets have defaults only in
 /// development and test, so production refuses to boot without them.
+pub const StorageDriver = enum { disk, s3, memory };
+
 pub const FileSettings = struct {
     pub const dev_defaults = .{
         .api_key = "dev-api-key-0123456789abcdef0123",
         .signing_secret = "dev-signing-secret-0123456789abcdef",
     };
 
-    /// Relative to the working directory.
+    /// `STORAGE_DRIVER`: `disk` by default in development and test, `s3`
+    /// otherwise (with `S3_*`); `memory` for tests.
+    storage_driver: ?StorageDriver = null,
+    /// The disk driver's folder, relative to the working directory.
     upload_dir: []const u8 = "uploads",
     max_upload_bytes: usize = 5 * 1024 * 1024,
     api_key: []const u8,

@@ -1,9 +1,10 @@
-//! file-storage-api's `file.test.ts`: the same paths and statuses, on a
-//! temporary upload folder.
+//! file-storage-api's `file.test.ts`: the same paths and statuses, on
+//! memory storage (KickJS overrides STORAGE with `memoryStorage()`).
 const std = @import("std");
 const kzig = @import("kzig");
 const test_app = @import("../../test_app.zig");
 const Clock = @import("file.service.zig").Clock;
+const FileStorage = @import("file.storage.zig").FileStorage;
 
 const testing = std.testing;
 const key = "test-api-key-0123456789abcdef0123456789";
@@ -19,22 +20,15 @@ fn form(comptime filename: []const u8, comptime content_type: []const u8, data: 
     });
 }
 
-/// The app on a fresh upload folder (KickJS's test overrides STORAGE with memory).
 const Files = struct {
-    tmp: std.testing.TmpDir,
     t: test_app.TestApp,
 
     fn init(self: *Files, max_bytes: []const u8) !void {
-        self.tmp = std.testing.tmpDir(.{});
-        errdefer self.tmp.cleanup();
-        const dir = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{self.tmp.sub_path});
-        defer testing.allocator.free(dir);
-        self.t = try test_app.boot(&.{ .{ "UPLOAD_DIR", dir }, .{ "API_KEY", key }, .{ "MAX_UPLOAD_BYTES", max_bytes } });
+        self.t = try test_app.boot(&.{ .{ "STORAGE_DRIVER", "memory" }, .{ "API_KEY", key }, .{ "MAX_UPLOAD_BYTES", max_bytes } });
     }
 
     fn deinit(self: *Files) void {
         self.t.deinit();
-        self.tmp.cleanup();
     }
 
     fn upload(self: *Files, body: []const u8) !kzig.testing.TestResponse {
@@ -75,7 +69,7 @@ test "files: uploads, lists, downloads and deletes a file" {
     try testing.expect(std.mem.endsWith(u8, file.id, ".png"));
     const stored = try std.fmt.allocPrint(testing.allocator, "files/{s}", .{file.id});
     defer testing.allocator.free(stored);
-    try f.tmp.dir.access(testing.io, stored, .{});
+    try testing.expect(try f.t.app.get(FileStorage).storage().exists(stored));
 
     var list = try f.api(.GET, "/api/v1/files");
     defer list.deinit();
@@ -201,4 +195,29 @@ test "files: refuses a signed URL for a missing file and an id that is not ours"
     var not_ours = try f.api(.GET, "/api/v1/files/secret.txt/url");
     defer not_ours.deinit();
     try testing.expectEqual(.unprocessable_entity, not_ours.status);
+}
+
+test "files: storage:<driver> on /health/ready" {
+    var f: Files = undefined;
+    try f.init("5242880");
+    defer f.deinit();
+    var res = try f.t.get("/health/ready");
+    defer res.deinit();
+    try testing.expect(std.mem.find(u8, res.body, "{\"name\":\"storage:memory\",\"status\":\"up\"}") != null);
+}
+
+test "files: production defaults to S3 and won't boot without S3_BUCKET" {
+    var env: std.process.Environ.Map = .init(testing.allocator);
+    defer env.deinit();
+    for ([_][2][]const u8{
+        .{ "NODE_ENV", "production" },                               .{ "APP_PUBLIC_URL", "https://api.example.com" },
+        .{ "TRANSACTIONAL_MAIL_PASSWORD", "a-long-password" },       .{ "TRANSACTIONAL_MAIL_FROM", "a@example.com" },
+        .{ "MARKETING_MAIL_PASSWORD", "a-long-password" },           .{ "MARKETING_MAIL_FROM", "a@example.com" },
+        .{ "API_KEY", "prod-api-key-0123456789abcdef0123456" },      .{ "SIGNING_SECRET", "prod-signing-secret-0123456789abcdef" },
+        .{ "CHAT_SECRET", "prod-chat-secret-0123456789abcdef0123" }, .{ "CRON_SECRET", "prod-cron-secret-0123456789" },
+    }) |v| try env.put(v[0], v[1]);
+    const App = @import("../../main.zig").App;
+    const app = try testing.allocator.create(App);
+    defer testing.allocator.destroy(app);
+    try testing.expectError(error.MissingS3Settings, app.init(testing.io, testing.allocator, &env));
 }

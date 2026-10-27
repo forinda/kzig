@@ -35,6 +35,7 @@ test "is not served in production" {
     try env.put("SIGNING_SECRET", "prod-signing-secret-0123456789abcdef");
     try env.put("CHAT_SECRET", "prod-chat-secret-0123456789abcdef0123");
     try env.put("CRON_SECRET", "prod-cron-secret-0123456789");
+    try env.put("STORAGE_DRIVER", "disk");
     for ([_][]const u8{ "TRANSACTIONAL_MAIL", "MARKETING_MAIL" }) |m| {
         try env.put(try std.mem.print(&key_buf, "{s}_PASSWORD", .{m}), "a-long-password");
         try env.put(try std.mem.print(&key_buf, "{s}_FROM", .{m}), "noreply@example.com");
@@ -59,6 +60,7 @@ test "is not served when NODE_ENV is unset" {
     try env.put("SIGNING_SECRET", "prod-signing-secret-0123456789abcdef");
     try env.put("CHAT_SECRET", "prod-chat-secret-0123456789abcdef0123");
     try env.put("CRON_SECRET", "prod-cron-secret-0123456789");
+    try env.put("STORAGE_DRIVER", "disk");
     for ([_][]const u8{ "TRANSACTIONAL_MAIL", "MARKETING_MAIL" }) |m| {
         try env.put(try std.mem.print(&key_buf, "{s}_PASSWORD", .{m}), "a-long-password");
         try env.put(try std.mem.print(&key_buf, "{s}_FROM", .{m}), "noreply@example.com");

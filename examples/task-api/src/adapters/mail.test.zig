@@ -15,6 +15,7 @@ const production = [_][2][]const u8{
     .{ "SIGNING_SECRET", "prod-signing-secret-0123456789abcdef" },
     .{ "CHAT_SECRET", "prod-chat-secret-0123456789abcdef0123" },
     .{ "CRON_SECRET", "prod-cron-secret-0123456789" },
+    .{ "STORAGE_DRIVER", "disk" },
 };
 
 fn envOf(pairs: []const [2][]const u8) !std.process.Environ.Map {
@@ -100,5 +101,6 @@ test "ready reports each mail adapter" {
     defer res.deinit();
     try testing.expectEqual(.service_unavailable, res.status);
     try testing.expectEqualStrings("{\"status\":\"degraded\",\"checks\":[" ++
-        "{\"name\":\"MailAdapter:transactional\",\"status\":\"down\"},{\"name\":\"MailAdapter:marketing\",\"status\":\"down\"}]}", res.body);
+        "{\"name\":\"MailAdapter:transactional\",\"status\":\"down\"},{\"name\":\"MailAdapter:marketing\",\"status\":\"down\"}," ++
+        "{\"name\":\"storage:disk\",\"status\":\"up\"}]}", res.body);
 }
