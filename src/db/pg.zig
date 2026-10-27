@@ -98,8 +98,8 @@ pub const Conn = struct {
     out: std.ArrayList(u8) = .empty,
 
     pub fn connect(io: Io, gpa: Allocator, cfg: Config) !*Conn {
-        const address = Io.net.IpAddress.resolve(io, cfg.host, cfg.port) catch |err| return transportError(err);
-        const stream = address.connect(io, .{ .mode = .stream }) catch |err| return transportError(err);
+        const host = Io.net.HostName.init(cfg.host) catch |err| return transportError(err);
+        const stream = host.connect(io, cfg.port, .{ .mode = .stream }) catch |err| return transportError(err);
         errdefer stream.close(io);
         const c = try gpa.create(Conn);
         errdefer gpa.destroy(c);
@@ -107,6 +107,7 @@ pub const Conn = struct {
         c.reader = stream.reader(io, &c.rbuf);
         c.writer = stream.writer(io, &c.wbuf);
         errdefer c.out.deinit(gpa);
+        errdefer c.big.deinit(gpa);
         errdefer c.error_arena.deinit();
         try c.startup(cfg);
         return c;
@@ -174,7 +175,11 @@ pub const Conn = struct {
         const n = len - 4;
         if (n <= r.buffer.len) return .{ .kind = head[0], .body = r.take(n) catch return c.lost() };
         c.big.clearRetainingCapacity();
-        const body = try c.big.addManyAsSlice(c.gpa, n);
+        // Unread, the body would be taken for the next message.
+        const body = c.big.addManyAsSlice(c.gpa, n) catch {
+            c.broken = true;
+            return error.OutOfMemory;
+        };
         r.readSliceAll(body) catch return c.lost();
         return .{ .kind = head[0], .body = body };
     }
@@ -348,18 +353,28 @@ pub const Conn = struct {
         // reuses the reader's.
         var name_buf: [4096]u8 = undefined;
         var values: [64]?[]const u8 = undefined;
+        // A problem with the rows is reported at ReadyForQuery: returning
+        // earlier would leave the rest of the answer for the next statement.
         while (true) {
             const m = try c.next();
             switch (m.kind) {
                 'T' => {
                     n_cols = std.mem.readInt(u16, m.body[0..2], .big);
-                    if (n_cols > names.len) return error.DbDecode;
+                    if (n_cols > names.len) {
+                        failed = true;
+                        c.last_error = .{ .message = "more than 64 columns" };
+                        continue;
+                    }
                     var at: usize = 2;
                     var used: usize = 0;
                     for (0..n_cols) |k| {
                         const end = std.mem.findScalarPos(u8, m.body, at, 0) orelse return c.lost();
                         const name = m.body[at..end];
-                        if (used + name.len > name_buf.len) return error.DbDecode;
+                        if (used + name.len > name_buf.len) {
+                            failed = true;
+                            c.last_error = .{ .message = "column names too long" };
+                            break;
+                        }
                         @memcpy(name_buf[used..][0..name.len], name);
                         names[k] = name_buf[used..][0..name.len];
                         used += name.len;
@@ -368,6 +383,7 @@ pub const Conn = struct {
                 },
                 'D' => if (!failed) {
                     const count = std.mem.readInt(u16, m.body[0..2], .big);
+                    if (count != n_cols) return c.lost();
                     var at: usize = 2;
                     for (0..count) |k| {
                         const len = std.mem.readInt(i32, m.body[at..][0..4], .big);

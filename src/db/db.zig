@@ -144,6 +144,12 @@ pub const Tx = struct {
         const c = t.conn orelse return error.TransactionDone;
         t.conn = null;
         defer t.pool.release(c);
+        // After a failed statement Postgres answers COMMIT with a rollback
+        // and no error; the caller must hear its writes are gone.
+        if (c.tx_status == 'E') {
+            c.script("ROLLBACK") catch {};
+            return error.TransactionAborted;
+        }
         try c.script("COMMIT");
     }
 
@@ -300,6 +306,42 @@ test "transactions: commit keeps, rollback and an unfinished one discard" {
     try testing.expectEqual(1, rows[0].n);
 }
 
+test "a row wider than the decoder takes is DbDecode, and the connection stays in step" {
+    var env: std.process.Environ.Map = undefined;
+    const url = testUrl(&env) catch |err| {
+        if (err == error.SkipZigTest) env.deinit();
+        return err;
+    };
+    defer env.deinit();
+    var db: Pool = try .init(testing.io, testing.allocator, .{ .url = url, .max_connections = 1 });
+    defer db.deinit();
+    var sql: std.ArrayList(u8) = .empty;
+    defer sql.deinit(testing.allocator);
+    try sql.appendSlice(testing.allocator, "SELECT 1 AS c0");
+    for (1..70) |i| try sql.print(testing.allocator, ", 1 AS c{d}", .{i});
+    try testing.expectError(error.DbDecode, db.exec(sql.items, .{}));
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const row = try db.queryOne(arena.allocator(), struct { x: i32 }, "SELECT 42 AS x", .{});
+    try testing.expectEqual(42, row.?.x);
+}
+
+test "committing after a failed statement is an error, not a silent rollback" {
+    var env: std.process.Environ.Map = undefined;
+    const url = testUrl(&env) catch |err| {
+        if (err == error.SkipZigTest) env.deinit();
+        return err;
+    };
+    defer env.deinit();
+    var db: Pool = try .init(testing.io, testing.allocator, .{ .url = url, .max_connections = 1 });
+    defer db.deinit();
+    var tx = try db.begin();
+    defer tx.deinit();
+    try testing.expectError(error.DbError, tx.exec("SELEC nonsense", .{}));
+    try testing.expectError(error.TransactionAborted, tx.commit());
+    try db.ping();
+}
+
 test "the pool: more tasks than connections, all served" {
     var env: std.process.Environ.Map = undefined;
     const url = testUrl(&env) catch |err| {
@@ -338,6 +380,11 @@ test "connecting: a wrong password, a server that isn't there" {
     try testing.expectError(error.DbAuthFailed, pg.Conn.connect(testing.io, testing.allocator, cfg));
     cfg.port = 1;
     try testing.expectError(error.ServiceUnavailable, pg.Conn.connect(testing.io, testing.allocator, cfg));
+    // A host name is looked up, not only an IP literal.
+    cfg = try pg.Config.parse(arena.allocator(), url);
+    if (std.mem.eql(u8, cfg.host, "127.0.0.1")) cfg.host = "localhost";
+    const c = try pg.Conn.connect(testing.io, testing.allocator, cfg);
+    c.close();
 }
 
 test "database URLs" {
