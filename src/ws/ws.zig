@@ -120,6 +120,8 @@ pub const Hub = struct {
     mutex: Io.Mutex = .init,
     sessions: std.ArrayList(*Session) = .empty,
     heartbeat: ?Io.Future(Io.Cancelable!void) = null,
+    /// Shutdown began: a socket let in from now on is drained at once.
+    draining: bool = false,
 
     pub fn deinit(hub: *Hub) void {
         hub.stopHeartbeat();
@@ -373,9 +375,14 @@ pub fn open(comptime G: type, gateway: *G, hub: *Hub, index: usize, conn: Conn, 
         close(G, gateway, hub, s);
         return null;
     }
-    const l = hub.lock();
-    defer hub.unlock(l);
-    s.accepted = true;
+    const late = blk: {
+        const l = hub.lock();
+        defer hub.unlock(l);
+        s.accepted = true;
+        break :blk hub.draining;
+    };
+    // Shutdown drained while `connect` ran, and skipped this socket.
+    if (late) drainOne(G, gateway, hub, s);
     return s;
 }
 
@@ -424,20 +431,25 @@ pub fn close(comptime G: type, gateway: *G, hub: *Hub, s: *Session) void {
 pub fn drain(comptime G: type, gateway: *G, hub: *Hub, index: usize) void {
     const l = hub.lock();
     defer hub.unlock(l);
+    hub.draining = true;
     for (hub.sessions.items) |s| {
         if (s.gateway != index or !s.accepted) continue;
-        if (@hasDecl(G, "draining")) {
-            // Not the socket's arenas: its task may be handling a message.
-            var tmp: std.heap.ArenaAllocator = .init(hub.gpa);
-            defer tmp.deinit();
-            var ctx = ctxOf(G, hub, s);
-            ctx.arena = tmp.allocator();
-            ctx.conn_arena = tmp.allocator();
-            ctx.draining = true;
-            report(G, "draining", gateway.draining(&ctx));
-        }
-        s.close(1001, "Server shutting down");
+        drainOne(G, gateway, hub, s);
     }
+}
+
+fn drainOne(comptime G: type, gateway: *G, hub: *Hub, s: *Session) void {
+    if (@hasDecl(G, "draining")) {
+        // Not the socket's arenas: its task may be handling a message.
+        var tmp: std.heap.ArenaAllocator = .init(hub.gpa);
+        defer tmp.deinit();
+        var ctx = ctxOf(G, hub, s);
+        ctx.arena = tmp.allocator();
+        ctx.conn_arena = tmp.allocator();
+        ctx.draining = true;
+        report(G, "draining", gateway.draining(&ctx));
+    }
+    s.close(1001, "Server shutting down");
 }
 
 fn free(hub: *Hub, s: *Session) void {
@@ -483,4 +495,52 @@ fn call(comptime G: type, comptime handler: []const u8, gateway: *G, ctx: *Ctx(S
 fn report(comptime G: type, comptime handler: []const u8, result: anytype) void {
     if (@typeInfo(@TypeOf(result)) != .error_union) return;
     result catch |err| if (!builtin.is_test) std.log.err("ws {s}.{s}: {t}", .{ @typeName(G), handler, err });
+}
+
+const testing = std.testing;
+
+/// Records what a socket was sent.
+const FakeConn = struct {
+    sent: std.ArrayList(u8) = .empty,
+    close_code: u16 = 0,
+
+    const vtable: Conn.VTable = .{ .send = send, .ping = ping, .close = closeConn };
+
+    fn conn(f: *FakeConn) Conn {
+        return .{ .ptr = f, .vtable = &vtable };
+    }
+    fn send(ptr: *anyopaque, data: []const u8) anyerror!void {
+        const f: *FakeConn = @ptrCast(@alignCast(ptr));
+        try f.sent.appendSlice(testing.allocator, data);
+    }
+    fn ping(_: *anyopaque) anyerror!void {}
+    fn closeConn(ptr: *anyopaque, code: u16, _: []const u8) void {
+        const f: *FakeConn = @ptrCast(@alignCast(ptr));
+        f.close_code = code;
+    }
+};
+
+test "a socket still in connect when shutdown drains is drained as it's let in" {
+    const G = struct {
+        hub: ?*Hub = null,
+        pub const path = "/late";
+        pub const events = .{};
+        pub fn connect(self: *@This(), ctx: anytype) !void {
+            try ctx.send("welcome", .{});
+            // Shutdown arrives now, before `open` lets the socket in.
+            drain(@This(), self, self.hub.?, 0);
+        }
+        pub fn draining(_: *@This(), ctx: anytype) !void {
+            try ctx.send("server:draining", .{});
+        }
+    };
+    var hub: Hub = .{ .io = testing.io, .gpa = testing.allocator, .opts = .{} };
+    defer hub.deinit();
+    var g: G = .{ .hub = &hub };
+    var fake: FakeConn = .{};
+    defer fake.sent.deinit(testing.allocator);
+    const s = (try open(G, &g, &hub, 0, fake.conn(), .{ .path = "/ws/late", .query = "", .headers = &.{} })).?;
+    defer close(G, &g, &hub, s);
+    try testing.expect(std.mem.find(u8, fake.sent.items, "server:draining") != null);
+    try testing.expectEqual(1001, fake.close_code);
 }
