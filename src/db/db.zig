@@ -23,6 +23,7 @@ const query_ = @import("query.zig");
 pub const snapshot = @import("snapshot.zig");
 pub const diff = @import("diff.zig");
 pub const emit_pg = @import("emit_pg.zig");
+pub const generate = @import("generate.zig");
 pub const Client = query_.Client;
 pub const eq = query_.eq;
 pub const ne = query_.ne;
@@ -254,6 +255,7 @@ test {
     _ = snapshot;
     _ = diff;
     _ = emit_pg;
+    _ = generate;
     _ = pg;
 }
 
