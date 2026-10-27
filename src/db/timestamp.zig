@@ -117,9 +117,10 @@ pub const Timestamp = struct {
     /// As kick/db stores a timestamp on SQLite: `YYYY-MM-DD HH:MM:SS.SSS`,
     /// UTC, so stored values sort as text.
     pub fn toSqlite(self: Timestamp, a: std.mem.Allocator) ![]const u8 {
-        const iso = try self.toPg(a); // YYYY-MM-DDTHH:MM:SS[.ffffff]Z
+        const iso = try self.toPg(a); // YYYY-MM-DDTHH:MM:SS[.ffffff]Z, YYYY maybe longer
+        const t = std.mem.findScalar(u8, iso, 'T').?;
         const ms = @divFloor(@mod(self.us, std.time.us_per_s), std.time.us_per_ms);
-        return a.print("{s} {s}.{d:0>3}", .{ iso[0..10], iso[11..19], @as(u64, @intCast(ms)) });
+        return a.print("{s} {s}.{d:0>3}", .{ iso[0..t], iso[t + 1 .. t + 9], @as(u64, @intCast(ms)) });
     }
 
     /// A request body's value; null when it isn't a date-time string.
@@ -215,4 +216,13 @@ test "format: ISO 8601 in UTC, fraction only when there is one" {
     try testing.expectEqualStrings("2026-10-27T12:00:00Z", try std.fmt.bufPrint(&buf, "{f}", .{Timestamp{ .us = 1793102400000000 }}));
     try testing.expectEqualStrings("2026-10-27T09:00:00.5Z", try std.fmt.bufPrint(&buf, "{f}", .{Timestamp{ .us = 1793091600500000 }}));
     try testing.expectEqualStrings("1969-12-31T23:59:59.999999Z", try std.fmt.bufPrint(&buf, "{f}", .{Timestamp{ .us = -1 }}));
+}
+
+test "toSqlite: past 9999 too" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const t = try Timestamp.parse("1969-12-31T23:59:59.999Z");
+    try std.testing.expectEqualStrings("1969-12-31 23:59:59.999", try t.toSqlite(arena.allocator()));
+    const far: Timestamp = .{ .us = 253402300800 * std.time.us_per_s }; // 10000-01-01
+    try std.testing.expectEqualStrings("10000-01-01 00:00:00.000", try far.toSqlite(arena.allocator()));
 }
