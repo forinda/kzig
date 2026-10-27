@@ -17,7 +17,8 @@ pub const Sql = struct { sql: []const u8, params: []const ?[]const u8 };
 pub const Conn = union(enum) { pool: *dbm.Pool, tx: *dbm.Tx };
 
 /// kick/db's client over a schema: `selectFrom(.users)`, `insertInto`,
-/// `updateTable`, `deleteFrom`.
+/// `updateTable`, `deleteFrom`. Every allocator passed in is a request arena:
+/// rows, SQL and strings are left in it, never freed one by one.
 pub fn Client(comptime S: type) type {
     return struct {
         conn: Conn,
@@ -65,14 +66,17 @@ pub fn Client(comptime S: type) type {
         /// savepoint so the loss doesn't abort it.
         pub fn findOrCreate(self: Self, a: Allocator, comptime t: S.Tag, where: anytype, create: anytype) !struct { row: S.Table(t).Row, created: bool } {
             const T = S.Table(t);
+            if (@typeInfo(@TypeOf(where)).@"struct".field_names.len == 0) @compileError(T.name_ ++ ": findOrCreate needs a where");
+            inline for (@typeInfo(@TypeOf(create)).@"struct".field_names) |f| if (!@hasField(T.Insert, f))
+                @compileError(T.name_ ++ "." ++ f ++ ": no such column for findOrCreate's create");
             const find = self.selectFrom(t).whereExpr(Match(@TypeOf(where)){ .values = where });
             if (try find.executeTakeFirst(a)) |row| return .{ .row = row, .created = false };
             var ins: T.Insert = undefined;
             inline for (@typeInfo(T.Insert).@"struct".field_names) |f| {
-                if (@hasField(@TypeOf(where), f)) {
-                    @field(ins, f) = @field(where, f);
-                } else if (@hasField(@TypeOf(create), f)) {
+                if (@hasField(@TypeOf(create), f)) {
                     @field(ins, f) = @field(create, f);
+                } else if (@hasField(@TypeOf(where), f)) {
+                    @field(ins, f) = @field(where, f);
                 } else if (comptime @typeInfo(@FieldType(T.Insert, f)) == .optional) {
                     @field(ins, f) = null;
                 } else @compileError(T.name_ ++ "." ++ f ++ ": findOrCreate needs it in where or create");
@@ -137,9 +141,9 @@ const ColRef = struct {
     qualified: bool,
 };
 
-fn tableTag(comptime S: type, comptime sql_name: []const u8) ?[]const u8 {
+fn tableTag(comptime S: type, comptime declared: []const u8) ?[]const u8 {
     for (@typeInfo(S.Tag).@"enum".field_names) |tag| {
-        if (std.mem.eql(u8, S.info(@field(S.Tag, tag)).name, sql_name)) return tag;
+        if (std.mem.eql(u8, S.Table(@field(S.Tag, tag)).name_, declared)) return tag;
     }
     return null;
 }
@@ -163,6 +167,10 @@ fn resolveCol(comptime sc: Scope, comptime ref: []const u8) ColRef {
         };
         @compileError(info.name ++ ": no column " ++ key);
     }
+}
+
+fn zigName(comptime Z: type) []const u8 {
+    return if (@typeInfo(Z) == .@"enum" and @hasDecl(Z, "pg_name")) Z.pg_name else @typeName(Z);
 }
 
 fn writeCol(w: *Writer, comptime r: ColRef) !void {
@@ -230,6 +238,7 @@ fn Cmp(comptime col: []const u8, comptime op: []const u8, comptime V: type, comp
                 // An enum's value, or another column (`.@"teams.id"`).
                 if (comptime @typeInfo(l.Z) == .@"enum" and @hasField(l.Z, name)) return w.param(@as([]const u8, name));
                 const r = comptime resolveCol(sc, name);
+                if (comptime r.Z != l.Z) @compileError(l.table ++ "." ++ l.key ++ " and " ++ r.table ++ "." ++ r.key ++ ": compares " ++ zigName(l.Z) ++ " with " ++ zigName(r.Z));
                 return writeCol(w, r);
             }
             comptime checkValue(l, V);
@@ -426,8 +435,11 @@ pub fn exists(subquery: anytype) Exists(@TypeOf(subquery)) {
 const Raw = struct {
     text: []const u8,
 
+    /// In parentheses, so an OR inside can't swallow the conditions around it.
     pub fn render(self: Raw, comptime _: Scope, w: *Writer) !void {
+        try w.raw("(");
         try w.raw(self.text);
+        try w.raw(")");
     }
 };
 /// SQL written as is: never put input in it, pass values to the helpers.
@@ -507,8 +519,14 @@ const Conflict = struct {
     update: union(enum) { all, none, cols: []const []const u8 },
 };
 
-fn conflictOf(comptime target: anytype, comptime update: anytype) Conflict {
+fn conflictOf(comptime sc: Scope, comptime target: anytype, comptime update: anytype) Conflict {
     const U = @TypeOf(update);
+    if (@typeInfo(@TypeOf(target)).@"struct".field_names.len == 0)
+        @compileError(sc.S.Table(@field(sc.S.Tag, sc.from)).name_ ++ ": upsert needs a target");
+    for (groupRefs(target)) |k| _ = resolveCol(sc, k);
+    if (U != EnumLiteral) for (groupRefs(update)) |k| {
+        _ = resolveCol(sc, k);
+    };
     return .{
         .target = groupRefs(target),
         .update = if (U == EnumLiteral) (if (update == .all) .all else if (update == .none) .none else @compileError("db: update is .all, .none or a tuple of columns")) else .{ .cols = groupRefs(update) },
@@ -782,10 +800,20 @@ pub fn Select(comptime S: type, comptime spec: SelectSpec, comptime W: type, com
         /// limit left out).
         pub fn count(self: Self, a: Allocator) !i64 {
             var w: Writer = .{ .a = a };
-            try w.raw("SELECT count(*) AS \"count\" FROM ");
-            try w.ident(S.info(@field(S.Tag, spec.from)).name);
-            try renderJoins(self.ons, &w);
-            try renderWheres(self.wheres, scope, &w);
+            if (spec.distinct or spec.group.len > 0) {
+                // Distinct rows or groups: count the query's own rows.
+                var inner = self;
+                inner.lim = null;
+                inner.off = null;
+                try w.raw("SELECT count(*) AS \"count\" FROM (");
+                try inner.renderInto(&w);
+                try w.raw(") AS \"q\"");
+            } else {
+                try w.raw("SELECT count(*) AS \"count\" FROM ");
+                try w.ident(S.info(@field(S.Tag, spec.from)).name);
+                try renderJoins(self.ons, &w);
+                try renderWheres(self.wheres, scope, &w);
+            }
             const rows = try runRows(self.conn, a, struct { count: i64 }, w.done());
             return rows[0].count;
         }
@@ -875,8 +903,8 @@ pub fn Insert(comptime S: type, comptime tag: []const u8, comptime ret: ?[]const
 
         /// `ON CONFLICT (target) DO UPDATE SET … = EXCLUDED.…` (`.all`: every
         /// given column outside the target; or the named ones), or `DO NOTHING` (`.none`).
-        pub fn onConflict(self: Self, comptime target: anytype, comptime update: anytype) Insert(S, tag, ret, conflictOf(target, update)) {
-            return retype(Insert(S, tag, ret, conflictOf(target, update)), self);
+        pub fn onConflict(self: Self, comptime target: anytype, comptime update: anytype) Insert(S, tag, ret, conflictOf(scope, target, update)) {
+            return retype(Insert(S, tag, ret, conflictOf(scope, target, update)), self);
         }
 
         pub fn returning(self: Self, comptime cols: anytype) Insert(S, tag, parseItems(cols), conflict) {
@@ -1160,7 +1188,7 @@ test "conditions: all, any, not, in, between, like, null; kick/db's empty rules"
     defer arena.deinit();
     try expectSql(c.selectFrom(.people).select(.{.id}).whereExpr(like(.name, try escapeLike(arena.allocator(), "50%_off\\"))), "SELECT \"id\" FROM \"people\" WHERE \"name\" LIKE $1", &.{"50\\%\\_off\\\\"});
     try expectSql(c.selectFrom(.people).select(.{.id}).where(.email, .is_not_null, {}), "SELECT \"id\" FROM \"people\" WHERE \"email\" IS NOT NULL", &.{});
-    try expectSql(c.selectFrom(.people).select(.{.id}).whereExpr(sql("lower(\"name\") = 'ada'")), "SELECT \"id\" FROM \"people\" WHERE lower(\"name\") = 'ada'", &.{});
+    try expectSql(c.selectFrom(.people).select(.{.id}).whereExpr(sql("1=1 OR 2=2")).where(.id, .eq, 1), "SELECT \"id\" FROM \"people\" WHERE (1=1 OR 2=2) AND \"id\" = $1", &.{"1"});
 }
 
 test "joins: qualified columns, aliases, left-joined columns are optional, exists" {
@@ -1257,6 +1285,8 @@ test "runs on Postgres: insert, select, join, update, delete" {
     try testing.expectEqual(null, try db.selectFrom(.people).where(.name, .eq, "nobody").executeTakeFirst(a));
     try testing.expectError(error.NotFound, db.selectFrom(.people).where(.name, .eq, "nobody").executeTakeFirstOrThrow(a));
     try testing.expectEqual(2, try db.selectFrom(.people).where(.role, .eq, .member).count(a));
+    try testing.expectEqual(2, try db.selectFrom(.people).select(.{.role}).distinct().count(a));
+    try testing.expectEqual(2, try db.selectFrom(.people).select(.{.role}).groupBy(.{.role}).count(a));
 
     const renamed = try db.updateTable(.people).set(.{ .name = "Ada", .email = @as(?[]const u8, "ada@example.com") }).where(.id, .eq, ada.id).returning(.{ .name, .email }).executeTakeFirstOrThrow(a);
     try testing.expectEqualStrings("Ada", renamed.name);
@@ -1298,6 +1328,10 @@ test "upsert and findOrCreate" {
     const named = try db.upsert(a, .people, .{ .name = "A3", .email = "a@x", .age = 9 }, .{ .target = .{.email}, .update = .{.age} });
     try testing.expectEqualStrings("A2", named.name);
     try testing.expectEqual(9, named.age.?);
+
+    // `create` wins over `where` for the new row, as kick/db spreads them.
+    const odd = try db.findOrCreate(a, .people, .{ .name = "W" }, .{ .name = "C" });
+    try testing.expectEqualStrings("C", odd.row.name);
 
     const made = try db.findOrCreate(a, .teams, .{ .title = "core" }, .{});
     try testing.expect(made.created);

@@ -119,13 +119,26 @@ pub fn table(comptime name: []const u8, comptime columns: anytype, comptime cons
         var cols: [keys.len]Column = undefined;
         for (keys, &cols) |k, *c| c.* = coerce(Column, @field(columns, k), name ++ "." ++ k);
         const cols_final = cols;
-        for (keys, cols_final) |k, c| if (c.type == .@"enum" and !@hasDecl(c.type.@"enum", "pg_name"))
-            @compileError(name ++ "." ++ k ++ ": an enum column's type needs `pub const pg_name`");
+        for (keys, cols_final) |k, c| if (c.type == .@"enum") {
+            const E = c.type.@"enum";
+            if (!@hasDecl(E, "pg_name")) @compileError(name ++ "." ++ k ++ ": an enum column's type needs `pub const pg_name`");
+            if (c.default == .value and !@hasField(E, c.default.value))
+                @compileError(name ++ "." ++ k ++ ": default \"" ++ c.default.value ++ "\" is not a value of " ++ E.pg_name);
+        };
 
         const Cs = @TypeOf(constraints);
+        for (@typeInfo(Cs).@"struct".field_names) |f| if (!has(&.{ "indexes", "checks", "primary_key" }, f))
+            @compileError(name ++ ": no constraint kind ." ++ f ++ " (indexes, checks, primary_key)");
+        if (@hasField(Cs, "checks")) for (@typeInfo(@TypeOf(constraints.checks)).@"struct".field_names) |ck|
+            for (@typeInfo(@TypeOf(@field(constraints.checks, ck))).@"struct".field_names) |f| if (!has(&.{ "name", "sql" }, f))
+                @compileError(name ++ ".checks." ++ ck ++ ": no option ." ++ f);
         const indexes = if (@hasField(Cs, "indexes")) constraints.indexes else .{};
-        for (@typeInfo(@TypeOf(indexes)).@"struct".field_names) |ik| for (@field(indexes, ik).on) |col|
-            if (!has(keys, @tagName(col))) @compileError(name ++ ".indexes." ++ ik ++ ": no column " ++ @tagName(col));
+        for (@typeInfo(@TypeOf(indexes)).@"struct".field_names) |ik| {
+            for (@typeInfo(@TypeOf(@field(indexes, ik))).@"struct".field_names) |f| if (!has(&.{ "name", "on", "unique", "where", "using" }, f))
+                @compileError(name ++ ".indexes." ++ ik ++ ": no option ." ++ f);
+            for (@field(indexes, ik).on) |col|
+                if (!has(keys, @tagName(col))) @compileError(name ++ ".indexes." ++ ik ++ ": no column " ++ @tagName(col));
+        }
         if (@hasField(Cs, "primary_key")) for (constraints.primary_key.on) |col|
             if (!has(keys, @tagName(col))) @compileError(name ++ ".primary_key: no column " ++ @tagName(col));
 
@@ -302,7 +315,7 @@ fn dbName(comptime options: SchemaOptions, comptime key: []const u8) []const u8 
 }
 
 fn resolve(comptime T: type, comptime tables: anytype, comptime options: SchemaOptions) TableInfo {
-    const name = T.name_;
+    const name = dbName(options, T.name_);
     const keys = T.column_keys;
     const Cs = @TypeOf(T.table_constraints);
     var columns: [keys.len]ColumnInfo = undefined;
@@ -355,7 +368,7 @@ fn resolve(comptime T: type, comptime tables: anytype, comptime options: SchemaO
             fks = fks ++ [_]ForeignKeyInfo{.{
                 .name = r.name orelse fitIdentifier(name ++ "_" ++ db ++ "_fk"),
                 .columns = &.{db},
-                .ref_table = ref_table,
+                .ref_table = dbName(options, ref_table),
                 .ref_columns = &.{dbName(options, ref_col)},
                 .on_delete = r.on_delete,
                 .on_update = r.on_update,
@@ -515,6 +528,19 @@ test "snake_case: keys stay, database names change" {
     try testing.expectEqualStrings("first_name", u.indexes[0].columns[0]);
     try testing.expectEqualStrings("user_id", comptime snakeCase("userID"));
     try testing.expectEqualStrings("http_code", comptime snakeCase("httpCode"));
+}
+
+test "snake_case renames tables too, and names derived from them" {
+    const teamMembers = table("teamMembers", .{
+        .id = .{ .type = .serial, .primary_key = true },
+        .userId = .{ .type = .uuid, .unique = true, .references = .{ .to = "users.id" } },
+    }, .{});
+    const S = Schema(.{ .users = users, .members = teamMembers }, .{ .casing = .snake_case });
+    const m = S.info(.members);
+    try testing.expectEqualStrings("team_members", m.name);
+    try testing.expectEqualStrings("team_members_user_id_unique", m.indexes[0].name);
+    try testing.expectEqualStrings("team_members_user_id_fk", m.foreign_keys[0].name);
+    try testing.expectEqualStrings("users", m.foreign_keys[0].ref_table);
 }
 
 test "long constraint names are shortened as kick/db shortens them" {
