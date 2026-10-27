@@ -72,7 +72,7 @@ pub fn run(io: Io, a: Allocator, dir_path: []const u8, target: Snapshot, o: Opti
     const down = try emit_pg.emit(a, try diff.invert(a, changes));
     // kick/db's relations aren't modelled yet: keep the ones on record.
     var next = target;
-    if (next.relations == null) next.relations = prev.snapshot.relations;
+    if (next.relations == null and next.declared == null) next.relations = prev.snapshot.relations;
     const id = try write(io, a, dir_path, next, prev.id, up, down, diff.hasAmbiguousReverse(changes), o);
     return .{ .id = id, .changes = changes };
 }

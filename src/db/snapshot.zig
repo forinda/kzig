@@ -18,13 +18,42 @@ pub const Snapshot = struct {
     tables: []const Table = &.{},
     /// Absent (not empty) when no table uses one, as kick/db writes it.
     enums: ?[]const Enum = null,
-    /// kick/db's relation sidecar, carried through as is.
+    /// kick/db's relation sidecar, as parsed (carried through as is).
     relations: ?std.json.Value = null,
+    /// The schema's relations, written as the sidecar.
+    declared: ?Declared = null,
+
+    pub const Declared = struct {
+        /// Declared table names, sorted (kick/db walks its exports alphabetically).
+        tables: []const []const u8,
+        relations: []const []const schema.RelationInfo,
+    };
 };
 
 /// The schema as kick/db's extract would record it.
 pub fn fromSchema(comptime S: type) Snapshot {
-    return .{ .tables = S.tables_info, .enums = if (S.enums.len > 0) S.enums else null };
+    return .{ .tables = S.tables_info, .enums = if (S.enums.len > 0) S.enums else null, .declared = comptime declaredOf(S) };
+}
+
+fn declaredOf(comptime S: type) ?Snapshot.Declared {
+    if (S.relation_tables.len == 0) return null;
+    var names: [S.relation_tables.len][]const u8 = undefined;
+    var lists: [S.relation_tables.len][]const schema.RelationInfo = undefined;
+    for (S.relation_tables, 0..) |tag, i| {
+        names[i] = S.Table(@field(S.Tag, tag)).name_;
+        lists[i] = S.relationsOf(@field(S.Tag, tag));
+    }
+    // Sorted by name, lists along.
+    for (1..names.len) |i| {
+        var j = i;
+        while (j > 0 and std.mem.lessThan(u8, names[j], names[j - 1])) : (j -= 1) {
+            std.mem.swap([]const u8, &names[j], &names[j - 1]);
+            std.mem.swap([]const schema.RelationInfo, &lists[j], &lists[j - 1]);
+        }
+    }
+    const n = names;
+    const l = lists;
+    return .{ .tables = &n, .relations = &l };
 }
 
 /// The file's text, without the trailing newline kick/db adds.
@@ -50,7 +79,29 @@ pub fn toValue(a: Allocator, s: Snapshot) !std.json.Value {
         }
         try root.put(a, "enums", .{ .object = obj });
     }
-    if (s.relations) |r| try root.put(a, "relations", r);
+    if (s.relations) |r| try root.put(a, "relations", r) else if (s.declared) |d| {
+        var obj: std.json.ObjectMap = .empty;
+        for (d.tables, d.relations) |name, list| {
+            var t: std.json.ObjectMap = .empty;
+            for (list) |r| {
+                var o: std.json.ObjectMap = .empty;
+                try o.put(a, "kind", .{ .string = @tagName(r.kind) });
+                try o.put(a, "target", .{ .string = r.target });
+                try o.put(a, "sourceColumns", try strings(a, r.source_columns));
+                try o.put(a, "targetColumns", try strings(a, r.target_columns));
+                if (r.through) |th| {
+                    var to: std.json.ObjectMap = .empty;
+                    try to.put(a, "table", .{ .string = th.table });
+                    try to.put(a, "sourceColumns", try strings(a, th.source_columns));
+                    try to.put(a, "targetColumns", try strings(a, th.target_columns));
+                    try o.put(a, "through", .{ .object = to });
+                } else if (r.relation_name) |n| try o.put(a, "relationName", .{ .string = n });
+                try t.put(a, r.name, .{ .object = o });
+            }
+            try obj.put(a, name, .{ .object = t });
+        }
+        try root.put(a, "relations", .{ .object = obj });
+    }
     return .{ .object = root };
 }
 
@@ -309,4 +360,51 @@ test "strings are escaped as JSON.stringify escapes them; empty parts are writte
         \\}
     , try toJson(a, s));
     try testing.expectEqualStrings("{\n  \"version\": 1,\n  \"dialect\": \"postgres\",\n  \"tables\": {}\n}", try toJson(a, .{}));
+}
+
+test "declared relations are written as kick/db's sidecar: tables by name, relations as declared" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const users = schema.table("users", .{ .id = .{ .type = .serial, .primary_key = true } }, .{});
+    const posts = schema.table("posts", .{
+        .id = .{ .type = .serial, .primary_key = true },
+        .authorId = .{ .type = .integer, .references = .{ .to = "users.id" } },
+    }, .{});
+    const S = schema.Schema(.{ .users = users, .posts = posts }, .{ .relations = .{
+        .users = .{ .posts = .{ .many = .posts } },
+        .posts = .{ .author = .{ .one = .users, .fields = .{.authorId}, .references = .{.id}, .relation_name = "a" } },
+    } });
+    const json = try toJson(a, fromSchema(S));
+    const at = std.mem.find(u8, json, "\"relations\"").?;
+    try testing.expectEqualStrings(
+        \\"relations": {
+        \\    "posts": {
+        \\      "author": {
+        \\        "kind": "one",
+        \\        "target": "users",
+        \\        "sourceColumns": [
+        \\          "authorId"
+        \\        ],
+        \\        "targetColumns": [
+        \\          "id"
+        \\        ],
+        \\        "relationName": "a"
+        \\      }
+        \\    },
+        \\    "users": {
+        \\      "posts": {
+        \\        "kind": "many",
+        \\        "target": "posts",
+        \\        "sourceColumns": [
+        \\          "id"
+        \\        ],
+        \\        "targetColumns": [
+        \\          "authorId"
+        \\        ]
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    , json[at..]);
 }

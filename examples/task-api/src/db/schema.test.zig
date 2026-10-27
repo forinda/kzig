@@ -60,15 +60,12 @@ test "schema: matches task-kickdb-api's init snapshot" {
     }
 }
 
-test "schema: its snapshot is task-kickdb-api's, byte for byte (relations carried over until M16)" {
+test "schema: its snapshot is task-kickdb-api's, byte for byte, relations included" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     const text = try std.Io.Dir.cwd().readFileAlloc(testing.io, snapshot_path, a, .limited(1 << 20));
-    const archived = try kzig.db.snapshot.parse(a, text[0 .. text.len - 1]);
-    var ours = kzig.db.snapshot.fromSchema(Schema);
-    ours.relations = archived.relations;
-    try testing.expectEqualStrings(text[0 .. text.len - 1], try kzig.db.snapshot.toJson(a, ours));
+    try testing.expectEqualStrings(text[0 .. text.len - 1], try kzig.db.snapshot.toJson(a, kzig.db.snapshot.fromSchema(Schema)));
 }
 
 test "schema: generating from nothing writes task-kickdb-api's up.sql and down.sql" {
