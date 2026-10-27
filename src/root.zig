@@ -23,6 +23,8 @@ pub const multipart = @import("upload/multipart.zig");
 pub const ws = @import("ws/ws.zig");
 /// Scheduled jobs (KickJS `@Cron`).
 pub const cron = @import("cron/cron.zig");
+/// PostgreSQL: pool, typed SQL, transactions, migrations (KickJS `@forinda/kickjs-db`).
+pub const db = @import("db/db.zig");
 /// File storage: memory, disk and S3 (KickJS `@forinda/kickjs-storage`).
 pub const storage = @import("storage/storage.zig");
 /// A WebSocket connection's loop, for runtimes (std, http.zig).
@@ -64,6 +66,8 @@ pub const HealthCheck = @import("core/health.zig").HealthCheck;
 pub const Version = app.Version;
 
 test {
+    _ = db;
+    _ = @import("db/pg.zig");
     _ = storage;
     _ = cron;
     _ = @import("ws/frame.zig");
