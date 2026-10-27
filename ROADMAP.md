@@ -83,6 +83,9 @@ after M6.
 | A cell missing from a multi-row insert is NULL on SQLite (kysely) | The column's default | SQLite has no `DEFAULT` in `VALUES`; NULL loses the default |
 | Nested relation rows are JSON strings, re-parsed by a plugin | `json()` around them: real nested JSON | No guessing which strings were JSON |
 | A table rebuild of a referenced table is out of scope | Migrations run with foreign keys off, checked before commit | SQLite's own ALTER TABLE procedure; the rebuild would cascade |
+| D1 through a Workers binding (`env.DB`) | D1's REST API with an API token | kzig isn't a Worker |
+| Turso through `@libsql/client` (WebSocket or HTTP) | Hrana over HTTP only | One request per statement or batch, through `std.http.Client`, no dependency |
+| libsql migrations as one batch (async adapter) | In a transaction (one Hrana stream), as on a file | The stream supports it; D1 still gets batches |
 | A DB adapter always reports health | `onHealthCheck` may return null; no database configured, nothing on `/health/ready` | task-api runs without a database |
 
 Kept for parity even where Zig would allow otherwise: route middleware runs **after** validation.
@@ -453,9 +456,13 @@ bind them either).
 
 ### M20 — Turso and Cloudflare D1
 
-- [ ] `libsql://` over HTTP (Hrana v2 pipeline), batches and baton transactions
-- [ ] `d1://` over Cloudflare's REST API; 100 parameters per statement, no transactions
-- [ ] Migrations on both as one batch
+- [x] `libsql://` (and `http(s)://`) over HTTP: Hrana v2 pipeline, a transaction per stream
+      (baton, `base_url`); migrations in a transaction as on a file; CI runs a pinned sqld
+- [x] `d1://` over Cloudflare's REST API: `batch`, 100 parameters per statement, no transactions;
+      migrations as one batch each, rebuilds of referenced tables refused (as kick/db); tested
+      against a fake of the endpoint run by local SQLite
+- [ ] A live D1 test (credentials in CI), and `insertMany` that splits at D1's parameter limit
+- [ ] Request timeouts for the HTTP drivers (std's fetch has none)
 
 ### Later
 

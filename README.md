@@ -434,6 +434,20 @@ writers wait for each other (5 s busy timeout) instead of failing.
 task-api's `projects` module and `TenantDbAdapter` run on SQLite with multi-tenant-kickdb-api's
 schema and migrations, beside the Postgres `DbAdapter`.
 
+Hosted SQLite needs no C: the pool speaks HTTP.
+
+```text
+libsql://my-db-me.turso.io?authToken=…            Turso (Hrana over HTTP); http://127.0.0.1:8080 for a local sqld
+d1://<account id>/<database id>?token=…           Cloudflare D1 (its REST API, an API token with D1 Edit)
+```
+
+On Turso a transaction is one Hrana stream, so `begin`/`commit` and migrations work as on a
+file. D1 has no interactive transactions: `begin` is `error.TransactionsUnsupported`,
+`pool.batch(&.{ … })` runs statements as one, and each migration goes as one batch (its
+statements, its record, a foreign-key check). D1 keeps foreign keys on, so a migration that
+rebuilds or drops a table others reference is refused before it runs (`error.RebuildOfReferencedTable`).
+D1 binds at most 100 parameters per statement (`error.TooManyParameters`).
+
 ## WebSockets
 
 KickJS's `@forinda/kickjs-ws`: a gateway in a module's `.gateways`, at `/ws` + its `path`.

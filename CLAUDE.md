@@ -70,6 +70,7 @@ src/
                        # schema.zig (tables), query.zig (builder), timestamp.zig,
                        # snapshot.zig, diff.zig, emit_pg.zig, emit_sqlite.zig,
                        # generate.zig (kzig db generate), sqlite.zig (local files, -Dsqlite),
+                       # libsql.zig (Turso over HTTP), d1.zig (Cloudflare D1 REST),
                        # relational.zig (query(.t).findMany with `with`), tls/ (std's TLS client
                        # vendored with ALPN, channel binding, client certs; keys.zig)
   cli/                 # The `kzig` CLI: main.zig, dev.zig, names, templates/*.tpl, registry
