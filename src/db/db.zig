@@ -55,58 +55,119 @@ pub const Settings = struct {
 };
 
 pub const Options = struct {
-    /// `postgres://user:password@host:5432/database`.
+    /// `postgres://user:password@host:5432/database`, or `sqlite:./app.db`,
+    /// `sqlite::memory:` (needs `-Dsqlite`).
     url: []const u8,
     max_connections: u32 = 10,
     /// Server-side; 0 leaves the server's default.
     statement_timeout_ms: u32 = 0,
 };
 
-/// Connections made as needed, up to `max_connections`; a task waits for
-/// one beyond that. A broken connection, or one left inside a transaction,
-/// is closed instead of reused.
+/// Which SQL a database speaks.
+pub const Dialect = enum { postgres, sqlite };
+
+const has_sqlite = @import("kzig_options").sqlite;
+const sqlite = if (has_sqlite) @import("sqlite.zig") else struct {
+    pub const Conn = void;
+};
+
+/// A connection of either driver.
+const Conn = union(enum) {
+    pg: *pg.Conn,
+    sqlite: *sqlite.Conn,
+
+    fn run(c: Conn, text: []const u8, params: []const ?[]const u8, ctx: anytype, comptime row: anytype) pg.Error!u64 {
+        return switch (c) {
+            .pg => |p| p.run(text, params, ctx, row),
+            .sqlite => |s| if (!has_sqlite) unreachable else s.run(text, params, ctx, row),
+        };
+    }
+
+    fn script(c: Conn, text: []const u8) pg.Error!void {
+        return switch (c) {
+            .pg => |p| p.script(text),
+            .sqlite => |s| if (!has_sqlite) unreachable else s.script(text),
+        };
+    }
+
+    fn dialect(c: Conn) Dialect {
+        return switch (c) {
+            .pg => .postgres,
+            .sqlite => .sqlite,
+        };
+    }
+};
+
+/// Postgres: connections made as needed, up to `max_connections`; a task
+/// waits for one beyond that. A broken connection, or one left inside a
+/// transaction, is closed instead of reused. SQLite: one handle, one task at
+/// a time (ponytail: WAL lets readers run beside the writer; add a reader
+/// pool if reads queue).
 pub const Pool = struct {
     io: Io,
     gpa: Allocator,
-    config: pg.Config,
+    driver: union(enum) { pg: pg.Config, sqlite: *sqlite.Conn },
     arena: std.heap.ArenaAllocator,
     mutex: Io.Mutex = .init,
     idle: std.ArrayList(*pg.Conn) = .empty,
     permits: Io.Semaphore,
 
     pub fn init(io: Io, gpa: Allocator, o: Options) !Pool {
+        if (std.mem.startsWith(u8, o.url, "sqlite:")) {
+            if (!has_sqlite) return error.SqliteNotBuilt;
+            const conn = try sqlite.Conn.open(gpa, o.url["sqlite:".len..]);
+            return .{ .io = io, .gpa = gpa, .driver = .{ .sqlite = conn }, .arena = .init(gpa), .permits = .{ .permits = 1 } };
+        }
         var arena: std.heap.ArenaAllocator = .init(gpa);
         errdefer arena.deinit();
         const a = arena.allocator();
         var config = try pg.Config.parse(a, try a.dupe(u8, o.url));
         config.statement_timeout_ms = o.statement_timeout_ms;
-        return .{ .io = io, .gpa = gpa, .config = config, .arena = arena, .permits = .{ .permits = o.max_connections } };
+        return .{ .io = io, .gpa = gpa, .driver = .{ .pg = config }, .arena = arena, .permits = .{ .permits = o.max_connections } };
     }
 
     /// Every connection must have been released.
     pub fn deinit(p: *Pool) void {
         for (p.idle.items) |c| c.close();
         p.idle.deinit(p.gpa);
+        if (p.driver == .sqlite) if (has_sqlite) p.driver.sqlite.close();
         p.arena.deinit();
     }
 
-    fn acquire(p: *Pool) !*pg.Conn {
+    pub fn dialect(p: *const Pool) Dialect {
+        return switch (p.driver) {
+            .pg => .postgres,
+            .sqlite => .sqlite,
+        };
+    }
+
+    fn acquire(p: *Pool) !Conn {
         p.permits.wait(p.io) catch return error.ServiceUnavailable;
         errdefer p.permits.post(p.io);
+        const config = switch (p.driver) {
+            .pg => |config| config,
+            .sqlite => |s| return .{ .sqlite = s },
+        };
         {
             p.mutex.lockUncancelable(p.io);
             defer p.mutex.unlock(p.io);
-            if (p.idle.pop()) |c| return c;
+            if (p.idle.pop()) |c| return .{ .pg = c };
         }
-        return pg.Conn.connect(p.io, p.gpa, p.config);
+        return .{ .pg = try pg.Conn.connect(p.io, p.gpa, config) };
     }
 
-    fn release(p: *Pool, c: *pg.Conn) void {
+    fn release(p: *Pool, conn: Conn) void {
         defer p.permits.post(p.io);
-        if (c.broken or c.tx_status != 'I') return c.close();
-        p.mutex.lockUncancelable(p.io);
-        defer p.mutex.unlock(p.io);
-        p.idle.append(p.gpa, c) catch c.close();
+        switch (conn) {
+            // The one handle stays; a transaction left open is undone.
+            .sqlite => |s| if (has_sqlite and s.inTransaction()) s.script("ROLLBACK") catch {},
+            .pg => |c| {
+                if (c.broken or c.tx_status != 'I') return c.close();
+                p.mutex.lockUncancelable(p.io);
+                defer p.mutex.unlock(p.io);
+                p.idle.append(p.gpa, c) catch c.close();
+            },
+        }
     }
 
     /// Every row of `text` as a `T`, by column name; strings in `a`.
@@ -165,7 +226,7 @@ pub const Pool = struct {
 /// One connection inside `BEGIN`. `deinit` rolls back unless `commit` ran.
 pub const Tx = struct {
     pool: *Pool,
-    conn: ?*pg.Conn,
+    conn: ?Conn,
 
     pub fn query(t: *Tx, a: Allocator, comptime T: type, text: []const u8, args: anytype) ![]T {
         return queryOn(t.conn orelse return error.TransactionDone, a, T, text, args);
@@ -198,7 +259,7 @@ pub const Tx = struct {
         defer t.pool.release(c);
         // After a failed statement Postgres answers COMMIT with a rollback
         // and no error; the caller must hear its writes are gone.
-        if (c.tx_status == 'E') {
+        if (c == .pg and c.pg.tx_status == 'E') {
             c.script("ROLLBACK") catch {};
             return error.TransactionAborted;
         }
@@ -217,13 +278,13 @@ pub const Tx = struct {
     }
 };
 
-fn queryOn(c: *pg.Conn, a: Allocator, comptime T: type, text: []const u8, args: anytype) ![]T {
-    return rowsOn(c, a, T, text, try pg.encodeArgs(a, args));
+fn queryOn(c: Conn, a: Allocator, comptime T: type, text: []const u8, args: anytype) ![]T {
+    return rowsOn(c, a, T, text, try pg.encodeArgs(a, args, c.dialect()));
 }
 
 fn ignoreRow(_: void, _: []const []const u8, _: []const ?[]const u8) !void {}
 
-fn rowsOn(c: *pg.Conn, a: Allocator, comptime T: type, text: []const u8, params: []const ?[]const u8) ![]T {
+fn rowsOn(c: Conn, a: Allocator, comptime T: type, text: []const u8, params: []const ?[]const u8) ![]T {
     if (@typeInfo(T) != .@"struct") @compileError("db: rows decode into a struct, not " ++ @typeName(T));
     const Rows = struct {
         a: Allocator,
@@ -238,11 +299,11 @@ fn rowsOn(c: *pg.Conn, a: Allocator, comptime T: type, text: []const u8, params:
     return rows.list.items;
 }
 
-fn execOn(c: *pg.Conn, text: []const u8, args: anytype) !u64 {
+fn execOn(c: Conn, text: []const u8, args: anytype) !u64 {
     var buf: [4096]u8 = undefined;
     var fba: std.heap.FixedBufferAllocator = .init(&buf);
     var arena: std.heap.ArenaAllocator = .init(fba.allocator());
-    return c.run(text, try pg.encodeArgs(arena.allocator(), args), {}, ignoreRow);
+    return c.run(text, try pg.encodeArgs(arena.allocator(), args, c.dialect()), {}, ignoreRow);
 }
 
 const testing = std.testing;
@@ -617,6 +678,11 @@ test "connecting: a wrong password, a server that isn't there" {
     if (std.mem.eql(u8, cfg.host, "127.0.0.1")) cfg.host = "localhost";
     const c = try pg.Conn.connect(testing.io, testing.allocator, cfg);
     c.close();
+}
+
+test "a sqlite: URL needs -Dsqlite" {
+    if (@import("kzig_options").sqlite) return error.SkipZigTest;
+    try testing.expectError(error.SqliteNotBuilt, Pool.init(testing.io, testing.allocator, .{ .url = "sqlite::memory:" }));
 }
 
 test "database URLs" {

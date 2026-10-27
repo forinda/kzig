@@ -114,6 +114,14 @@ pub const Timestamp = struct {
         return a.print("{f}", .{self});
     }
 
+    /// As kick/db stores a timestamp on SQLite: `YYYY-MM-DD HH:MM:SS.SSS`,
+    /// UTC, so stored values sort as text.
+    pub fn toSqlite(self: Timestamp, a: std.mem.Allocator) ![]const u8 {
+        const iso = try self.toPg(a); // YYYY-MM-DDTHH:MM:SS[.ffffff]Z
+        const ms = @divFloor(@mod(self.us, std.time.us_per_s), std.time.us_per_ms);
+        return a.print("{s} {s}.{d:0>3}", .{ iso[0..10], iso[11..19], @as(u64, @intCast(ms)) });
+    }
+
     /// A request body's value; null when it isn't a date-time string.
     pub fn fromJsonValue(v: std.json.Value) ?Timestamp {
         return if (v == .string) parse(v.string) catch null else null;

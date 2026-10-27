@@ -127,7 +127,7 @@ pub const Writer = struct {
     }
 
     pub fn param(w: *Writer, v: anytype) !void {
-        try w.params.append(w.a, try pg.encodeValue(w.a, v));
+        try w.params.append(w.a, try pg.encodeValue(w.a, v, .postgres));
         try w.buf.print(w.a, "${d}", .{w.params.items.len});
     }
 

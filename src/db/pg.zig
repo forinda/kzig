@@ -9,6 +9,7 @@ const keys = @import("tls/keys.zig");
 const crl = @import("tls/crl.zig");
 const builtin = @import("builtin");
 const Timestamp = @import("timestamp.zig").Timestamp;
+const Dialect = @import("db.zig").Dialect;
 
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -883,7 +884,8 @@ fn decodeValue(comptime F: type, a: Allocator, value: ?[]const u8) !F {
     return switch (@typeInfo(F)) {
         .int => std.fmt.parseInt(F, v, 10) catch error.DbDecode,
         .float => std.fmt.parseFloat(F, v) catch error.DbDecode,
-        .bool => if (std.mem.eql(u8, v, "t")) true else if (std.mem.eql(u8, v, "f")) false else error.DbDecode,
+        // Postgres's t/f, SQLite's 1/0.
+        .bool => if (std.mem.eql(u8, v, "t") or std.mem.eql(u8, v, "1")) true else if (std.mem.eql(u8, v, "f") or std.mem.eql(u8, v, "0")) false else error.DbDecode,
         .@"enum" => std.meta.stringToEnum(F, v) orelse error.DbDecode,
         else => @compileError("db: a column can't be read into " ++ @typeName(F) ++ " (strings, ints, floats, bools, enums, optionals)"),
     };
@@ -934,23 +936,26 @@ pub fn fromJson(comptime F: type, a: Allocator, v: std.json.Value) !F {
 }
 
 /// A query's arguments (a tuple) as text parameters, in `a`.
-pub fn encodeArgs(a: Allocator, args: anytype) ![]const ?[]const u8 {
+pub fn encodeArgs(a: Allocator, args: anytype, dialect: Dialect) ![]const ?[]const u8 {
     const info = @typeInfo(@TypeOf(args)).@"struct";
     const out = try a.alloc(?[]const u8, info.field_names.len);
-    inline for (info.field_names, 0..) |f, i| out[i] = try encodeValue(a, @field(args, f));
+    inline for (info.field_names, 0..) |f, i| out[i] = try encodeValue(a, @field(args, f), dialect);
     return out;
 }
 
-pub fn encodeValue(a: Allocator, v: anytype) !?[]const u8 {
+/// A value as a text parameter. SQLite gets booleans as 1/0 and timestamps
+/// as kick/db stores them there.
+pub fn encodeValue(a: Allocator, v: anytype, dialect: Dialect) !?[]const u8 {
     const T = @TypeOf(v);
     if (T == std.json.Value) return try std.json.Stringify.valueAlloc(a, v, .{});
+    if (@typeInfo(T) == .@"struct" and @hasDecl(T, "toSqlite") and dialect == .sqlite) return try v.toSqlite(a);
     if (@typeInfo(T) == .@"struct" and @hasDecl(T, "toPg")) return try v.toPg(a);
     switch (@typeInfo(T)) {
-        .optional => return if (v) |x| try encodeValue(a, x) else null,
+        .optional => return if (v) |x| try encodeValue(a, x, dialect) else null,
         .null => return null,
         .int, .comptime_int => return try std.fmt.allocPrint(a, "{d}", .{v}),
         .float, .comptime_float => return try std.fmt.allocPrint(a, "{d}", .{v}),
-        .bool => return if (v) "true" else "false",
+        .bool => return if (dialect == .sqlite) (if (v) "1" else "0") else if (v) "true" else "false",
         .@"enum", .enum_literal => return @tagName(v),
         .pointer => |p| {
             if (p.size == .slice and p.child == u8) return v;
@@ -1013,7 +1018,7 @@ test "arguments encode as text" {
     defer arena.deinit();
     const role: enum { admin } = .admin;
     const none: ?i32 = null;
-    const p = try encodeArgs(arena.allocator(), .{ 7, "x", true, 1.5, none, role, @as(?[]const u8, "y") });
+    const p = try encodeArgs(arena.allocator(), .{ 7, "x", true, 1.5, none, role, @as(?[]const u8, "y") }, .postgres);
     try testing.expectEqualStrings("7", p[0].?);
     try testing.expectEqualStrings("x", p[1].?);
     try testing.expectEqualStrings("true", p[2].?);
@@ -1033,7 +1038,7 @@ test "Timestamp and JSON columns read and write" {
     try testing.expectEqual(2, r.meta.object.get("k").?.array.items.len);
     try testing.expectEqual(null, r.gone);
     try testing.expectError(error.DbDecode, decodeRow(Row, a, &.{ "at", "meta", "gone" }, &.{ "never", "{}", null }));
-    const args = try encodeArgs(a, .{ Timestamp{ .us = 0 }, std.json.Value{ .bool = true } });
+    const args = try encodeArgs(a, .{ Timestamp{ .us = 0 }, std.json.Value{ .bool = true } }, .postgres);
     try testing.expectEqualStrings("1970-01-01T00:00:00Z", args[0].?);
     try testing.expectEqualStrings("true", args[1].?);
 }
