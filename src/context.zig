@@ -79,6 +79,19 @@ pub const Ctx = struct {
         return null;
     }
 
+    /// Every value of `name` in the query string, decoded, in order.
+    pub fn queryAll(ctx: *const Ctx, name: []const u8) error{ BadRequest, OutOfMemory }![]const []const u8 {
+        var out: std.ArrayList([]const u8) = .empty;
+        var it = std.mem.splitScalar(u8, ctx.req.query, '&');
+        while (it.next()) |pair| {
+            const eq = std.mem.indexOfScalar(u8, pair, '=');
+            const key = try percentDecode(ctx.arena, if (eq) |i| pair[0..i] else pair, true);
+            if (!std.mem.eql(u8, key, name)) continue;
+            try out.append(ctx.arena, if (eq) |i| try percentDecode(ctx.arena, pair[i + 1 ..], true) else "");
+        }
+        return out.items;
+    }
+
     /// The id from the `requestId` middleware, else the raw `x-request-id` header.
     pub fn requestId(ctx: *const Ctx) ?[]const u8 {
         return ctx.request_id orelse ctx.header("x-request-id");
@@ -162,6 +175,7 @@ pub const Ctx = struct {
             .title = p.title orelse p.status.phrase() orelse "Error",
             .status = @backingInt(p.status),
             .detail = p.detail,
+            .errors = p.errors,
         });
     }
 

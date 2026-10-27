@@ -12,6 +12,14 @@
 const std = @import("std");
 const Ctx = @import("context.zig").Ctx;
 
+/// `got` fields filled from the request instead of a contributor.
+pub const request_data = [_][]const u8{ "body", "query", "params" };
+
+fn isRequestData(comptime name: []const u8) bool {
+    for (request_data) |r| if (std.mem.eql(u8, r, name)) return true;
+    return false;
+}
+
 pub fn isContributor(comptime T: type) bool {
     return @typeInfo(T) == .@"struct" and @hasDecl(T, "key") and @hasDecl(T, "resolve");
 }
@@ -60,6 +68,7 @@ pub fn Plan(comptime levels: [4][]const type, comptime handler_got: ?type, compt
         var merged: []const type = &.{};
         for (levels) |level| {
             for (level, 0..) |C, i| {
+                if (isRequestData(C.key)) @compileError(where ++ ": contributor key '" ++ C.key ++ "' is reserved for request data");
                 for (level[0..i]) |D| if (std.mem.eql(u8, C.key, D.key))
                     @compileError(where ++ ": contributor key '" ++ C.key ++ "' registered twice");
                 merged = shadow(merged, C);
@@ -70,12 +79,28 @@ pub fn Plan(comptime levels: [4][]const type, comptime handler_got: ?type, compt
         }
         if (handler_got) |G| checkGot(merged, G, where, "the handler");
 
+        // What the route reads from the request: one type per name.
+        var data_types: [request_data.len]?type = @splat(null);
+        var readers: []const ?type = &.{handler_got};
+        for (merged) |C| readers = readers ++ .{GotOf(C.resolve)};
+        for (readers) |maybe| if (maybe) |G| {
+            const gi = @typeInfo(G).@"struct";
+            for (gi.field_names, gi.field_types) |f, F| for (request_data, 0..) |r, k| {
+                if (!std.mem.eql(u8, r, f)) continue;
+                if (data_types[k]) |prev| if (prev != F)
+                    @compileError(where ++ ": '" ++ r ++ "' is read as " ++ @typeName(prev) ++ " and as " ++ @typeName(F));
+                data_types[k] = F;
+            };
+        };
+
         const sorted = topoSort(merged, where);
         var early: []const type = &.{};
         var late: []const type = &.{};
         for (sorted) |C| {
             if (isEarly(C)) {
                 if (GotOf(C.resolve)) |G| for (@typeInfo(G).@"struct".field_names) |f| {
+                    if (isRequestData(f))
+                        @compileError(where ++ ": early contributor '" ++ C.key ++ "' reads '" ++ f ++ "', which is decoded after it runs");
                     if (!isEarly(byKey(merged, f).?))
                         @compileError(where ++ ": early contributor '" ++ C.key ++ "' reads '" ++ f ++ "', which runs later");
                 };
@@ -83,9 +108,13 @@ pub fn Plan(comptime levels: [4][]const type, comptime handler_got: ?type, compt
             } else late = late ++ .{C};
         }
 
-        var names: [merged.len][]const u8 = undefined;
-        var field_types: [merged.len]type = undefined;
-        var attrs: [merged.len]std.builtin.Type.Struct.FieldAttributes = undefined;
+        var n_data = 0;
+        for (data_types) |d| {
+            if (d != null) n_data += 1;
+        }
+        var names: [merged.len + n_data][]const u8 = undefined;
+        var field_types: [merged.len + n_data]type = undefined;
+        var attrs: [merged.len + n_data]std.builtin.Type.Struct.FieldAttributes = undefined;
         for (merged, 0..) |C, i| {
             const F = ?Value(C);
             const none: F = null;
@@ -93,11 +122,24 @@ pub fn Plan(comptime levels: [4][]const type, comptime handler_got: ?type, compt
             field_types[i] = F;
             attrs[i] = .{ .default_value_ptr = @ptrCast(&none) };
         }
+        var at = merged.len;
+        for (data_types, request_data) |maybe, r| if (maybe) |D| {
+            const F = ?D;
+            const none: F = null;
+            names[at] = r;
+            field_types[at] = F;
+            attrs[at] = .{ .default_value_ptr = @ptrCast(&none) };
+            at += 1;
+        };
+        const data_final = data_types;
         const early_final = early;
         const late_final = late;
         const StoreT = @Struct(.auto, null, &names, &field_types, &attrs);
         return struct {
             pub const early_order: []const type = early_final;
+            pub const Body: ?type = data_final[0];
+            pub const Query: ?type = data_final[1];
+            pub const Params: ?type = data_final[2];
             pub const late_order: []const type = late_final;
             /// One `?V` per key; null until its contributor ran (or failed, if optional).
             pub const Store = StoreT;
@@ -122,6 +164,7 @@ fn byKey(comptime list: []const type, comptime key: []const u8) ?type {
 fn checkGot(comptime merged: []const type, comptime G: type, comptime where: []const u8, comptime reader: []const u8) void {
     const info = @typeInfo(G).@"struct";
     for (info.field_names, info.field_types) |f, F| {
+        if (isRequestData(f)) continue;
         const C = byKey(merged, f) orelse
             @compileError(where ++ ": " ++ reader ++ " needs '" ++ f ++ "' but no contributor on this route provides it");
         const V = Value(C);

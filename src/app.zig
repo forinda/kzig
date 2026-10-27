@@ -13,6 +13,7 @@ const health = @import("health.zig");
 const router = @import("router.zig");
 const mw = @import("middleware.zig");
 const contributor = @import("contributor.zig");
+const decode = @import("decode.zig");
 
 /// Injectable as `*const kzig.Process`.
 pub const Process = struct {
@@ -249,6 +250,7 @@ fn thunk(comptime AppT: type, comptime C: type, comptime name: []const u8, compt
                 // A contributor that answered ends the request, as in KickJS.
                 if (ctx.res.sent) return;
             }
+            try decodeRequest(P, ctx, &store);
             if (chain.len == 0) return late(ctx);
             var next: mw.Next = .{ .ctx = ctx, .chain = chain, .final = late };
             next.run();
@@ -271,6 +273,64 @@ fn thunk(comptime AppT: type, comptime C: type, comptime name: []const u8, compt
         }
     }.call;
 }
+
+/// KickJS's `validate()`: body, then query, then params; the first that
+/// fails answers 422 with every field error.
+fn decodeRequest(comptime P: type, ctx: *Ctx, store: *P.Store) !void {
+    if (P.Body) |T| {
+        var issues: decode.Issues = .init(ctx.arena);
+        store.body = try decode.json(T, ctx.arena, try jsonBody(ctx), &issues) orelse
+            return invalid(ctx, issues.list.items[0].message, issues);
+    }
+    if (P.Query) |T| {
+        var issues: decode.Issues = .init(ctx.arena);
+        store.query = try decode.strings(T, ctx.arena, QuerySource{ .ctx = ctx }, &issues) orelse
+            return invalid(ctx, "Invalid query parameters", issues);
+    }
+    if (P.Params) |T| {
+        var issues: decode.Issues = .init(ctx.arena);
+        store.params = try decode.strings(T, ctx.arena, ParamSource{ .ctx = ctx }, &issues) orelse
+            return invalid(ctx, "Invalid path parameters", issues);
+    }
+}
+
+fn invalid(ctx: *Ctx, detail: []const u8, issues: decode.Issues) error{HttpProblem} {
+    ctx.problem = .{ .status = .unprocessable_entity, .detail = detail, .errors = issues.list.items };
+    return error.HttpProblem;
+}
+
+/// A JSON content type parses (malformed → 400); anything else, or nothing,
+/// is `{}`, as `express.json()` leaves it for the schema to reject.
+fn jsonBody(ctx: *Ctx) !std.json.Value {
+    const ct = ctx.header("content-type") orelse "";
+    const is_json = std.ascii.startsWithIgnoreCase(ct, "application/json") or std.mem.indexOf(u8, ct, "+json") != null;
+    if (!is_json or ctx.req.body.len == 0) return .{ .object = .empty };
+    return std.json.parseFromSliceLeaky(std.json.Value, ctx.arena, ctx.req.body, .{}) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => ctx.fail(.bad_request, "Malformed JSON"),
+    };
+}
+
+const QuerySource = struct {
+    ctx: *Ctx,
+    pub fn first(self: QuerySource, name: []const u8) ?[]const u8 {
+        return self.ctx.query(name) catch null;
+    }
+    pub fn all(self: QuerySource, _: std.mem.Allocator, name: []const u8) ![]const []const u8 {
+        return self.ctx.queryAll(name);
+    }
+};
+
+const ParamSource = struct {
+    ctx: *Ctx,
+    pub fn first(self: ParamSource, name: []const u8) ?[]const u8 {
+        return self.ctx.param(name);
+    }
+    pub fn all(self: ParamSource, arena: std.mem.Allocator, name: []const u8) ![]const []const u8 {
+        const v = self.ctx.param(name) orelse return &.{};
+        return arena.dupe([]const u8, &.{v});
+    }
+};
 
 fn appOf(comptime AppT: type, ctx: *Ctx) *AppT {
     return @ptrCast(@alignCast(ctx.app.?));
@@ -684,4 +744,109 @@ test "a contributor that responds skips the handler" {
     defer b.deinit();
     try testing.expectEqualStrings("denied early", b.body);
     try testing.expectEqual(null, b.header("x-trail"));
+}
+
+const CreateThing = struct {
+    title: []const u8,
+    tags: []const []const u8 = &.{},
+    pub fn validate(self: *const CreateThing, issues: *@import("decode.zig").Issues) !void {
+        if (self.title.len == 0) try issues.add("title", "must not be empty");
+    }
+};
+
+const LoadOwner = struct {
+    pub const key = "owner";
+    pub fn resolve(_: *LoadOwner, _: *Ctx, got: struct { body: CreateThing }) []const u8 {
+        return got.body.title;
+    }
+};
+
+const BodyController = struct {
+    pub const routes = .{
+        .{ .method = .POST, .path = "/things", .handler = "create" },
+        .{ .method = .GET, .path = "/things/:id", .handler = "show" },
+        .{ .method = .POST, .path = "/owned", .handler = "owned", .contributors = .{LoadOwner} },
+    };
+    pub fn create(_: *BodyController, ctx: *Ctx, got: struct { body: CreateThing }) !void {
+        try ctx.created(.{ .title = got.body.title, .tags = got.body.tags.len });
+    }
+    pub fn show(_: *BodyController, ctx: *Ctx, got: struct { params: struct { id: u32 }, query: struct { verbose: bool = false } }) ![]const u8 {
+        return std.fmt.allocPrint(ctx.arena, "{d}:{}", .{ got.params.id, got.query.verbose });
+    }
+    pub fn owned(_: *BodyController, _: *Ctx, got: struct { owner: []const u8 }) []const u8 {
+        return got.owner;
+    }
+};
+
+const BodyApp = App(.{ .modules = &.{Module(.{ .name = "BodyModule", .controllers = &.{BodyController} })} });
+
+fn bodyReq(method: std.http.Method, target: []const u8, content_type: ?[]const u8, body: []const u8) !testing_rt.TestResponse {
+    var env: std.process.Environ.Map = .init(testing.allocator);
+    defer env.deinit();
+    const app = try testing.allocator.create(BodyApp);
+    defer testing.allocator.destroy(app);
+    try app.init(testing.io, testing.allocator, &env);
+    defer app.deinit();
+    const headers: []const context.Header = if (content_type) |ct| &.{.{ .name = "content-type", .value = ct }} else &.{};
+    return testing_rt.request(testing.allocator, app, .{ .method = method, .target = target, .headers = headers, .body = body });
+}
+
+test "typed body reaches the handler" {
+    var a = try bodyReq(.POST, "/api/v1/things", "application/json", "{\"title\":\"x\",\"tags\":[\"a\",\"b\"]}");
+    defer a.deinit();
+    try testing.expectEqual(std.http.Status.created, a.status);
+    try testing.expectEqualStrings("{\"title\":\"x\",\"tags\":2}", a.body);
+}
+
+test "invalid body is 422 with field errors" {
+    var a = try bodyReq(.POST, "/api/v1/things", "application/json; charset=utf-8", "{\"title\":1,\"tags\":[\"a\",2]}");
+    defer a.deinit();
+    try testing.expectEqual(std.http.Status.unprocessable_entity, a.status);
+    try testing.expectEqualStrings(
+        "{\"type\":\"about:blank\",\"title\":\"Unprocessable Entity\",\"status\":422,\"detail\":\"expected string\"," ++
+            "\"errors\":[{\"field\":\"title\",\"message\":\"expected string\"},{\"field\":\"tags.1\",\"message\":\"expected string\"}]}",
+        a.body,
+    );
+}
+
+test "custom validation is 422" {
+    var a = try bodyReq(.POST, "/api/v1/things", "application/json", "{\"title\":\"\"}");
+    defer a.deinit();
+    try testing.expectEqual(std.http.Status.unprocessable_entity, a.status);
+    try testing.expect(std.mem.indexOf(u8, a.body, "must not be empty") != null);
+}
+
+test "malformed JSON is 400" {
+    var a = try bodyReq(.POST, "/api/v1/things", "application/json", "{\"title\":");
+    defer a.deinit();
+    try testing.expectEqual(std.http.Status.bad_request, a.status);
+}
+
+test "non-JSON body decodes as {}" {
+    var a = try bodyReq(.POST, "/api/v1/things", "text/plain", "title=x");
+    defer a.deinit();
+    try testing.expectEqual(std.http.Status.unprocessable_entity, a.status);
+    try testing.expect(std.mem.indexOf(u8, a.body, "{\"field\":\"title\",\"message\":\"required\"}") != null);
+}
+
+test "typed query and params" {
+    var a = try bodyReq(.GET, "/api/v1/things/7?verbose=true", null, "");
+    defer a.deinit();
+    try testing.expectEqualStrings("7:true", a.body);
+}
+
+test "bad query or params is 422" {
+    var a = try bodyReq(.GET, "/api/v1/things/7?verbose=maybe", null, "");
+    defer a.deinit();
+    try testing.expectEqual(std.http.Status.unprocessable_entity, a.status);
+    try testing.expect(std.mem.indexOf(u8, a.body, "\"detail\":\"Invalid query parameters\"") != null);
+    var b = try bodyReq(.GET, "/api/v1/things/x", null, "");
+    defer b.deinit();
+    try testing.expect(std.mem.indexOf(u8, b.body, "\"detail\":\"Invalid path parameters\"") != null);
+}
+
+test "a late contributor reads the body" {
+    var a = try bodyReq(.POST, "/api/v1/owned", "application/json", "{\"title\":\"mine\"}");
+    defer a.deinit();
+    try testing.expectEqualStrings("mine", a.body);
 }

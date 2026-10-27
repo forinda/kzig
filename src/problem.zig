@@ -1,5 +1,6 @@
 //! RFC 9457 problem details and the framework error set.
 const std = @import("std");
+const FieldError = @import("decode.zig").FieldError;
 
 /// Errors a handler can return to answer with a status. `HttpProblem` means
 /// the details were stored with `Ctx.fail`.
@@ -21,6 +22,8 @@ pub const Problem = struct {
     /// Defaults to the status phrase.
     title: ?[]const u8 = null,
     detail: ?[]const u8 = null,
+    /// RFC 9457 extension member: per-field validation errors (KickJS 422).
+    errors: ?[]const FieldError = null,
 };
 
 pub fn statusOf(err: anyerror) ?std.http.Status {
