@@ -125,6 +125,19 @@ pub const Pool = struct {
         return execOn(c, text, args);
     }
 
+    /// `query` with parameters already encoded (the query builder's).
+    pub fn queryParams(p: *Pool, a: Allocator, comptime T: type, text: []const u8, params: []const ?[]const u8) ![]T {
+        const c = try p.acquire();
+        defer p.release(c);
+        return rowsOn(c, a, T, text, params);
+    }
+
+    pub fn execParams(p: *Pool, text: []const u8, params: []const ?[]const u8) !u64 {
+        const c = try p.acquire();
+        defer p.release(c);
+        return c.run(text, params, {}, ignoreRow);
+    }
+
     /// Several statements, no parameters (a migration).
     pub fn execScript(p: *Pool, text: []const u8) !void {
         const c = try p.acquire();
@@ -167,6 +180,14 @@ pub const Tx = struct {
         return (t.conn orelse return error.TransactionDone).script(text);
     }
 
+    pub fn queryParams(t: *Tx, a: Allocator, comptime T: type, text: []const u8, params: []const ?[]const u8) ![]T {
+        return rowsOn(t.conn orelse return error.TransactionDone, a, T, text, params);
+    }
+
+    pub fn execParams(t: *Tx, text: []const u8, params: []const ?[]const u8) !u64 {
+        return (t.conn orelse return error.TransactionDone).run(text, params, {}, ignoreRow);
+    }
+
     pub fn commit(t: *Tx) !void {
         const c = t.conn orelse return error.TransactionDone;
         t.conn = null;
@@ -193,6 +214,12 @@ pub const Tx = struct {
 };
 
 fn queryOn(c: *pg.Conn, a: Allocator, comptime T: type, text: []const u8, args: anytype) ![]T {
+    return rowsOn(c, a, T, text, try pg.encodeArgs(a, args));
+}
+
+fn ignoreRow(_: void, _: []const []const u8, _: []const ?[]const u8) !void {}
+
+fn rowsOn(c: *pg.Conn, a: Allocator, comptime T: type, text: []const u8, params: []const ?[]const u8) ![]T {
     if (@typeInfo(T) != .@"struct") @compileError("db: rows decode into a struct, not " ++ @typeName(T));
     const Rows = struct {
         a: Allocator,
@@ -203,7 +230,7 @@ fn queryOn(c: *pg.Conn, a: Allocator, comptime T: type, text: []const u8, args: 
         }
     };
     var rows: Rows = .{ .a = a };
-    _ = try c.run(text, try pg.encodeArgs(a, args), &rows, Rows.add);
+    _ = try c.run(text, params, &rows, Rows.add);
     return rows.list.items;
 }
 
@@ -211,10 +238,7 @@ fn execOn(c: *pg.Conn, text: []const u8, args: anytype) !u64 {
     var buf: [4096]u8 = undefined;
     var fba: std.heap.FixedBufferAllocator = .init(&buf);
     var arena: std.heap.ArenaAllocator = .init(fba.allocator());
-    const Ignore = struct {
-        fn add(_: void, _: []const []const u8, _: []const ?[]const u8) !void {}
-    };
-    return c.run(text, try pg.encodeArgs(arena.allocator(), args), {}, Ignore.add);
+    return c.run(text, try pg.encodeArgs(arena.allocator(), args), {}, ignoreRow);
 }
 
 const testing = std.testing;

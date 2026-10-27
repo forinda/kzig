@@ -32,7 +32,7 @@ pub fn Client(comptime S: type) type {
             return .{ .conn = self.conn, .wheres = {}, .ons = {} };
         }
 
-        pub fn insertInto(self: Self, comptime t: S.Tag) Insert(S, @tagName(t), null) {
+        pub fn insertInto(self: Self, comptime t: S.Tag) Insert(S, @tagName(t), null, null) {
             return .{ .conn = self.conn };
         }
 
@@ -42,6 +42,55 @@ pub fn Client(comptime S: type) type {
 
         pub fn deleteFrom(self: Self, comptime t: S.Tag) Delete(S, @tagName(t), void, null) {
             return .{ .conn = self.conn, .wheres = {} };
+        }
+
+        /// kick/db's `upsert`: insert, or update the row whose `target` key
+        /// exists (`.update = .all` (default), `.none`, or a tuple of columns).
+        /// The row as stored comes back either way.
+        pub fn upsert(self: Self, a: Allocator, comptime t: S.Tag, values: S.Table(t).Insert, comptime opts: anytype) !S.Table(t).Row {
+            const update = if (@hasField(@TypeOf(opts), "update")) opts.update else .all;
+            if (try self.insertInto(t).values(values).onConflict(opts.target, update).returningAll().executeTakeFirst(a)) |row| return row;
+            // DO NOTHING returned nothing: the row was there; read it by its key.
+            var key: TargetValues(S.Table(t), opts.target) = undefined;
+            inline for (@typeInfo(@TypeOf(key)).@"struct".field_names) |f| {
+                const v = @field(values, f);
+                @field(key, f) = if (@typeInfo(@TypeOf(v)) == .optional) (v orelse return error.MissingTarget) else v;
+            }
+            return self.selectFrom(t).whereExpr(Match(@TypeOf(key)){ .values = key }).executeTakeFirstOrThrow(a);
+        }
+
+        /// kick/db's `findOrCreate`: the row matching `where`, or one created
+        /// from `where` and `create`. Race-safe: a creator that loses reads
+        /// the winner's row; inside a transaction the insert runs in a
+        /// savepoint so the loss doesn't abort it.
+        pub fn findOrCreate(self: Self, a: Allocator, comptime t: S.Tag, where: anytype, create: anytype) !struct { row: S.Table(t).Row, created: bool } {
+            const T = S.Table(t);
+            const find = self.selectFrom(t).whereExpr(Match(@TypeOf(where)){ .values = where });
+            if (try find.executeTakeFirst(a)) |row| return .{ .row = row, .created = false };
+            var ins: T.Insert = undefined;
+            inline for (@typeInfo(T.Insert).@"struct".field_names) |f| {
+                if (@hasField(@TypeOf(where), f)) {
+                    @field(ins, f) = @field(where, f);
+                } else if (@hasField(@TypeOf(create), f)) {
+                    @field(ins, f) = @field(create, f);
+                } else if (comptime @typeInfo(@FieldType(T.Insert, f)) == .optional) {
+                    @field(ins, f) = null;
+                } else @compileError(T.name_ ++ "." ++ f ++ ": findOrCreate needs it in where or create");
+            }
+            const q = self.insertInto(t).values(ins).returningAll();
+            const row = switch (self.conn) {
+                .pool => q.executeTakeFirstOrThrow(a),
+                .tx => |tx| blk: {
+                    try tx.execScript("SAVEPOINT kzig_find_or_create");
+                    const r = q.executeTakeFirstOrThrow(a);
+                    try tx.execScript(if (r) |_| "RELEASE SAVEPOINT kzig_find_or_create" else |_| "ROLLBACK TO SAVEPOINT kzig_find_or_create");
+                    break :blk r;
+                },
+            } catch |err| switch (err) {
+                error.Conflict => return .{ .row = try find.executeTakeFirst(a) orelse return error.Conflict, .created = false },
+                else => return err,
+            };
+            return .{ .row = row, .created = true };
         }
     };
 }
@@ -414,6 +463,107 @@ fn opExpr(comptime col: anytype, comptime op: Op, value: anytype) OpExpr(col, op
     };
 }
 
+// ---- running
+
+fn runRows(conn: Conn, a: Allocator, comptime Row: type, q: Sql) ![]Row {
+    return switch (conn) {
+        .pool => |p| p.queryParams(a, Row, q.sql, q.params),
+        .tx => |t| t.queryParams(a, Row, q.sql, q.params),
+    };
+}
+
+fn runExec(conn: Conn, q: Sql) !u64 {
+    return switch (conn) {
+        .pool => |p| p.execParams(q.sql, q.params),
+        .tx => |t| t.execParams(q.sql, q.params),
+    };
+}
+
+/// Rows, or the affected count for a statement without RETURNING.
+fn Result(comptime Row: type) type {
+    return if (Row == void) u64 else []Row;
+}
+
+fn execute_(b: anytype, a: Allocator) !Result(@TypeOf(b).Row) {
+    const Row = @TypeOf(b).Row;
+    const q = try b.toSql(a);
+    if (Row == void) return runExec(b.conn, q);
+    return runRows(b.conn, a, Row, q);
+}
+
+fn takeFirst(b: anytype, a: Allocator) !?@TypeOf(b).Row {
+    if (@TypeOf(b).Row == void) @compileError("db: executeTakeFirst needs rows: add returning(…)");
+    const rows = try execute_(b, a);
+    return if (rows.len > 0) rows[0] else null;
+}
+
+/// kick/db's `executeTakeFirstOrThrow`: no row is `error.NotFound` (404).
+fn takeFirstOrThrow(b: anytype, a: Allocator) !@TypeOf(b).Row {
+    return try takeFirst(b, a) orelse error.NotFound;
+}
+
+const Conflict = struct {
+    target: []const []const u8,
+    update: union(enum) { all, none, cols: []const []const u8 },
+};
+
+fn conflictOf(comptime target: anytype, comptime update: anytype) Conflict {
+    const U = @TypeOf(update);
+    return .{
+        .target = groupRefs(target),
+        .update = if (U == EnumLiteral) (if (update == .all) .all else if (update == .none) .none else @compileError("db: update is .all, .none or a tuple of columns")) else .{ .cols = groupRefs(update) },
+    };
+}
+
+/// The `target` columns of an Insert, unwrapped.
+fn TargetValues(comptime T: type, comptime target: anytype) type {
+    comptime {
+        const keys = groupRefs(target);
+        var types: [keys.len]type = undefined;
+        var attrs: [keys.len]std.builtin.Type.Struct.FieldAttributes = undefined;
+        for (keys, 0..) |k, i| {
+            const F = @FieldType(T.Insert, k);
+            types[i] = if (@typeInfo(F) == .optional) @typeInfo(F).optional.child else F;
+            attrs[i] = .{};
+        }
+        const t = types;
+        const at = attrs;
+        return @Struct(.auto, null, keys[0..keys.len], &t, &at);
+    }
+}
+
+fn contains(comptime list: []const []const u8, comptime k: []const u8) bool {
+    for (list) |x| if (std.mem.eql(u8, x, k)) return true;
+    return false;
+}
+
+/// `"a" = $1 AND "b" = $2` from a struct's fields (findOrCreate's `where`).
+fn Match(comptime V: type) type {
+    return struct {
+        values: V,
+
+        pub fn render(self: @This(), comptime sc: Scope, w: *Writer) !void {
+            inline for (@typeInfo(V).@"struct".field_names, 0..) |f, i| {
+                if (i > 0) try w.raw(" AND ");
+                const r = comptime resolveCol(sc, f);
+                const v = @field(self.values, f);
+                const F = @TypeOf(v);
+                try writeCol(w, r);
+                if (comptime @typeInfo(F) == .optional) {
+                    if (v) |x| {
+                        try w.raw(" = ");
+                        try w.param(x);
+                    } else try w.raw(" IS NULL");
+                } else {
+                    if (comptime F != EnumLiteral) comptime checkValue(r, F);
+                    try w.raw(" = ");
+                    try w.param(v);
+                }
+            }
+        }
+    };
+}
+
 // ---- builders
 
 /// Conditions added one `where` at a time, ANDed.
@@ -486,6 +636,14 @@ fn leftJoined(comptime spec: SelectSpec, comptime table_name: []const u8, compti
 
 fn RowOf(comptime sc: Scope, comptime items: []const Item, comptime spec: ?SelectSpec) type {
     comptime {
+        // Every column of the table, in order: its own Row type.
+        const all_cols = allItems(sc.S, sc.from);
+        if (items.len == all_cols.len and (spec == null or spec.?.joins.len == 0)) {
+            const same = for (items, all_cols) |x, y| {
+                if (!std.mem.eql(u8, x.ref, y.ref) or !std.mem.eql(u8, x.as, y.as)) break false;
+            } else true;
+            if (same) return sc.S.Table(@field(sc.S.Tag, sc.from)).Row;
+        }
         var names: [items.len][]const u8 = undefined;
         var types: [items.len]type = undefined;
         var attrs: [items.len]std.builtin.Type.Struct.FieldAttributes = undefined;
@@ -602,10 +760,34 @@ pub fn Select(comptime S: type, comptime spec: SelectSpec, comptime W: type, com
             return out;
         }
 
+        pub fn execute(self: Self, a: Allocator) !Result(Row) {
+            return execute_(self, a);
+        }
+
+        pub fn executeTakeFirst(self: Self, a: Allocator) !?Row {
+            return takeFirst(self, a);
+        }
+
+        pub fn executeTakeFirstOrThrow(self: Self, a: Allocator) !Row {
+            return takeFirstOrThrow(self, a);
+        }
+
         pub fn toSql(self: Self, a: Allocator) !Sql {
             var w: Writer = .{ .a = a };
             try self.renderInto(&w);
             return w.done();
+        }
+
+        /// `count(*)` of the rows this query matches (its columns, order and
+        /// limit left out).
+        pub fn count(self: Self, a: Allocator) !i64 {
+            var w: Writer = .{ .a = a };
+            try w.raw("SELECT count(*) AS \"count\" FROM ");
+            try w.ident(S.info(@field(S.Tag, spec.from)).name);
+            try renderJoins(self.ons, &w);
+            try renderWheres(self.wheres, scope, &w);
+            const rows = try runRows(self.conn, a, struct { count: i64 }, w.done());
+            return rows[0].count;
         }
 
         pub fn renderInto(self: Self, w: *Writer) !void {
@@ -668,7 +850,7 @@ fn returningClause(comptime sc: Scope, comptime ret: ?[]const Item, w: *Writer) 
     }
 }
 
-pub fn Insert(comptime S: type, comptime tag: []const u8, comptime ret: ?[]const Item) type {
+pub fn Insert(comptime S: type, comptime tag: []const u8, comptime ret: ?[]const Item, comptime conflict: ?Conflict) type {
     return struct {
         conn: Conn,
         one: ?T.Insert = null,
@@ -691,12 +873,30 @@ pub fn Insert(comptime S: type, comptime tag: []const u8, comptime ret: ?[]const
             return out;
         }
 
-        pub fn returning(self: Self, comptime cols: anytype) Insert(S, tag, parseItems(cols)) {
-            return retype(Insert(S, tag, parseItems(cols)), self);
+        /// `ON CONFLICT (target) DO UPDATE SET … = EXCLUDED.…` (`.all`: every
+        /// given column outside the target; or the named ones), or `DO NOTHING` (`.none`).
+        pub fn onConflict(self: Self, comptime target: anytype, comptime update: anytype) Insert(S, tag, ret, conflictOf(target, update)) {
+            return retype(Insert(S, tag, ret, conflictOf(target, update)), self);
         }
 
-        pub fn returningAll(self: Self) Insert(S, tag, allItems(S, tag)) {
-            return retype(Insert(S, tag, allItems(S, tag)), self);
+        pub fn returning(self: Self, comptime cols: anytype) Insert(S, tag, parseItems(cols), conflict) {
+            return retype(Insert(S, tag, parseItems(cols), conflict), self);
+        }
+
+        pub fn returningAll(self: Self) Insert(S, tag, allItems(S, tag), conflict) {
+            return retype(Insert(S, tag, allItems(S, tag), conflict), self);
+        }
+
+        pub fn execute(self: Self, a: Allocator) !Result(Row) {
+            return execute_(self, a);
+        }
+
+        pub fn executeTakeFirst(self: Self, a: Allocator) !?Row {
+            return takeFirst(self, a);
+        }
+
+        pub fn executeTakeFirstOrThrow(self: Self, a: Allocator) !Row {
+            return takeFirstOrThrow(self, a);
         }
 
         pub fn toSql(self: Self, a: Allocator) !Sql {
@@ -737,6 +937,30 @@ pub fn Insert(comptime S: type, comptime tag: []const u8, comptime ret: ?[]const
                     };
                     try w.raw(")");
                 }
+            }
+            if (conflict) |cf| {
+                try w.raw(" ON CONFLICT (");
+                inline for (cf.target, 0..) |k, i| {
+                    if (i > 0) try w.raw(", ");
+                    try w.ident(comptime resolveCol(scope, k).name);
+                }
+                try w.raw(")");
+                var first = true;
+                inline for (keys, 0..) |k, i| {
+                    const named = comptime switch (cf.update) {
+                        .all => !contains(cf.target, k),
+                        .none => false,
+                        .cols => |cols| contains(cols, k),
+                    };
+                    if (named and (given[i] or cf.update == .cols)) {
+                        try w.raw(if (first) " DO UPDATE SET " else ", ");
+                        first = false;
+                        try w.ident(info.columns[i].name);
+                        try w.raw(" = EXCLUDED.");
+                        try w.ident(info.columns[i].name);
+                    }
+                }
+                if (first) try w.raw(" DO NOTHING");
             }
             try returningClause(scope, ret, &w);
             return w.done();
@@ -779,6 +1003,18 @@ pub fn Update(comptime S: type, comptime tag: []const u8, comptime W: type, comp
 
         pub fn returningAll(self: Self) Update(S, tag, W, allItems(S, tag)) {
             return retype(Update(S, tag, W, allItems(S, tag)), self);
+        }
+
+        pub fn execute(self: Self, a: Allocator) !Result(Row) {
+            return execute_(self, a);
+        }
+
+        pub fn executeTakeFirst(self: Self, a: Allocator) !?Row {
+            return takeFirst(self, a);
+        }
+
+        pub fn executeTakeFirstOrThrow(self: Self, a: Allocator) !Row {
+            return takeFirstOrThrow(self, a);
         }
 
         pub fn toSql(self: Self, a: Allocator) !Sql {
@@ -830,6 +1066,18 @@ pub fn Delete(comptime S: type, comptime tag: []const u8, comptime W: type, comp
 
         pub fn returningAll(self: Self) Delete(S, tag, W, allItems(S, tag)) {
             return retype(Delete(S, tag, W, allItems(S, tag)), self);
+        }
+
+        pub fn execute(self: Self, a: Allocator) !Result(Row) {
+            return execute_(self, a);
+        }
+
+        pub fn executeTakeFirst(self: Self, a: Allocator) !?Row {
+            return takeFirst(self, a);
+        }
+
+        pub fn executeTakeFirstOrThrow(self: Self, a: Allocator) !Row {
+            return takeFirstOrThrow(self, a);
         }
 
         pub fn toSql(self: Self, a: Allocator) !Sql {
@@ -957,4 +1205,146 @@ test "snake_case: database names in SQL, keys in rows" {
     const sc: Client(Snake) = .{ .conn = undefined };
     try expectSql(sc.selectFrom(.people).select(.{ .id, .teamId }).where(.teamId, .eq, 2), "SELECT \"id\", \"team_id\" AS \"teamId\" FROM \"people\" WHERE \"team_id\" = $1", &.{"2"});
     try expectSql(sc.insertInto(.people).values(.{ .name = "A", .teamId = 1 }), "INSERT INTO \"people\" (\"name\", \"team_id\") VALUES ($1, $2)", &.{ "A", "1" });
+}
+
+fn setupPeople(pool: *dbm.Pool) !void {
+    try pool.execScript(
+        \\DROP TABLE IF EXISTS people, teams; DROP TYPE IF EXISTS role;
+        \\CREATE TYPE role AS ENUM ('admin', 'member');
+        \\CREATE TABLE teams (id serial PRIMARY KEY, title text NOT NULL UNIQUE);
+        \\CREATE TABLE people (id serial PRIMARY KEY, name text NOT NULL, email varchar(255) UNIQUE,
+        \\  role role NOT NULL DEFAULT 'member', age smallint, joined timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        \\  "teamId" integer REFERENCES teams(id));
+    );
+}
+
+fn dropPeople(pool: *dbm.Pool) void {
+    pool.execScript("DROP TABLE IF EXISTS people, teams; DROP TYPE IF EXISTS role;") catch {};
+}
+
+test "runs on Postgres: insert, select, join, update, delete" {
+    var env: std.process.Environ.Map = undefined;
+    const url = dbm.testUrl(&env) catch |err| {
+        if (err == error.SkipZigTest) env.deinit();
+        return err;
+    };
+    defer env.deinit();
+    var pool: dbm.Pool = try .init(testing.io, testing.allocator, .{ .url = url, .max_connections = 2 });
+    defer pool.deinit();
+    try setupPeople(&pool);
+    defer dropPeople(&pool);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const db: Client(TestSchema) = .init(.{ .pool = &pool });
+
+    const team = try db.insertInto(.teams).values(.{ .title = "core" }).returningAll().executeTakeFirstOrThrow(a);
+    const tricky = "O'Brien; DROP TABLE teams --";
+    const ada = try db.insertInto(.people).values(.{ .name = tricky, .role = .admin, .teamId = team.id }).returningAll().executeTakeFirstOrThrow(a);
+    try testing.expectEqualStrings(tricky, ada.name);
+    try testing.expectEqual(Role.admin, ada.role);
+    try testing.expectEqual(null, ada.email);
+    try testing.expect(ada.joined.us > 0);
+    try testing.expectEqual(2, try db.insertInto(.people).valuesMany(&.{ .{ .name = "B", .age = 30 }, .{ .name = "C" } }).execute(a));
+
+    const admins = try db.selectFrom(.people).where(.role, .eq, .admin).execute(a);
+    try testing.expectEqual(1, admins.len);
+    const joined = try db.selectFrom(.people).leftJoin(.teams, eq(.@"teams.id", .@"people.teamId"))
+        .select(.{ .name, "teams.title as teamTitle" }).orderBy(.@"people.id", .asc).execute(a);
+    try testing.expectEqual(3, joined.len);
+    try testing.expectEqualStrings("core", joined[0].teamTitle.?);
+    try testing.expectEqual(null, joined[1].teamTitle);
+    try testing.expectEqual(null, try db.selectFrom(.people).where(.name, .eq, "nobody").executeTakeFirst(a));
+    try testing.expectError(error.NotFound, db.selectFrom(.people).where(.name, .eq, "nobody").executeTakeFirstOrThrow(a));
+    try testing.expectEqual(2, try db.selectFrom(.people).where(.role, .eq, .member).count(a));
+
+    const renamed = try db.updateTable(.people).set(.{ .name = "Ada", .email = @as(?[]const u8, "ada@example.com") }).where(.id, .eq, ada.id).returning(.{ .name, .email }).executeTakeFirstOrThrow(a);
+    try testing.expectEqualStrings("Ada", renamed.name);
+    try testing.expectEqualStrings("ada@example.com", renamed.email.?);
+    try testing.expectError(error.Conflict, db.insertInto(.people).values(.{ .name = "X", .email = "ada@example.com" }).execute(a));
+    try testing.expectEqual(1, try db.deleteFrom(.people).where(.name, .eq, "C").execute(a));
+
+    // A NULL into a non-optional field is a decode error, not a crash.
+    const q = try db.selectFrom(.people).leftJoin(.teams, eq(.@"teams.id", .@"people.teamId"))
+        .select(.{ .name, "teams.title as teamTitle" }).where(.@"people.name", .eq, "B").toSql(a);
+    try testing.expectError(error.DbDecode, pool.queryParams(a, struct { teamTitle: []const u8 }, q.sql, q.params));
+}
+
+test "upsert and findOrCreate" {
+    var env: std.process.Environ.Map = undefined;
+    const url = dbm.testUrl(&env) catch |err| {
+        if (err == error.SkipZigTest) env.deinit();
+        return err;
+    };
+    defer env.deinit();
+    var pool: dbm.Pool = try .init(testing.io, testing.allocator, .{ .url = url, .max_connections = 4 });
+    defer pool.deinit();
+    try setupPeople(&pool);
+    defer dropPeople(&pool);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const db: Client(TestSchema) = .init(.{ .pool = &pool });
+
+    const first = try db.upsert(a, .people, .{ .name = "A", .email = "a@x" }, .{ .target = .{.email} });
+    const second = try db.upsert(a, .people, .{ .name = "A2", .email = "a@x", .age = 5 }, .{ .target = .{.email} });
+    try testing.expectEqual(first.id, second.id);
+    try testing.expectEqualStrings("A2", second.name);
+    try testing.expectEqual(5, second.age.?);
+    // update = .none: the stored row comes back as it was.
+    const kept = try db.upsert(a, .people, .{ .name = "ignored", .email = "a@x" }, .{ .target = .{.email}, .update = .none });
+    try testing.expectEqualStrings("A2", kept.name);
+    // Only the named columns take the incoming value.
+    const named = try db.upsert(a, .people, .{ .name = "A3", .email = "a@x", .age = 9 }, .{ .target = .{.email}, .update = .{.age} });
+    try testing.expectEqualStrings("A2", named.name);
+    try testing.expectEqual(9, named.age.?);
+
+    const made = try db.findOrCreate(a, .teams, .{ .title = "core" }, .{});
+    try testing.expect(made.created);
+    const found = try db.findOrCreate(a, .teams, .{ .title = "core" }, .{});
+    try testing.expect(!found.created);
+    try testing.expectEqual(made.row.id, found.row.id);
+
+    // Racing creators: one creates, every one gets the same row.
+    const Race = struct {
+        fn run(d: Client(TestSchema), created: *std.atomic.Value(u32), failed: *std.atomic.Value(u32)) void {
+            var ar: std.heap.ArenaAllocator = .init(testing.allocator);
+            defer ar.deinit();
+            const r = d.findOrCreate(ar.allocator(), .teams, .{ .title = "race" }, .{}) catch {
+                _ = failed.fetchAdd(1, .acq_rel);
+                return;
+            };
+            if (r.created) _ = created.fetchAdd(1, .acq_rel);
+        }
+    };
+    var created: std.atomic.Value(u32) = .init(0);
+    var failed: std.atomic.Value(u32) = .init(0);
+    var group: std.Io.Group = .init;
+    for (0..4) |_| try group.concurrent(testing.io, Race.run, .{ db, &created, &failed });
+    try group.await(testing.io);
+    try testing.expectEqual(0, failed.load(.acquire));
+    try testing.expectEqual(1, created.load(.acquire));
+
+    // Inside a transaction a lost race doesn't abort it (savepoint): another
+    // transaction holds an uncommitted "taken", so our read misses, our
+    // insert waits for it, and conflicts once it commits.
+    var other = try pool.begin();
+    defer other.deinit();
+    _ = try other.exec("INSERT INTO teams (title) VALUES ('taken')", .{});
+    const Commit = struct {
+        fn run(t: *dbm.Tx) void {
+            testing.io.sleep(.fromMilliseconds(200), .awake) catch {};
+            t.commit() catch {};
+        }
+    };
+    var later = try testing.io.concurrent(Commit.run, .{&other});
+    var tx = try pool.begin();
+    defer tx.deinit();
+    const txdb: Client(TestSchema) = .init(.{ .tx = &tx });
+    const taken = try txdb.findOrCreate(a, .teams, .{ .title = "taken" }, .{});
+    later.await(testing.io);
+    try testing.expect(!taken.created);
+    _ = try txdb.insertInto(.teams).values(.{ .title = "after" }).execute(a);
+    try tx.commit();
+    try testing.expectEqual(1, try db.selectFrom(.teams).where(.title, .eq, "after").count(a));
 }
