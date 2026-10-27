@@ -38,3 +38,44 @@ pub fn bootWith(vars: []const [2][]const u8, overrides: anytype) !TestApp {
     try app.initWith(testing.io, testing.allocator, &env, overrides);
     return .{ .app = app };
 }
+
+/// The app on a real socket (std runtime, an ephemeral port), for WebSocket
+/// tests — KickJS's `app.start()` with `port: 0`.
+pub const Live = struct {
+    t: TestApp,
+    srv: kzig.runtime.std.Server(App),
+    fut: std.Io.Future(anyerror!void),
+
+    pub fn port(self: *Live) u16 {
+        return self.srv.port();
+    }
+
+    pub fn client(self: *Live, target: []const u8) !*kzig.testing.WsClient {
+        return kzig.testing.WsClient.connect(testing.allocator, testing.io, self.port(), target);
+    }
+
+    /// Graceful shutdown (sockets get `draining`, then 1001), then deinit.
+    pub fn stop(self: *Live) void {
+        self.srv.shutdown();
+        self.fut.cancel(testing.io) catch {};
+        self.srv.deinit();
+        self.t.deinit();
+        testing.allocator.destroy(self);
+    }
+
+    fn run(srv: *kzig.runtime.std.Server(App)) anyerror!void {
+        return srv.run();
+    }
+};
+
+/// `heartbeat_ms` replaces the App's for this test.
+pub fn listen(vars: []const [2][]const u8, heartbeat_ms: ?u32) !*Live {
+    const live = try testing.allocator.create(Live);
+    errdefer testing.allocator.destroy(live);
+    live.t = try boot(vars);
+    errdefer live.t.deinit();
+    if (heartbeat_ms) |ms| live.t.app.ws_hub.opts.heartbeat_ms = ms;
+    live.srv = try .init(testing.io, testing.allocator, live.t.app, .{ .port = 0 });
+    live.fut = try testing.io.concurrent(Live.run, .{&live.srv});
+    return live;
+}

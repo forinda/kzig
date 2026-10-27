@@ -16,6 +16,8 @@ pub const App = kzig.App(.{
         .info = .{ .title = "task-api", .version = "0.1.0", .description = "kzig's example app" },
         .disable_in_prod = true,
     })},
+    // ws://…/ws/<gateway path>; pings every 30 s.
+    .ws = .{ .heartbeat_ms = 30_000 },
     .adapters = &.{
         MailAdapter("transactional", mail.TransactionalMail),
         MailAdapter("marketing", mail.MarketingMail),
@@ -46,7 +48,9 @@ test {
     _ = @import("modules/config-reports/config-report.test.zig");
     _ = @import("adapters/mail.test.zig");
     _ = @import("openapi.test.zig");
+    _ = @import("clock.zig");
     _ = @import("modules/tasks/task.test.zig");
     _ = @import("modules/files/file.test.zig");
+    _ = @import("modules/chats/chat.test.zig");
     // kzig:tests
 }

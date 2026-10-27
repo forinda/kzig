@@ -1,6 +1,9 @@
 const std = @import("std");
 const kzig = @import("kzig");
 const FileSettings = @import("file.settings.zig").FileSettings;
+const clock = @import("../../clock.zig");
+pub const Clock = clock.Clock;
+const iso = clock.iso;
 
 const Io = std.Io;
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
@@ -20,17 +23,6 @@ pub fn isFileId(id: []const u8) bool {
     for (id[37..]) |c| if (!std.ascii.isLower(c)) return false;
     return true;
 }
-
-/// Wall-clock seconds; tests move it forward with `offset_s`.
-pub const Clock = struct {
-    process: *const kzig.Process,
-    offset_s: i64 = 0,
-
-    pub fn now(self: *const Clock) i64 {
-        const ns = Io.Clock.real.now(self.process.io).toNanoseconds();
-        return @as(i64, @intCast(@divTrunc(ns, std.time.ns_per_s))) + self.offset_s;
-    }
-};
 
 /// file-storage-api's `FilesService` on its disk driver: files live in
 /// `<UPLOAD_DIR>/files/<id>`, the folder made on the first upload.
@@ -163,15 +155,6 @@ fn typeOf(id: []const u8) []const u8 {
 
 fn lessThan(_: void, a: []const u8, b: []const u8) bool {
     return std.mem.order(u8, a, b) == .lt;
-}
-
-/// `2026-10-27T09:28:37.000Z`, as `Date.toISOString()`.
-fn iso(arena: std.mem.Allocator, secs: i64) ![]const u8 {
-    const es: std.time.epoch.EpochSeconds = .{ .secs = @intCast(@max(secs, 0)) };
-    const yd = es.getEpochDay().calculateYearDay();
-    const md = yd.calculateMonthDay();
-    const ds = es.getDaySeconds();
-    return arena.print("{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.000Z", .{ yd.year, md.month.numeric(), md.day_index + 1, ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute() });
 }
 
 test "isFileId takes ours only" {

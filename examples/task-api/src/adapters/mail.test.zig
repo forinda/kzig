@@ -13,6 +13,7 @@ const production = [_][2][]const u8{
     .{ "MARKETING_MAIL_PASSWORD", "marketing-secret" },
     .{ "API_KEY", "prod-api-key-0123456789abcdef0123456" },
     .{ "SIGNING_SECRET", "prod-signing-secret-0123456789abcdef" },
+    .{ "CHAT_SECRET", "prod-chat-secret-0123456789abcdef0123" },
 };
 
 fn envOf(pairs: []const [2][]const u8) !std.process.Environ.Map {

@@ -50,6 +50,9 @@ after M6.
 | Swagger operations untagged without `@ApiTags` | Tagged with the module's name | Swagger UI groups by module |
 | `@FileUpload({ maxSize: getEnv(…) })` | `kzig.Upload(.{ .max_size })` is comptime; a limit from env is checked in the handler | Route types are built at compile time |
 | `..%2F` in a path reaches validation (422) | 400 at the router | Traversal never reaches a handler |
+| `@WsController('/chat')`, `@OnMessage('event')`, `WsAdapter({ auth: { resolveUser } })` | A gateway struct in `.gateways` with `pub const events`; auth in `connect` (`ctx.close(4401, …)`) | One hook instead of an adapter option; nothing runs before `connect` |
+| `ctx.data` untyped | The handler's `data` parameter is decoded (an `error` event lists the issues) | Same rules as request bodies |
+| `WsAdapter({ heartbeatInterval })` from env | `.ws = .{ .heartbeat_ms }` in the App spec | The App spec is comptime |
 
 Kept for parity even where Zig would allow otherwise: route middleware runs **after** validation.
 
@@ -265,7 +268,7 @@ Follow-ups:
 - [x] task-api `files` module (`file-storage-api`, disk storage): API key, signed download links
 - [x] WebSocket gateways (`@forinda/kickjs-ws`): `.gateways` on modules, `{event, data}` frames,
       rooms, `connect`/`disconnect`/`draining`, heartbeat, close codes; on both runtimes
-- [ ] task-api `chat` module (`ws-chat`, without Redis): tokens, rooms, presence
+- [x] task-api `chat` module (`ws-chat`, without Redis): tokens, rooms, presence
 
 ### Later
 
