@@ -3,6 +3,7 @@
 const std = @import("std");
 const context = @import("context.zig");
 const testing_rt = @import("testing.zig");
+const kzig_mw = @import("middleware.zig");
 
 const Ctx = context.Ctx;
 const builtin = @import("builtin");
@@ -10,6 +11,7 @@ const config = @import("config.zig");
 const di = @import("di.zig");
 const health = @import("health.zig");
 const router = @import("router.zig");
+const mw = @import("middleware.zig");
 
 /// Injectable as `*const kzig.Process`.
 pub const Process = struct {
@@ -51,7 +53,8 @@ pub fn Module(comptime spec: anytype) type {
 /// `.default_version = 1`, `.health = true` (mounts `/health/live` and
 /// `/health/ready`).
 pub fn App(comptime spec: anytype) type {
-    checkFields(spec, &.{ "modules", "config", "api_prefix", "default_version", "health" }, "App");
+    checkFields(spec, &.{ "modules", "config", "api_prefix", "default_version", "health", "middleware" }, "App");
+    const global_mw = if (@hasField(@TypeOf(spec), "middleware")) spec.middleware else .{};
     const Config = opt(spec, "config", struct {});
     const api_prefix: []const u8 = opt(spec, "api_prefix", @as([]const u8, "/api"));
     const default_version: u16 = opt(spec, "default_version", @as(u16, 1));
@@ -60,9 +63,16 @@ pub fn App(comptime spec: anytype) type {
         (if (opt(spec, "health", true)) &[_]type{health.Module} else &[_]type{});
 
     comptime var listed: []const type = &.{ Config, Process };
+    listed = listed ++ mwTypes(global_mw);
     inline for (modules) |M| {
         if (!@hasDecl(M, "kzig_module")) @compileError(@typeName(M) ++ " is not a kzig.Module");
         listed = listed ++ M.services ++ M.controllers;
+        inline for (M.controllers) |C| {
+            if (@hasDecl(C, "middleware")) listed = listed ++ mwTypes(C.middleware);
+            if (@hasDecl(C, "routes")) inline for (C.routes) |r| {
+                if (@hasField(@TypeOf(r), "middleware")) listed = listed ++ mwTypes(r.middleware);
+            };
+        }
     }
     const Services = di.Container(listed);
 
@@ -75,6 +85,7 @@ pub fn App(comptime spec: anytype) type {
 
         pub const routes: []const router.Route = buildRoutes(Self, modules, api_prefix, default_version);
         const Routes = router.Router(routes);
+        const global: []const mw.Fn = mwChain(Self, global_mw, "App");
 
         /// Reads config from `env` and builds every service in place.
         /// `self` must not move afterwards: services point into it.
@@ -105,7 +116,7 @@ pub fn App(comptime spec: anytype) type {
 
         pub fn handle(self: *Self, ctx: *Ctx) void {
             ctx.app = self;
-            (Routes{}).handle(ctx);
+            Routes.handleWith(global, ctx);
         }
     };
 }
@@ -134,7 +145,10 @@ fn buildRoutes(comptime AppT: type, comptime modules: []const type, comptime api
                         if (other.method == method and samePattern(other.path, full))
                             @compileError("duplicate route " ++ @tagName(method) ++ " " ++ full ++ ": " ++ other_owner ++ " and " ++ owner);
                     }
-                    list = list ++ .{router.Route{ .method = method, .path = full, .handler = thunk(AppT, C, handler) }};
+                    const where = @tagName(method) ++ " " ++ full;
+                    const chain = (if (@hasDecl(C, "middleware")) mwChain(AppT, C.middleware, where) else &[_]mw.Fn{}) ++
+                        (if (@hasField(@TypeOf(r), "middleware")) mwChain(AppT, r.middleware, where) else &[_]mw.Fn{});
+                    list = list ++ .{router.Route{ .method = method, .path = full, .handler = thunk(AppT, C, handler), .middleware = chain }};
                     owners = owners ++ .{owner};
                 }
             }
@@ -142,6 +156,48 @@ fn buildRoutes(comptime AppT: type, comptime modules: []const type, comptime api
         const result = list;
         return result;
     }
+}
+
+/// Struct middleware types in `entries`; they are services.
+fn mwTypes(comptime entries: anytype) []const type {
+    comptime {
+        var out: []const type = &.{};
+        for (entries) |e| {
+            if (@TypeOf(e) == type) out = out ++ .{e};
+        }
+        const result = out;
+        return result;
+    }
+}
+
+/// A middleware entry is a function `fn (*Ctx, *Next) !void` or a service
+/// type with `pub fn handle(self: *T, *Ctx, *Next) !void`.
+fn mwChain(comptime AppT: type, comptime entries: anytype, comptime where: []const u8) []const mw.Fn {
+    comptime {
+        var out: []const mw.Fn = &.{};
+        for (entries) |e| out = out ++ .{mwFn(AppT, e, where)};
+        const result = out;
+        return result;
+    }
+}
+
+fn mwFn(comptime AppT: type, comptime e: anytype, comptime where: []const u8) mw.Fn {
+    const bad = where ++ ": middleware must be fn (*Ctx, *Next) !void or a type with handle";
+    if (@TypeOf(e) == type) {
+        if (@typeInfo(e) != .@"struct" or !@hasDecl(e, "handle")) @compileError(bad);
+        return struct {
+            fn call(ctx: *Ctx, next: *mw.Next) anyerror!void {
+                const app: *AppT = @ptrCast(@alignCast(ctx.app.?));
+                return e.handle(app.get(e), ctx, next);
+            }
+        }.call;
+    }
+    if (@typeInfo(@TypeOf(e)) != .@"fn") @compileError(bad);
+    return struct {
+        fn call(ctx: *Ctx, next: *mw.Next) anyerror!void {
+            return e(ctx, next);
+        }
+    }.call;
 }
 
 /// Same route ignoring param names and empty segments.
@@ -318,4 +374,80 @@ test "overrides replace a service in tests" {
     var a = try get(&app, "/api/v1/hello");
     defer a.deinit();
     try testing.expectEqualStrings("{\"message\":\"Yo world\"}", a.body);
+}
+
+fn mark(ctx: *Ctx, m: []const u8) !void {
+    const prev = for (ctx.res.headers.items) |h| {
+        if (std.mem.eql(u8, h.name, "x-trail")) break h.value;
+    } else null;
+    try ctx.setHeader("x-trail", if (prev) |p| try std.fmt.allocPrint(ctx.arena, "{s},{s}", .{ p, m }) else m);
+}
+
+const Mw = struct {
+    fn app(ctx: *Ctx, next: *kzig_mw.Next) !void {
+        try mark(ctx, "a");
+        next.run();
+    }
+    fn controller(ctx: *Ctx, next: *kzig_mw.Next) !void {
+        try mark(ctx, "c");
+        next.run();
+    }
+    fn route(ctx: *Ctx, next: *kzig_mw.Next) !void {
+        try mark(ctx, "r");
+        next.run();
+    }
+};
+
+const Counter = struct { hits: u32 = 0 };
+
+/// Struct middleware: a service with DI fields.
+const CountHits = struct {
+    counter: *Counter,
+    pub fn handle(self: *CountHits, ctx: *Ctx, next: *kzig_mw.Next) !void {
+        self.counter.hits += 1;
+        try ctx.setHeader("x-hits", try std.fmt.allocPrint(ctx.arena, "{d}", .{self.counter.hits}));
+        next.run();
+    }
+};
+
+const MwController = struct {
+    pub const middleware = .{Mw.controller};
+    pub const routes = .{
+        .{ .method = .GET, .path = "/", .handler = "index", .middleware = .{ Mw.route, CountHits } },
+    };
+    pub fn index(_: *MwController, ctx: *Ctx) !void {
+        try mark(ctx, "h");
+    }
+};
+
+const MwApp = App(.{
+    .modules = &.{Module(.{ .name = "MwModule", .path = "/mw", .controllers = &.{MwController}, .services = &.{Counter} })},
+    .middleware = .{Mw.app},
+});
+
+test "app, controller and route middleware run in order" {
+    var env: std.process.Environ.Map = .init(testing.allocator);
+    defer env.deinit();
+    var app: MwApp = undefined;
+    try app.init(testing.io, testing.allocator, &env);
+    defer app.deinit();
+    var a = try testing_rt.request(testing.allocator, &app, .{ .target = "/api/v1/mw" });
+    defer a.deinit();
+    try testing.expectEqualStrings("a,c,r,h", a.header("x-trail").?);
+    var b = try testing_rt.request(testing.allocator, &app, .{ .target = "/nope" });
+    defer b.deinit();
+    try testing.expectEqualStrings("a", b.header("x-trail").?);
+}
+
+test "struct middleware gets its service" {
+    var env: std.process.Environ.Map = .init(testing.allocator);
+    defer env.deinit();
+    var app: MwApp = undefined;
+    try app.init(testing.io, testing.allocator, &env);
+    defer app.deinit();
+    for (0..2) |_| {
+        var a = try testing_rt.request(testing.allocator, &app, .{ .target = "/api/v1/mw" });
+        a.deinit();
+    }
+    try testing.expectEqual(2, app.get(Counter).hits);
 }
