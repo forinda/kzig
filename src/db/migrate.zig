@@ -114,9 +114,16 @@ fn tablesOf(a: Allocator, o: Options) !Tables {
     return .{ .t = try quoted(a, o.table), .lock = try quoted(a, try std.mem.concat(a, u8, &.{ o.table, "_lock" })) };
 }
 
+/// `$n` on Postgres, `?n` on SQLite.
+fn ph(pool: *db.Pool) []const u8 {
+    return if (pool.dialect() == .sqlite) "?" else "$";
+}
+
 fn ensure(pool: *db.Pool, a: Allocator, o: Options) !Tables {
     const tables = try tablesOf(a, o);
-    const schema = if (std.mem.findScalar(u8, o.table, '.')) |i| try std.fmt.allocPrint(a, "CREATE SCHEMA IF NOT EXISTS \"{s}\";\n", .{o.table[0..i]}) else "";
+    const dot = std.mem.findScalar(u8, o.table, '.');
+    if (dot != null and pool.dialect() == .sqlite) return error.InvalidTableName; // no schemas in SQLite
+    const schema = if (dot) |i| try std.fmt.allocPrint(a, "CREATE SCHEMA IF NOT EXISTS \"{s}\";\n", .{o.table[0..i]}) else "";
     try pool.execScript(try std.fmt.allocPrint(a,
         \\{s}CREATE TABLE IF NOT EXISTS {s} (
         \\  "id" varchar(128) PRIMARY KEY,
@@ -152,7 +159,11 @@ fn find(rows: []const Applied, id: []const u8) ?Applied {
 /// replicas booting together don't race to make the tables.
 pub fn status(pool: *db.Pool, a: Allocator, list: []const Migration, o: Options) ![]Status {
     const tables = try tablesOf(a, o);
-    const exists = try pool.queryOne(a, struct { t: ?[]const u8 }, "SELECT to_regclass($1)::text AS t", .{tables.t});
+    const Exists = struct { t: ?[]const u8 };
+    const exists = if (pool.dialect() == .sqlite)
+        try pool.queryOne(a, Exists, "SELECT max(name) AS t FROM sqlite_master WHERE type = 'table' AND name = ?1", .{o.table})
+    else
+        try pool.queryOne(a, Exists, "SELECT to_regclass($1)::text AS t", .{tables.t});
     const rows = if (exists.?.t == null) &.{} else try appliedRows(pool, a, tables);
     const out = try a.alloc(Status, list.len);
     for (list, out) |m, *s| {
@@ -177,12 +188,13 @@ const Lock = struct {
             .pool = pool,
             .tables = tables,
             .owner = try std.fmt.allocPrint(a, "kzig:{x}", .{id}),
-            .keep_sql = try std.fmt.allocPrint(a, "UPDATE {s} SET locked_at = CURRENT_TIMESTAMP WHERE id = 1 AND locked_by = $1", .{tables.lock}),
+            .keep_sql = try std.fmt.allocPrint(a, "UPDATE {s} SET locked_at = CURRENT_TIMESTAMP WHERE id = 1 AND locked_by = {s}1", .{ tables.lock, ph(pool) }),
         };
+        const stale = if (pool.dialect() == .sqlite) "datetime('now', '-' || ?2 || ' seconds')" else "CURRENT_TIMESTAMP - make_interval(secs => $2)";
         const taken = try pool.exec(try std.fmt.allocPrint(a,
-            \\UPDATE {s} SET locked_at = CURRENT_TIMESTAMP, locked_by = $1
-            \\WHERE id = 1 AND (locked_at IS NULL OR locked_at < CURRENT_TIMESTAMP - make_interval(secs => $2))
-        , .{tables.lock}), .{ l.owner, o.stale_lock_s });
+            \\UPDATE {s} SET locked_at = CURRENT_TIMESTAMP, locked_by = {s}1
+            \\WHERE id = 1 AND (locked_at IS NULL OR locked_at < {s})
+        , .{ tables.lock, ph(pool), stale }), .{ l.owner, o.stale_lock_s });
         if (taken != 1) return held(tables);
         return l;
     }
@@ -195,7 +207,7 @@ const Lock = struct {
     }
 
     fn release(l: Lock, a: Allocator) void {
-        const sql = std.fmt.allocPrint(a, "UPDATE {s} SET locked_at = NULL, locked_by = NULL WHERE id = 1 AND locked_by = $1", .{l.tables.lock}) catch return;
+        const sql = std.fmt.allocPrint(a, "UPDATE {s} SET locked_at = NULL, locked_by = NULL WHERE id = 1 AND locked_by = {s}1", .{ l.tables.lock, ph(l.pool) }) catch return;
         _ = l.pool.exec(sql, .{l.owner}) catch {};
     }
 
@@ -225,19 +237,13 @@ pub fn latest(pool: *db.Pool, a: Allocator, list: []const Migration, o: Options)
     var batch: i32 = 0;
     for (rows) |r| batch = @max(batch, r.batch);
     batch += 1;
-    const insert = try std.fmt.allocPrint(a, "INSERT INTO {s} (id, name, hash, batch, direction) VALUES ($1, $2, $3, $4, 'up')", .{tables.t});
+    const p = ph(pool);
+    const insert = try std.fmt.allocPrint(a, "INSERT INTO {s} (id, name, hash, batch, direction) VALUES ({s}1, {s}2, {s}3, {s}4, 'up')", .{ tables.t, p, p, p, p });
     var count: usize = 0;
     for (list) |m| {
         if (find(rows, m.id) != null) continue;
         try l.keep();
-        var tx = try pool.begin();
-        defer tx.deinit();
-        tx.execScript(m.up) catch |err| {
-            if (!builtin.is_test) std.log.err("migration {s} failed; rolled back", .{m.id});
-            return err;
-        };
-        _ = try tx.exec(insert, .{ m.id, m.name, m.hash, batch });
-        try tx.commit();
+        try applyOne(pool, a, m.id, m.up, insert, .{ m.id, m.name, m.hash, batch });
         count += 1;
         if (!builtin.is_test) std.log.info("migration {s} applied", .{m.id});
     }
@@ -253,7 +259,7 @@ pub fn rollback(pool: *db.Pool, a: Allocator, list: []const Migration, o: Option
     var last: i32 = 0;
     for (rows) |r| last = @max(last, r.batch);
     if (last == 0) return 0;
-    const delete = try std.fmt.allocPrint(a, "DELETE FROM {s} WHERE id = $1", .{tables.t});
+    const delete = try std.fmt.allocPrint(a, "DELETE FROM {s} WHERE id = {s}1", .{ tables.t, ph(pool) });
     var count: usize = 0;
     var i = rows.len;
     while (i > 0) {
@@ -268,14 +274,35 @@ pub fn rollback(pool: *db.Pool, a: Allocator, list: []const Migration, o: Option
             return error.NoDownMigration;
         }
         try l.keep();
-        var tx = try pool.begin();
-        defer tx.deinit();
-        try tx.execScript(m.down);
-        _ = try tx.exec(delete, .{m.id});
-        try tx.commit();
+        try applyOne(pool, a, m.id, m.down, delete, .{m.id});
         count += 1;
     }
     return count;
+}
+
+/// A migration's SQL and its record, in one transaction. On SQLite foreign
+/// keys are off while it runs (a table rebuild drops a table others
+/// reference; with them on, the drop deletes or cascades) and checked
+/// before it commits, as SQLite's ALTER TABLE procedure says.
+fn applyOne(pool: *db.Pool, a: Allocator, id: []const u8, sql: []const u8, record: []const u8, args: anytype) !void {
+    const sqlite = pool.dialect() == .sqlite;
+    if (sqlite) try pool.execScript("PRAGMA foreign_keys = OFF");
+    defer if (sqlite) pool.execScript("PRAGMA foreign_keys = ON") catch {};
+    var tx = try pool.begin();
+    defer tx.deinit();
+    tx.execScript(sql) catch |err| {
+        if (!builtin.is_test) std.log.err("migration {s} failed; rolled back", .{id});
+        return err;
+    };
+    _ = try tx.exec(record, args);
+    if (sqlite) {
+        const broken = try tx.query(a, struct { table: []const u8 }, "PRAGMA foreign_key_check", .{});
+        if (broken.len > 0) {
+            if (!builtin.is_test) std.log.err("migration {s} leaves rows in {s} whose foreign key matches nothing; rolled back", .{ id, broken[0].table });
+            return error.ForeignKeyViolation;
+        }
+    }
+    try tx.commit();
 }
 
 /// What an app does at boot (KickJS's `kickDbAdapter`): apply pending
@@ -509,4 +536,59 @@ test "boot policy and the lock" {
     try onBoot(&pool, testing.io, testing.allocator, m.path, o);
     o.on_boot = .fail_if_pending;
     try onBoot(&pool, testing.io, testing.allocator, m.path, o);
+}
+
+test "SQLite: latest, status, rollback; a rebuilt table others reference keeps their rows" {
+    if (!@import("kzig_options").sqlite) return error.SkipZigTest;
+    var pool: db.Pool = try .init(testing.io, testing.allocator, .{ .url = "sqlite::memory:" });
+    defer pool.deinit();
+    var m = try TmpMigrations.init();
+    defer m.deinit();
+    try m.add("20260101_000000_a",
+        \\CREATE TABLE "users" ("id" INTEGER PRIMARY KEY, "name" TEXT);
+        \\CREATE TABLE "posts" ("id" INTEGER PRIMARY KEY, "authorId" INTEGER NOT NULL, FOREIGN KEY ("authorId") REFERENCES "users" ("id") ON DELETE CASCADE ON UPDATE NO ACTION);
+        \\INSERT INTO "users" VALUES (1, 'Ada');
+        \\INSERT INTO "posts" VALUES (1, 1);
+    , "DROP TABLE \"posts\";\nDROP TABLE \"users\";");
+    // The emitter's rebuild of "users" (name becomes NOT NULL).
+    try m.add("20260102_000000_b",
+        \\CREATE TABLE "_kick_new_users" (
+        \\  "id" INTEGER PRIMARY KEY,
+        \\  "name" TEXT NOT NULL
+        \\);
+        \\INSERT INTO "_kick_new_users" ("id", "name")
+        \\  SELECT "id", "name" FROM "users";
+        \\DROP TABLE "users";
+        \\ALTER TABLE "_kick_new_users" RENAME TO "users";
+    , "");
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const list = try load(testing.io, a, m.path);
+    for (try status(&pool, a, list, opts)) |s| try testing.expectEqual(.pending, s.state);
+    try testing.expectEqual(2, (try latest(&pool, a, list, opts)).applied);
+    for (try status(&pool, a, list, opts)) |s| try testing.expectEqual(.applied, s.state);
+    // ON DELETE CASCADE didn't fire when the old table went.
+    try testing.expectEqual(1, (try pool.queryOne(a, struct { n: i64 }, "SELECT count(*) AS n FROM posts", .{})).?.n);
+    // Foreign keys are back on afterwards.
+    try testing.expectError(error.DbError, pool.exec("INSERT INTO posts VALUES (2, 99)", .{}));
+    try testing.expectError(error.NoDownMigration, rollback(&pool, a, list, opts));
+}
+
+test "SQLite: a migration that breaks a foreign key is rolled back" {
+    if (!@import("kzig_options").sqlite) return error.SkipZigTest;
+    var pool: db.Pool = try .init(testing.io, testing.allocator, .{ .url = "sqlite::memory:" });
+    defer pool.deinit();
+    var m = try TmpMigrations.init();
+    defer m.deinit();
+    try m.add("20260101_000000_a",
+        \\CREATE TABLE "users" ("id" INTEGER PRIMARY KEY);
+        \\CREATE TABLE "posts" ("id" INTEGER PRIMARY KEY, "authorId" INTEGER REFERENCES "users" ("id"));
+        \\INSERT INTO "posts" VALUES (1, 42);
+    , "");
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectError(error.ForeignKeyViolation, latest(&pool, a, try load(testing.io, a, m.path), opts));
+    try testing.expectError(error.DbError, pool.exec("SELECT * FROM posts", .{}));
 }

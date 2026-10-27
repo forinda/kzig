@@ -13,8 +13,9 @@ pub const ForeignKey = schema.ForeignKeyInfo;
 pub const Check = schema.CheckInfo;
 pub const Enum = schema.EnumInfo;
 
-/// Postgres only; tables in the database's default schema.
+/// Tables in the database's default schema.
 pub const Snapshot = struct {
+    dialect: @import("db.zig").Dialect = .postgres,
     tables: []const Table = &.{},
     /// Absent (not empty) when no table uses one, as kick/db writes it.
     enums: ?[]const Enum = null,
@@ -32,7 +33,8 @@ pub const Snapshot = struct {
 
 /// The schema as kick/db's extract would record it.
 pub fn fromSchema(comptime S: type) Snapshot {
-    return .{ .tables = S.tables_info, .enums = if (S.enums.len > 0) S.enums else null, .declared = comptime declaredOf(S) };
+    // kick/db keeps `enums` on Postgres snapshots only.
+    return .{ .dialect = S.dialect, .tables = S.tables_info, .enums = if (S.enums.len > 0 and S.dialect == .postgres) S.enums else null, .declared = comptime declaredOf(S) };
 }
 
 fn declaredOf(comptime S: type) ?Snapshot.Declared {
@@ -65,7 +67,7 @@ pub fn toJson(a: Allocator, s: Snapshot) ![]const u8 {
 pub fn toValue(a: Allocator, s: Snapshot) !std.json.Value {
     var root: std.json.ObjectMap = .empty;
     try root.put(a, "version", .{ .integer = 1 });
-    try root.put(a, "dialect", .{ .string = "postgres" });
+    try root.put(a, "dialect", .{ .string = @tagName(s.dialect) });
     var tables: std.json.ObjectMap = .empty;
     for (s.tables) |t| try tables.put(a, t.name, try tableValue(a, t));
     try root.put(a, "tables", .{ .object = tables });
@@ -173,8 +175,7 @@ pub fn parse(a: Allocator, text: []const u8) !Snapshot {
     const v = std.json.parseFromSliceLeaky(std.json.Value, a, text, .{ .allocate = .alloc_always }) catch return error.InvalidSnapshot;
     const root = try object(v);
     try only(root, &.{ "version", "dialect", "tables", "enums", "relations" });
-    if (!std.mem.eql(u8, try str(root.get("dialect")), "postgres")) return unsupported("dialect");
-    var out: Snapshot = .{};
+    var out: Snapshot = .{ .dialect = std.meta.stringToEnum(@import("db.zig").Dialect, try str(root.get("dialect"))) orelse return unsupported("dialect") };
     const tables = try object(root.get("tables") orelse return error.InvalidSnapshot);
     const list = try a.alloc(Table, tables.count());
     for (tables.values(), list) |tv, *t| t.* = try parseTable(a, try object(tv));
@@ -318,7 +319,8 @@ test "kick/db's features kzig doesn't have yet are refused, by name" {
     defer arena.deinit();
     const a = arena.allocator();
     try testing.expectError(error.UnsupportedSnapshot, parse(a, "{\"version\":1,\"dialect\":\"postgres\",\"tables\":{},\"views\":{}}"));
-    try testing.expectError(error.UnsupportedSnapshot, parse(a, "{\"version\":1,\"dialect\":\"sqlite\",\"tables\":{}}"));
+    try testing.expectError(error.UnsupportedSnapshot, parse(a, "{\"version\":1,\"dialect\":\"mysql\",\"tables\":{}}"));
+    try testing.expectEqual(@import("db.zig").Dialect.sqlite, (try parse(a, "{\"version\":1,\"dialect\":\"sqlite\",\"tables\":{}}")).dialect);
     try testing.expectError(error.UnsupportedSnapshot, parse(a,
         \\{"version":1,"dialect":"postgres","tables":{"t":{"name":"t","columns":{"a":{"name":"a","type":"integer","nullable":true,"default":null,"primaryKey":false,"identity":"always"}},"indexes":[],"foreignKeys":[],"checks":[]}}}
     ));

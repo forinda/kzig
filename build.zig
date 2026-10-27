@@ -151,6 +151,7 @@ const compile_errors = [_][2][]const u8{
     .{ "db_find_or_create_no_where", "people: findOrCreate needs a where" },
     .{ "db_compare_column_types", "people.role and people.name: compares role with []const u8" },
     .{ "db_index_option", "t.indexes.n: no option .uniqe" },
+    .{ "db_sqlite_index_using", "t: index t_a uses .using, which SQLite doesn't support" },
     .{ "db_constraint_key", "t: no constraint kind .check (indexes, checks, primary_key)" },
     .{ "db_schema_duplicate_name", "two adapters bring a schema named \"main\"" },
     .{ "db_relation_no_inverse", "users.posts: no one back from posts and no single foreign key to users" },

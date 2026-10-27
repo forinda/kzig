@@ -310,6 +310,9 @@ pub fn Schema(comptime tables: anytype, comptime given: anytype) type {
                 if (!hasEnum(enum_list, E.pg_name)) enum_list = enum_list ++ [_]EnumInfo{.{ .name = E.pg_name, .values = @typeInfo(E).@"enum".field_names }};
             };
         }
+        // kick/db refuses at extract what SQLite can't express.
+        if (options.dialect == .sqlite) for (infos) |info| for (info.indexes) |ix| if (ix.using != null)
+            @compileError(info.name ++ ": index " ++ ix.name ++ " uses .using, which SQLite doesn't support");
         const infos_final = infos;
         const enums_final = sortEnums(enum_list);
         for (@typeInfo(@TypeOf(decls)).@"struct".field_names) |t| if (!@hasField(@TypeOf(tables), t))
