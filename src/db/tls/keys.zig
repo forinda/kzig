@@ -224,7 +224,9 @@ fn pemBlock(a: Allocator, text: []const u8, comptime label: []const u8) !?Block 
     var block: Block = .{ .der = &.{} };
     // RFC 1421 headers, up to a blank line.
     if (std.mem.find(u8, text[body_start..stop], "Proc-Type:")) |_| {
-        const blank = std.mem.findPos(u8, text, body_start, "\n\n") orelse std.mem.findPos(u8, text, body_start, "\r\n\r\n") orelse return error.InvalidPem;
+        // The blank line must be inside this block.
+        const hdr = text[body_start..stop];
+        const blank = body_start + (std.mem.find(u8, hdr, "\n\n") orelse std.mem.find(u8, hdr, "\r\n\r\n") orelse return error.InvalidPem);
         var lines = std.mem.tokenizeAny(u8, text[body_start..blank], "\r\n");
         while (lines.next()) |line| {
             if (!std.mem.startsWith(u8, line, "DEK-Info:")) continue;
@@ -263,6 +265,7 @@ fn legacyDecrypt(block: Block, password: ?[]const u8) ![]const u8 {
     var key: [32]u8 = undefined;
     defer std.crypto.secureZero(u8, &key);
     var prev: [16]u8 = undefined;
+    defer std.crypto.secureZero(u8, &prev);
     var have: usize = 0;
     while (have < dek.key_len) {
         var h = Md5.init(.{});
@@ -277,22 +280,35 @@ fn legacyDecrypt(block: Block, password: ?[]const u8) ![]const u8 {
     return cbcDecrypt(block.der, key[0..dek.key_len], dek.iv);
 }
 
-/// AES-CBC with PKCS#7 padding, in place; a bad pad is a wrong password.
-fn cbcDecrypt(data: []u8, key: []const u8, iv: [16]u8) ![]const u8 {
-    if (data.len == 0 or data.len % 16 != 0) return error.BadPassword;
+fn cbcBlocks(ctx: anytype, data: []u8, iv: [16]u8) void {
     var chain = iv;
+    var plain: [16]u8 = undefined;
+    defer std.crypto.secureZero(u8, &plain);
     var i: usize = 0;
     while (i < data.len) : (i += 16) {
         const block = data[i..][0..16];
         const next_chain = block.*;
-        var plain: [16]u8 = undefined;
-        switch (key.len) {
-            16 => std.crypto.core.aes.Aes128.initDec(key[0..16].*).decrypt(&plain, block),
-            32 => std.crypto.core.aes.Aes256.initDec(key[0..32].*).decrypt(&plain, block),
-            else => return error.UnsupportedKey,
-        }
+        ctx.decrypt(&plain, block);
         for (block, plain, chain) |*o, p, c| o.* = p ^ c;
         chain = next_chain;
+    }
+}
+
+/// AES-CBC with PKCS#7 padding, in place; a bad pad is a wrong password.
+fn cbcDecrypt(data: []u8, key: []const u8, iv: [16]u8) ![]const u8 {
+    if (data.len == 0 or data.len % 16 != 0) return error.BadPassword;
+    switch (key.len) {
+        16 => {
+            var ctx = std.crypto.core.aes.Aes128.initDec(key[0..16].*);
+            defer std.crypto.secureZero(u8, std.mem.asBytes(&ctx));
+            cbcBlocks(&ctx, data, iv);
+        },
+        32 => {
+            var ctx = std.crypto.core.aes.Aes256.initDec(key[0..32].*);
+            defer std.crypto.secureZero(u8, std.mem.asBytes(&ctx));
+            cbcBlocks(&ctx, data, iv);
+        },
+        else => return error.UnsupportedKey,
     }
     const pad = data[data.len - 1];
     if (pad == 0 or pad > 16) return error.BadPassword;
@@ -325,7 +341,9 @@ fn pbes2(der: []u8, password: []const u8) ![]const u8 {
     if (iter_bytes.len > 4) return error.UnsupportedKey;
     var iterations: u32 = 0;
     for (iter_bytes) |b| iterations = (iterations << 8) | b;
-    if (iterations == 0 or iterations > 10_000_000) return error.UnsupportedKey;
+    // Each connection derives the key again: keep the count sane (OpenSSL
+    // writes 2048; current guidance is in the hundreds of thousands).
+    if (iterations == 0 or iterations > 2_000_000) return error.UnsupportedKey;
     if (kdf_params.peek() == 0x02) _ = try kdf_params.int(); // keyLength: the cipher's
     var prf: []const u8 = &oid_hmac_sha1;
     if (kdf_params.peek() == 0x30) {
@@ -373,7 +391,7 @@ const Der = struct {
             for (d.buf[d.i + 2 ..][0..nb]) |b| len = (len << 8) | b;
             hdr += nb;
         }
-        if (d.i + hdr + len > d.buf.len) return error.InvalidKey;
+        if (d.i + hdr > d.buf.len or len > d.buf.len - d.i - hdr) return error.InvalidKey;
         const content = d.buf[d.i + hdr ..][0..len];
         d.i += hdr + len;
         return content;
@@ -538,4 +556,13 @@ test "TLS 1.2 CertificateVerify signs a digest; the scheme follows what the serv
     const s1 = try rsa.signDigest(testing.io, pkcs1_scheme, &digest, &out);
     try Cert.rsa.PKCS1v1_5Signature.verify(256, s1[0..256], "handshake messages", pk, Sha256);
     try testing.expectEqual(null, rsa.tls12Scheme(&.{@backingInt(SignatureScheme.ecdsa_secp256r1_sha256)}));
+}
+
+test "a malformed encrypted PEM is an error, not a crash" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // No blank line ends the headers inside the block; one follows it.
+    const pem = "-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,00112233445566778899AABBCCDDEEFF\nAAAA\n-----END RSA PRIVATE KEY-----\n\n";
+    try testing.expectError(error.InvalidPem, PrivateKey.parsePem(a, pem, "x"));
 }
