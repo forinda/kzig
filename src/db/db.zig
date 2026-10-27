@@ -13,6 +13,7 @@
 //! ```
 const std = @import("std");
 pub const pg = @import("pg.zig");
+pub const migrate = @import("migrate.zig");
 
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -184,6 +185,11 @@ fn execOn(c: *pg.Conn, sql: []const u8, args: anytype) !u64 {
 }
 
 const testing = std.testing;
+
+test {
+    _ = migrate;
+    _ = pg;
+}
 
 /// `DATABASE_URL` for the tests that need a server; skipped without one.
 pub fn testUrl(buf: *std.process.Environ.Map) ![]const u8 {
