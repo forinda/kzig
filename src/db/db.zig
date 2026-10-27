@@ -257,6 +257,7 @@ test {
     _ = emit_pg;
     _ = generate;
     _ = @import("relational.zig");
+    _ = @import("tls/keys.zig");
     _ = pg;
 }
 
