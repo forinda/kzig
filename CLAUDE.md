@@ -59,6 +59,7 @@ src/
   middleware.zig       # Next chain; re-exports the built-ins
   middleware/          # requestId, requestLogger, cors, helmet
   multipart.zig        # kzig.Upload: multipart/form-data, 413/415
+  cron.zig             # kzig.cron: expressions, zoneinfo timezones, Jobs and the scheduler
   ws.zig               # WebSocket gateways: hub, rooms, heartbeat, ws.Ctx
   ws/frame.zig         # RFC 6455 framing (std runtime; http.zig frames itself)
   runtime/std.zig      # std.http.Server engine

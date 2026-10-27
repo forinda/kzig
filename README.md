@@ -7,9 +7,9 @@ built on `comptime` instead of decorators, so a missing service or an unknown ha
 
 > **Status: pre-alpha.** Modules, compile-time DI, config and settings sections, middleware,
 > context contributors, typed and validated request bodies, list queries, adapters, plugins,
-> health checks, graceful shutdown, OpenAPI with Swagger UI, file uploads, WebSockets, two HTTP
-> runtimes (`std.http`, and http.zig opt-in), an in-process test runtime and a `kzig` CLI work
-> (M1–M9). APIs will change. See the [roadmap](./ROADMAP.md).
+> health checks, graceful shutdown, OpenAPI with Swagger UI, file uploads, WebSockets, scheduled
+> jobs, two HTTP runtimes (`std.http`, and http.zig opt-in), an in-process test runtime and a
+> `kzig` CLI work (M1–M10). APIs will change. See the [roadmap](./ROADMAP.md).
 
 Requires **Zig 0.17.0**. No dependencies (the optional http.zig runtime fetches http.zig).
 
@@ -273,6 +273,37 @@ a write may wait on a client that stopped reading before its socket is cut. Both
 gateways with the same loop (http.zig hands the socket over after the handshake).
 task-api's `chat` module is the archive's ws-chat without Redis.
 
+## Scheduled jobs
+
+KickJS's `@Cron`: any service lists its jobs, and the App schedules them once it is listening.
+
+```zig
+pub const MaintenanceJobs = struct {
+    reports: *ReportService,
+
+    pub const crons = .{
+        .{ .expression = "*/5 * * * *", .handler = "purge", .name = "purge-sessions" },
+        .{ .expression = "0 2 * * *", .handler = "nightly", .timezone = "Africa/Nairobi" },
+        .{ .expression = "0 * * * *", .handler = "warm", .run_on_init = true },
+    };
+
+    /// Asked on every tick and manual run.
+    pub fn cronEnabled(self: *MaintenanceJobs, name: []const u8) bool { … }
+
+    pub fn nightly(self: *MaintenanceJobs, run: kzig.cron.Run) !void {
+        try self.reports.generate(run.arena);
+    }
+};
+```
+
+Expressions have 5 fields or 6 (seconds first), with names, ranges, steps and lists; a bad one
+fails `zig build`. Timezones come from the system's zoneinfo (`CRON_ZONEINFO`). A run while the
+previous is still going is skipped unless `.overlap = true`. `CRON_ENABLED=false` schedules
+nothing (one replica of several, say). Inject `*kzig.cron.Jobs` to list jobs, get their next run
+or run one now; a failure reaches adapters' `onCronError(err, info)`. Shutdown stops the
+schedule and waits for runs in flight. task-api's `crons` module is the archive's
+cron-jobs-api.
+
 ## CLI
 
 Prebuilt `kzig` binaries for Linux and macOS are attached to each
@@ -431,6 +462,8 @@ stays the default. Against KickJS on Express, on one machine (see [benchmarks](.
 | `@FileUpload({ maxSize, allowedTypes })` / `ctx.file` | `got: struct { upload: kzig.Upload(.{ … }) }` / `got.upload.file()` |
 | `@WsController('/chat')`, `@OnConnect`, `@OnMessage('e')` | a struct in `.gateways` with `path`, `connect`, `events` |
 | `ws` in tests | `kzig.testing.WsClient` |
+| `@Cron(expr, { timezone, runOnInit, overlap, enabled })` + `KickCronAdapter` | `pub const crons = .{ … }` on a service, scheduled by the App |
+| `runCronJobs(container, { name }, 'manual')` | `jobs.run(name, .manual)` on an injected `*kzig.cron.Jobs` |
 
 The full list of deliberate differences is in the [roadmap](./ROADMAP.md).
 

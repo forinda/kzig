@@ -53,6 +53,10 @@ after M6.
 | `@WsController('/chat')`, `@OnMessage('event')`, `WsAdapter({ auth: { resolveUser } })` | A gateway struct in `.gateways` with `pub const events`; auth in `connect` (`ctx.close(4401, …)`) | One hook instead of an adapter option; nothing runs before `connect` |
 | `ctx.data` untyped | The handler's `data` parameter is decoded (an `error` event lists the issues) | Same rules as request bodies |
 | `WsAdapter({ heartbeatInterval })` from env | `.ws = .{ .heartbeat_ms }` in the App spec | The App spec is comptime |
+| `@Cron(…, { enabled: () => … })` per job | `pub fn cronEnabled(self, name) bool` on the service | One hook sees the service's settings |
+| `KickCronAdapter({ enabled })` | Built in; `CRON_ENABLED` | Jobs need no adapter to be found |
+| `onError(err, { source: 'cron' })` | `onCronError(err, info)` | A job has no request; the info is typed |
+| The serverless `/_kick/cron/:scheduleId` trigger | Not ported | kzig runs as a server |
 
 Kept for parity even where Zig would allow otherwise: route middleware runs **after** validation.
 
@@ -270,10 +274,20 @@ Follow-ups:
       rooms, `connect`/`disconnect`/`draining`, heartbeat, close codes; on both runtimes
 - [x] task-api `chat` module (`ws-chat`, without Redis): tokens, rooms, presence
 
+### M10 — Scheduled jobs
+
+- [x] Cron expressions (5 or 6 fields, names, ranges, steps, lists; dom/dow either-match);
+      invalid ones fail the build
+- [x] Timezones from zoneinfo, with the TZif footer's POSIX rule past its table
+- [x] `pub const crons` on services; `kzig.cron.Jobs` (list, next run, run now); the scheduler
+      from `started`: run on init, no overlap by default, `cronEnabled`, `CRON_ENABLED`;
+      `onCronError` for adapters; shutdown waits for runs in flight
+- [x] task-api `crons` module (`cron-jobs-api`): last runs, `GET /cron/jobs`, guarded manual run
+
 ### Later
 
-Radix-tree router, SSE, S3 storage, a WebSocket broker (Redis), cron (`cron-jobs-api`), queues,
-database layer, a third engine (`io_uring`, edge).
+Radix-tree router, SSE, S3 storage, a WebSocket broker (Redis), serverless cron triggers,
+queues, database layer, a third engine (`io_uring`, edge).
 
 ## Open questions
 
