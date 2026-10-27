@@ -126,6 +126,12 @@ if [ -n "${DATABASE_URL:-}" ]; then
 fi
 rm -rf db
 
+step "kzig db generate/check: task-api's schema matches its migrations; an app without a schema says so"
+(cd "$ROOT" && zig build examples && "$KZIG" db generate --exe zig-out/bin/task-api --dir examples/task-api/db/migrations | grep -q "No schema changes." \
+  && "$KZIG" db check --exe zig-out/bin/task-api --dir examples/task-api/db/migrations > /dev/null)
+code=0; "$KZIG" db check > out.txt 2> err.txt || code=$?
+[ $code = 1 ] && grep -q "printed no schema" err.txt
+
 step "kzig g module note --minimal"
 "$KZIG" g module note --minimal
 zig build test
