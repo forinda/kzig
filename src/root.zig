@@ -2,6 +2,7 @@
 const context = @import("context.zig");
 const problem = @import("problem.zig");
 const router = @import("router.zig");
+pub const testing = @import("testing.zig");
 
 pub const Ctx = context.Ctx;
 pub const Request = context.Request;
@@ -18,4 +19,5 @@ test {
     _ = context;
     _ = problem;
     _ = router;
+    _ = testing;
 }
