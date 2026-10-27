@@ -218,8 +218,11 @@ fn renderRelation(comptime S: type, comptime src_tag: []const u8, comptime r: sc
         try w.raw(if (r.kind == .many) "SELECT coalesce(json_group_array(json_object(" else "SELECT json_object(");
         inline for (comptime columnKeys(S, r.target_tag, Opts), 0..) |k, i| {
             if (i > 0) try w.raw(", ");
-            try w.raw("'" ++ k ++ "', " ++ t ++ ".");
+            // A json column's text is JSON in the object, not a string.
+            const json = comptime isJson(S, r.target_tag, k);
+            try w.raw("'" ++ k ++ "', " ++ (if (json) "json(" else "") ++ t ++ ".");
             try w.ident(k);
+            if (json) try w.raw(")");
         }
         if (@hasField(Opts, "with")) inline for (@typeInfo(@FieldType(Opts, "with")).@"struct".field_names) |rk| {
             try w.raw(", '" ++ rk ++ "', json(" ++ t ++ ".");
@@ -270,6 +273,12 @@ fn renderRelation(comptime S: type, comptime src_tag: []const u8, comptime r: sc
         try w.raw(if (r.kind == .many) ") AS \"agg\"" else ") AS \"obj\"")
     else
         try w.raw(if (r.kind == .many) ") AS agg" else ") AS obj");
+}
+
+fn isJson(comptime S: type, comptime tag: []const u8, comptime key: []const u8) bool {
+    for (S.info(@field(S.Tag, tag)).columns) |c| if (std.mem.eql(u8, c.key, key))
+        return std.mem.eql(u8, c.sql_type, "json") or std.mem.eql(u8, c.sql_type, "jsonb");
+    return false;
 }
 
 fn qcol(w: *Writer, alias: []const u8, name: []const u8) !void {
@@ -474,4 +483,34 @@ test "relational reads on SQLite" {
         \\INSERT INTO rq_post_tags VALUES (1, 1), (1, 2), (1, 2);
     );
     try relationalSuite(LiteSchema, &pool);
+}
+
+const notes = schema.table("rq_notes", .{
+    .id = .{ .type = .serial, .primary_key = true },
+    .boardId = .{ .type = .integer, .not_null = true },
+    .meta = .{ .type = .jsonb },
+}, .{});
+const boards = schema.table("rq_boards", .{
+    .id = .{ .type = .serial, .primary_key = true },
+}, .{});
+const NotesSchema = schema.Schema(.{ .boards = boards, .notes = notes }, .{ .dialect = .sqlite, .relations = .{
+    .boards = .{ .notes = .{ .many = .notes } },
+    .notes = .{ .board = .{ .one = .boards, .fields = .{.boardId}, .references = .{.id} } },
+} });
+
+test "relational reads on SQLite: a json column inside a nested row is JSON, not a string" {
+    if (!@import("kzig_options").sqlite) return error.SkipZigTest;
+    var pool: @import("db.zig").Pool = try .init(testing.io, testing.allocator, .{ .url = "sqlite::memory:" });
+    defer pool.deinit();
+    try pool.execScript(
+        \\CREATE TABLE rq_boards (id integer PRIMARY KEY);
+        \\CREATE TABLE rq_notes (id integer PRIMARY KEY, "boardId" integer NOT NULL, meta text);
+        \\INSERT INTO rq_boards VALUES (1);
+        \\INSERT INTO rq_notes VALUES (1, 1, '{"pinned":true}');
+    );
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const db: query.Client(NotesSchema) = .init(.{ .pool = &pool });
+    const board = (try db.query(.boards).findFirst(arena.allocator(), .{ .with = .{ .notes = true } })).?;
+    try testing.expect(board.notes[0].meta.? == .object);
 }
