@@ -16,3 +16,5 @@ zig-out/
 /build/
 /build-*/
 /docgen_tmp/
+# Design notes, specs and plans stay private
+.ignored/
