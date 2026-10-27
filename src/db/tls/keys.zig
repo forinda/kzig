@@ -21,6 +21,9 @@ pub const Rsa = struct {
     n: []const u8,
     e: []const u8,
     d: []const u8,
+    /// φ(n) − 1, from p and q: r^(φ(n)−1) is r's inverse, which unblinds.
+    /// Empty when the key carries no primes.
+    phi_minus_1: []const u8 = &.{},
 };
 
 pub const PrivateKey = union(enum) {
@@ -36,11 +39,11 @@ pub const PrivateKey = union(enum) {
             const pw = password orelse return error.PasswordRequired;
             const der = try pbes2(a, block.der, pw);
             // Garbage from a wrong password rarely parses; when it does, it's no key.
-            return pkcs8(der) catch error.BadPassword;
+            return pkcs8(a, der) catch error.BadPassword;
         }
         if (try pemBlock(a, text, "EC PRIVATE KEY")) |block| return sec1(try legacyDecrypt(block, password), null) catch |err| wrongIfEncrypted(block, err);
-        if (try pemBlock(a, text, "RSA PRIVATE KEY")) |block| return pkcs1(try legacyDecrypt(block, password)) catch |err| wrongIfEncrypted(block, err);
-        if (try pemBlock(a, text, "PRIVATE KEY")) |block| return pkcs8(block.der);
+        if (try pemBlock(a, text, "RSA PRIVATE KEY")) |block| return pkcs1(a, try legacyDecrypt(block, password)) catch |err| wrongIfEncrypted(block, err);
+        if (try pemBlock(a, text, "PRIVATE KEY")) |block| return pkcs8(a, block.der);
         return error.UnsupportedKey;
     }
 
@@ -98,7 +101,7 @@ pub const PrivateKey = union(enum) {
                 if (digest.len != 32) return error.UnsupportedKey;
                 return switch (sig_scheme) {
                     .rsa_pss_rsae_sha256 => rsaPss(io, r, digest[0..32].*, out),
-                    .rsa_pkcs1_sha256 => rsaPkcs1(r, digest[0..32].*, out),
+                    .rsa_pkcs1_sha256 => rsaPkcs1(io, r, digest[0..32].*, out),
                     else => error.UnsupportedKey,
                 };
             },
@@ -202,11 +205,11 @@ fn rsaPss(io: std.Io, r: Rsa, m_hash: [32]u8, out: *[max_signature_len]u8) ![]co
     @memcpy(padded[k - em_len .. k], em);
     defer std.crypto.secureZero(u8, &padded);
     defer std.crypto.secureZero(u8, &em_buf);
-    return rsaPrivate(r, padded[0..k], out);
+    return rsaPrivate(io, r, padded[0..k], out);
 }
 
 /// RFC 8017 RSASSA-PKCS1-v1_5 with SHA-256 (TLS 1.2 servers without PSS).
-fn rsaPkcs1(r: Rsa, m_hash: [32]u8, out: *[max_signature_len]u8) ![]const u8 {
+fn rsaPkcs1(io: std.Io, r: Rsa, m_hash: [32]u8, out: *[max_signature_len]u8) ![]const u8 {
     const M = std.crypto.ff.Modulus(max_signature_len * 8);
     const n = try M.fromBytes(r.n, .big);
     const k = (n.bits() + 7) / 8;
@@ -220,17 +223,83 @@ fn rsaPkcs1(r: Rsa, m_hash: [32]u8, out: *[max_signature_len]u8) ![]const u8 {
     em[k - t_len - 1] = 0x00;
     @memcpy(em[k - t_len ..][0..digest_info.len], &digest_info);
     @memcpy(em[k - m_hash.len .. k], &m_hash);
-    return rsaPrivate(r, em[0..k], out);
+    return rsaPrivate(io, r, em[0..k], out);
 }
 
-/// `em`^d mod n, constant-time in d; `em` is as long as the modulus.
-fn rsaPrivate(r: Rsa, em: []const u8, out: *[max_signature_len]u8) ![]const u8 {
+/// `em`^d mod n, constant-time in d and blinded (RFC 8017 §5.1.2 note): the
+/// exponentiation sees (em·r^e)^d = em^d·r for a fresh random r, and r's
+/// inverse, r^(φ(n)−1), takes it off.
+fn rsaPrivate(io: std.Io, r: Rsa, em: []const u8, out: *[max_signature_len]u8) ![]const u8 {
     const M = std.crypto.ff.Modulus(max_signature_len * 8);
     const n = try M.fromBytes(r.n, .big);
     const x = try M.Fe.fromBytes(n, em, .big);
-    const sig = try n.powWithEncodedExponent(x, r.d, .big);
-    try sig.toBytes(out[0..em.len], .big);
-    return out[0..em.len];
+    if (r.phi_minus_1.len == 0) {
+        const sig = try n.powWithEncodedExponent(x, r.d, .big);
+        try sig.toBytes(out[0..em.len], .big);
+        return out[0..em.len];
+    }
+    // A random r below n: n's leading byte, halved, bounds r's.
+    var rb: [max_signature_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, &rb);
+    const k = em.len;
+    io.random(rb[0..k]);
+    rb[0] &= r.n[0] >> 1;
+    if (r.n.len < k) rb[0] = 0;
+    const blind_r = try M.Fe.fromBytes(n, rb[0..k], .big);
+    const masked = n.mul(x, try n.powWithEncodedPublicExponent(blind_r, r.e, .big));
+    const s_masked = try n.powWithEncodedExponent(masked, r.d, .big);
+    const r_inv = try n.powWithEncodedExponent(blind_r, r.phi_minus_1, .big);
+    const sig = n.mul(s_masked, r_inv);
+    try sig.toBytes(out[0..k], .big);
+    return out[0..k];
+}
+
+/// (p−1)(q−1) − 1, big-endian without leading zeros. p and q are odd.
+fn phiMinusOne(a: Allocator, p: []const u8, q: []const u8) ![]const u8 {
+    const pm1 = try a.dupe(u8, p);
+    const qm1 = try a.dupe(u8, q);
+    defer std.crypto.secureZero(u8, pm1);
+    defer std.crypto.secureZero(u8, qm1);
+    if (pm1[pm1.len - 1] & 1 == 0 or qm1[qm1.len - 1] & 1 == 0) return error.InvalidKey;
+    pm1[pm1.len - 1] -= 1;
+    qm1[qm1.len - 1] -= 1;
+    // Schoolbook product, little-endian limbs of one byte.
+    const prod = try a.alloc(u8, pm1.len + qm1.len);
+    @memset(prod, 0);
+    var i: usize = pm1.len;
+    while (i > 0) {
+        i -= 1;
+        var carry: u32 = 0;
+        var j: usize = qm1.len;
+        while (j > 0) {
+            j -= 1;
+            const pos = (pm1.len - 1 - i) + (qm1.len - 1 - j);
+            const at = prod.len - 1 - pos;
+            const t: u32 = @as(u32, pm1[i]) * qm1[j] + prod[at] + carry;
+            prod[at] = @truncate(t);
+            carry = t >> 8;
+        }
+        var pos = (pm1.len - 1 - i) + qm1.len;
+        while (carry != 0) : (pos += 1) {
+            const at = prod.len - 1 - pos;
+            const t: u32 = @as(u32, prod[at]) + carry;
+            prod[at] = @truncate(t);
+            carry = t >> 8;
+        }
+    }
+    // − 1: φ(n) is even, so its last byte is never 0 after a borrow chain ends.
+    var b = prod.len;
+    while (b > 0) {
+        b -= 1;
+        if (prod[b] != 0) {
+            prod[b] -= 1;
+            break;
+        }
+        prod[b] = 0xff;
+    }
+    var start: usize = 0;
+    while (start + 1 < prod.len and prod[start] == 0) start += 1;
+    return prod[start..];
 }
 
 /// Each certificate's DER, in the file's order (leaf first).
@@ -529,7 +598,7 @@ fn ecKey(comptime E: type, secret: []const u8) !E.KeyPair {
 }
 
 /// PKCS#1 `RSAPrivateKey`.
-fn pkcs1(der: []const u8) !PrivateKey {
+fn pkcs1(a: Allocator, der: []const u8) !PrivateKey {
     var top: Der = .{ .buf = der };
     var d: Der = .{ .buf = try top.next(0x30) };
     _ = try d.int();
@@ -537,18 +606,20 @@ fn pkcs1(der: []const u8) !PrivateKey {
     const e = try d.int();
     const priv = try d.int();
     if (n.len > max_signature_len) return error.UnsupportedKey;
-    return .{ .rsa = .{ .n = n, .e = e, .d = priv } };
+    const p = try d.int();
+    const q = try d.int();
+    return .{ .rsa = .{ .n = n, .e = e, .d = priv, .phi_minus_1 = try phiMinusOne(a, p, q) } };
 }
 
 /// PKCS#8 `PrivateKeyInfo` around an EC or RSA key.
-fn pkcs8(der: []const u8) !PrivateKey {
+fn pkcs8(a: Allocator, der: []const u8) !PrivateKey {
     var top: Der = .{ .buf = der };
     var d: Der = .{ .buf = try top.next(0x30) };
     _ = try d.int();
     var alg: Der = .{ .buf = try d.next(0x30) };
     const oid = try alg.next(0x06);
     const inner = try d.next(0x04);
-    if (std.mem.eql(u8, oid, &oid_rsa)) return pkcs1(inner);
+    if (std.mem.eql(u8, oid, &oid_rsa)) return pkcs1(a, inner);
     if (std.mem.eql(u8, oid, &oid_ec_public_key)) return sec1(inner, try alg.next(0x06));
     if (std.mem.eql(u8, oid, &oid_ed25519)) {
         // RFC 8410: CurvePrivateKey, an OCTET STRING of the 32-byte seed.
@@ -698,4 +769,25 @@ test "a key matches its certificate and no other" {
     try testing.expect(!try ec.matches(rsa_cert));
     try testing.expect(!try rsa.matches(ec_cert));
     try testing.expect(!try ed.matches(ec_cert));
+}
+
+test "RSA signing is blinded and still gives the plain signature" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const key = try PrivateKey.parsePem(a, @embedFile("../testdata/rsa2048-pkcs8.pem"), null);
+    const r = key.rsa;
+    try testing.expect(r.phi_minus_1.len > 0);
+    var em: [256]u8 = undefined;
+    for (&em, 0..) |*b, i| b.* = @truncate(i * 7 + 3);
+    em[0] = 0; // below n
+    var blinded: [max_signature_len]u8 = undefined;
+    const got = try rsaPrivate(testing.io, r, &em, &blinded);
+    // The textbook result, unblinded.
+    const M = std.crypto.ff.Modulus(max_signature_len * 8);
+    const n = try M.fromBytes(r.n, .big);
+    const plain = try n.powWithEncodedExponent(try M.Fe.fromBytes(n, &em, .big), r.d, .big);
+    var want: [256]u8 = undefined;
+    try plain.toBytes(&want, .big);
+    try testing.expectEqualSlices(u8, &want, got);
 }
