@@ -17,10 +17,7 @@ pub const Options = struct {
 
 pub fn run(io: Io, gpa: Allocator, arena: Allocator, environ: *const std.process.Environ.Map, out: *Io.Writer, options: Options) !void {
     const cwd = Io.Dir.cwd();
-    const bin = options.bin orelse try binName(io, arena, cwd) orelse {
-        try say(out, "error: no `addExecutable(.{{ .name = \"…\"` in build.zig; pass --bin <name>\n", .{});
-        return error.NoBinary;
-    };
+    const bin = options.bin orelse try binName(io, arena, cwd) orelse return error.NoBinary;
     const exe = try arena.print("zig-out/bin/{s}", .{bin});
     const argv = try std.mem.concat(arena, []const u8, &.{ &.{exe}, options.args });
 

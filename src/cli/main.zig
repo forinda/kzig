@@ -95,12 +95,20 @@ const Cli = struct {
     arena: Allocator,
     gpa: Allocator,
     out: *Io.Writer,
+    /// Errors, so `kzig … > file` keeps them on the terminal.
+    err: *Io.Writer,
     cwd: Io.Dir,
     environ: *const std.process.Environ.Map,
 
     fn print(cli: Cli, comptime fmt: []const u8, args: anytype) void {
         cli.out.print(fmt, args) catch {};
         cli.out.flush() catch {};
+    }
+
+    fn fail(cli: Cli, comptime fmt: []const u8, args: anytype) void {
+        cli.out.flush() catch {};
+        cli.err.print("error: " ++ fmt, args) catch {};
+        cli.err.flush() catch {};
     }
 };
 
@@ -109,6 +117,7 @@ const Flags = struct {
     force: bool = false,
     minimal: bool = false,
     no_fetch: bool = false,
+    help: bool = false,
     kzig: ?[]const u8 = null,
     module: ?[]const u8 = null,
     bin: ?[]const u8 = null,
@@ -129,6 +138,8 @@ fn parse(arena: Allocator, args: []const [:0]const u8) !Flags {
             flags.force = true;
         } else if (std.mem.eql(u8, a, "--minimal")) {
             flags.minimal = true;
+        } else if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
+            flags.help = true;
         } else if (std.mem.eql(u8, a, "--no-fetch")) {
             flags.no_fetch = true;
         } else if (std.mem.eql(u8, a, "--kzig") or std.mem.eql(u8, a, "--module") or std.mem.eql(u8, a, "--bin")) {
@@ -151,20 +162,31 @@ pub fn main(init: std.process.Init) !u8 {
     const arena = init.arena.allocator();
     var buf: [4096]u8 = undefined;
     var stdout: Io.File.Writer = .init(.stdout(), init.io, &buf);
-    const cli: Cli = .{ .io = init.io, .arena = arena, .gpa = init.gpa, .out = &stdout.interface, .cwd = Io.Dir.cwd(), .environ = init.environ_map };
+    var err_buf: [1024]u8 = undefined;
+    var stderr: Io.File.Writer = .init(.stderr(), init.io, &err_buf);
+    const cli: Cli = .{ .io = init.io, .arena = arena, .gpa = init.gpa, .out = &stdout.interface, .err = &stderr.interface, .cwd = Io.Dir.cwd(), .environ = init.environ_map };
 
     const args = try init.minimal.args.toSlice(arena);
     const flags = parse(arena, args[1..]) catch |err| {
-        cli.print("error: {t}\n\n{s}", .{ err, usage });
+        cli.fail("{t}\n\n{s}", .{ err, usage });
         return 2;
     };
+    if (flags.help or (flags.positional.len > 0 and std.mem.eql(u8, flags.positional[0], "help"))) {
+        cli.print("{s}", .{usage});
+        return 0;
+    }
     run(cli, flags) catch |err| {
         switch (err) {
-            error.Usage => cli.print("{s}", .{usage}),
-            error.InvalidName => cli.print("error: a name starts with a letter and has letters, digits, '-' or '_'\n", .{}),
-            error.NotAProject => cli.print("error: no src/modules.zig here — run this in a kzig project (made by `kzig new`)\n", .{}),
+            error.Usage => {
+                cli.err.print("{s}", .{usage}) catch {};
+                cli.err.flush() catch {};
+            },
+            error.InvalidName => cli.fail("a name starts with a letter and has letters, digits, '-' or '_'\n", .{}),
+            error.NotAProject => cli.fail("no src/modules.zig here — run this in a kzig project (made by `kzig new`)\n", .{}),
+            error.NoBinary => cli.fail("no `addExecutable(.{{ .name = \"…\"` in build.zig; pass --bin <name>\n", .{}),
+            // Reported where it happened.
             error.Exists => {},
-            else => cli.print("error: {t}\n", .{err}),
+            else => cli.fail("{t}\n", .{err}),
         }
         return if (err == error.Usage) 2 else 1;
     };
@@ -173,7 +195,7 @@ pub fn main(init: std.process.Init) !u8 {
 
 fn run(cli: Cli, flags: Flags) !void {
     const p = flags.positional;
-    if (p.len == 0 or std.mem.eql(u8, p[0], "help")) return error.Usage;
+    if (p.len == 0) return error.Usage;
     const cmd = p[0];
     if (std.mem.eql(u8, cmd, "new")) {
         if (p.len != 2) return error.Usage;
@@ -226,7 +248,7 @@ fn writeAll(cli: Cli, dir: []const u8, templates: []const Template, v: []const [
         try paths.append(cli.arena, path);
         if (!force) {
             if (cli.cwd.access(cli.io, path, .{})) |_| {
-                cli.print("error: {s} exists (use --force to overwrite)\n", .{path});
+                cli.fail("{s} exists (use --force to overwrite)\n", .{path});
                 return error.Exists;
             } else |_| {}
         }
@@ -244,14 +266,14 @@ fn newProject(cli: Cli, flags: Flags, raw: []const u8) !void {
     // The package name in build.zig.zon is a bare Zig identifier of at most
     // 32 bytes (as `zig init` requires).
     if (!std.zig.isValidId(n.snake) or std.zig.primitives.isPrimitive(n.snake) or n.snake.len > 32) {
-        cli.print("error: '{s}' can't be a Zig package name: it must not be a keyword or primitive, and at most 32 characters\n", .{n.snake});
+        cli.fail("'{s}' can't be a Zig package name: it must not be a keyword or primitive, and at most 32 characters\n", .{n.snake});
         return error.Exists;
     }
 
     var dependency: []const u8 = "";
     if (flags.kzig) |kzig_path| {
         const kzig_abs = cli.cwd.realPathFileAlloc(cli.io, kzig_path, cli.arena) catch {
-            cli.print("error: --kzig {s}: no such directory\n", .{kzig_path});
+            cli.fail("--kzig {s}: no such directory\n", .{kzig_path});
             return error.Exists;
         };
         try cli.cwd.createDirPath(cli.io, dir);
@@ -286,7 +308,7 @@ fn newProject(cli: Cli, flags: Flags, raw: []const u8) !void {
             defer cli.gpa.free(result.stdout);
             defer cli.gpa.free(result.stderr);
             if (!result.term.success()) {
-                cli.print("error: zig fetch failed:\n{s}\nRun it yourself: cd {s} && zig fetch --save=kzig {s}\n", .{ result.stderr, dir, kzig_url });
+                cli.fail("zig fetch failed:\n{s}\nRun it yourself: cd {s} && zig fetch --save=kzig {s}\n", .{ result.stderr, dir, kzig_url });
                 return error.FetchFailed;
             }
         }
@@ -330,7 +352,7 @@ fn generateModule(cli: Cli, flags: Flags, raw: []const u8) !void {
     // Checked before writing, so a failure leaves nothing half done.
     const registry_source = try cli.cwd.readFileAlloc(cli.io, "src/modules.zig", cli.arena, .limited(1 << 20));
     if (std.mem.find(u8, registry_source, "// kzig:modules") == null) {
-        cli.print("error: src/modules.zig has no `// kzig:modules` line; add it inside `modules` where new modules go\n", .{});
+        cli.fail("src/modules.zig has no `// kzig:modules` line; add it inside `modules` where new modules go\n", .{});
         return error.Exists;
     }
     const dir = try std.fmt.allocPrint(cli.arena, "src/modules/{s}", .{n.plural});
@@ -353,12 +375,12 @@ fn generateStub(cli: Cli, flags: Flags, s: Stub, raw: []const u8) !void {
     const dir = s.dir orelse if (flags.module) |m| blk: {
         // A folder name, not a path: nothing outside src/modules.
         _ = Names.init(cli.arena, m) catch {
-            cli.print("error: --module {s}: a module folder name (letters, digits, '-', '_')\n", .{m});
+            cli.fail("--module {s}: a module folder name (letters, digits, '-', '_')\n", .{m});
             return error.Exists;
         };
         const d = try std.fmt.allocPrint(cli.arena, "src/modules/{s}", .{m});
         cli.cwd.access(cli.io, d, .{}) catch {
-            cli.print("error: --module {s}: no folder {s}\n", .{ m, d });
+            cli.fail("--module {s}: no folder {s}\n", .{ m, d });
             return error.Exists;
         };
         break :blk d;
@@ -373,7 +395,7 @@ fn removeModule(cli: Cli, flags: Flags, raw: []const u8) !void {
     const plural_dir = try std.fmt.allocPrint(cli.arena, "src/modules/{s}", .{n.plural});
     const single_dir = try std.fmt.allocPrint(cli.arena, "src/modules/{s}", .{n.kebab});
     const dir = if (cli.cwd.access(cli.io, plural_dir, .{})) |_| plural_dir else |_| if (cli.cwd.access(cli.io, single_dir, .{})) |_| single_dir else |_| {
-        cli.print("error: no module folder {s} or {s}\n", .{ plural_dir, single_dir });
+        cli.fail("no module folder {s} or {s}\n", .{ plural_dir, single_dir });
         return error.Exists;
     };
     if (!flags.force and !try confirm(cli, dir)) {

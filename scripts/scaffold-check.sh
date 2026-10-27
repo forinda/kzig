@@ -18,6 +18,13 @@ edit() { sed "$1" "$2" > "$2.tmp" && mv "$2.tmp" "$2"; }
 
 fails() { if "$@" >/dev/null 2>&1; then echo "should have failed: $*" >&2; exit 1; fi; }
 
+step "help is exit 0 on stdout; errors and misuse go to stderr"
+for h in help --help -h; do "$KZIG" $h > out.txt 2> err.txt; grep -q "kzig new" out.txt; test ! -s err.txt; done
+code=0; "$KZIG" bogus > out.txt 2> err.txt || code=$?
+[ $code = 2 ] && test ! -s out.txt && grep -q "kzig new" err.txt
+code=0; "$KZIG" g module task > out.txt 2> err.txt || code=$?
+[ $code = 1 ] && test ! -s out.txt && grep -q "^error: no src/modules.zig" err.txt
+
 step "kzig new refuses names Zig can't use as a package name"
 fails "$KZIG" new test --kzig "$ROOT"
 fails "$KZIG" new error --kzig "$ROOT"

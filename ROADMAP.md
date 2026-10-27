@@ -250,7 +250,7 @@ Follow-ups:
 - [ ] `kzig build` / `start`
 - [ ] Generators for DTO-only, guards, tests; `kzig add <feature>` (swagger, http.zig runtime)
 - [ ] Prebuilt `kzig` binaries in releases
-- [ ] Errors to stderr; `kzig --help` / `kzig help` exit 0
+- [x] Errors to stderr; `kzig --help` / `kzig help` exit 0
 - [ ] Generated list endpoint: 400 for filter operators it doesn't support (today they match all)
 - [ ] Plurals for irregular words (`person`, `data`, `quiz`) and acronyms (`HTTPClient`)
 - [ ] Generated tests: a search test with more than one row; 404 documented on `/:id` routes
