@@ -304,16 +304,22 @@ fn phiMinusOne(a: Allocator, p: []const u8, q: []const u8) ![]const u8 {
 
 /// Each certificate's DER, in the file's order (leaf first).
 pub fn parseChain(a: Allocator, text: []const u8) ![]const []const u8 {
+    const list = try pemAll(a, text, "CERTIFICATE");
+    if (list.len == 0) return error.NoCertificate;
+    return list;
+}
+
+/// Every `-----BEGIN <label>-----` block's bytes, in order.
+pub fn pemAll(a: Allocator, text: []const u8, comptime label: []const u8) ![]const []const u8 {
     var list: std.ArrayList([]const u8) = .empty;
     var rest = text;
     while (true) {
-        const begin = "-----BEGIN CERTIFICATE-----";
+        const begin = "-----BEGIN " ++ label ++ "-----";
         const at = std.mem.find(u8, rest, begin) orelse break;
-        const block = (try pemBlock(a, rest[at..], "CERTIFICATE")).?;
+        const block = (try pemBlock(a, rest[at..], label)).?;
         try list.append(a, block.der);
         rest = rest[at + begin.len ..];
     }
-    if (list.items.len == 0) return error.NoCertificate;
     return list.items;
 }
 
@@ -531,12 +537,18 @@ fn smallInt(d: *Der) !u32 {
     return v;
 }
 
-/// A minimal DER reader: what private keys need.
-const Der = struct {
+/// A minimal DER reader: what private keys (and CRLs) need.
+pub const Der = struct {
     buf: []const u8,
     i: usize = 0,
 
-    fn next(d: *Der, tag: u8) ![]const u8 {
+    /// The element's contents, which must have `tag`.
+    pub fn next(d: *Der, tag: u8) ![]const u8 {
+        return (try d.element(tag)).content;
+    }
+
+    /// The whole element (tag, length and contents) and its contents.
+    pub fn element(d: *Der, tag: u8) !struct { raw: []const u8, content: []const u8 } {
         if (d.i + 2 > d.buf.len or d.buf[d.i] != tag) return error.InvalidKey;
         const first = d.buf[d.i + 1];
         var len: usize = first;
@@ -549,17 +561,18 @@ const Der = struct {
             hdr += nb;
         }
         if (d.i + hdr > d.buf.len or len > d.buf.len - d.i - hdr) return error.InvalidKey;
+        const start = d.i;
         const content = d.buf[d.i + hdr ..][0..len];
         d.i += hdr + len;
-        return content;
+        return .{ .raw = d.buf[start..d.i], .content = content };
     }
 
-    fn peek(d: Der) ?u8 {
+    pub fn peek(d: Der) ?u8 {
         return if (d.i < d.buf.len) d.buf[d.i] else null;
     }
 
     /// An INTEGER's magnitude without leading zero bytes.
-    fn int(d: *Der) ![]const u8 {
+    pub fn int(d: *Der) ![]const u8 {
         var v = try d.next(0x02);
         while (v.len > 1 and v[0] == 0) v = v[1..];
         return v;

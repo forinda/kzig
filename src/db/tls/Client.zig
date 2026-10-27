@@ -16,6 +16,7 @@ const Certificate = std.crypto.Certificate;
 const Reader = std.Io.Reader;
 const Writer = std.Io.Writer;
 const keys = @import("keys.zig");
+const crl = @import("crl.zig");
 
 /// kzig: a client certificate chain (leaf first, DER) and its private key,
 /// for a server that asks (TLS 1.3 only).
@@ -131,6 +132,9 @@ pub const Options = struct {
     },
     write_buffer: []u8,
     read_buffer: []u8,
+    /// kzig: revocation lists; a server certificate one of them lists is
+    /// refused (`error.TlsCertificateRevoked`).
+    crl: ?*const crl.Set = null,
     /// kzig: the certificate to answer a CertificateRequest with; without it
     /// an empty Certificate is sent (the server decides whether that's enough).
     client_auth: ?ClientAuth = null,
@@ -174,6 +178,8 @@ pub const Options = struct {
 pub const InitError = error{
     /// kzig: `alpn` was offered and the server didn't select it.
     TlsNoApplicationProtocol,
+    /// kzig: a CRL lists one of the server's certificates.
+    TlsCertificateRevoked,
     /// kzig: a TLS 1.2 server asked for a client certificate.
     TlsClientAuthUnsupported,
     /// kzig: the certificate chain doesn't fit one record.
@@ -776,6 +782,10 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                 .index = @intCast(certd.idx),
                             };
                             const subject = try subject_cert.parse();
+                            // kzig: every certificate in the chain, against the CRLs.
+                            if (options.crl) |set| {
+                                if (set.revoked(certd.buf) catch return error.TlsDecodeError) return error.TlsCertificateRevoked;
+                            }
                             if (cert_index == 0) {
                                 // kzig: tls-server-end-point, from the leaf's DER.
                                 end_point_len = if (serverEndPoint(certd.buf, &end_point)) |h| @intCast(h.len) else |_| 0;

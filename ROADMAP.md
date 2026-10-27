@@ -415,9 +415,15 @@ after their exports.
 - [x] Client certificates on TLS 1.2 (RSA-PSS or PKCS#1 v1.5, ECDSA), and an empty Certificate when
       a TLS 1.2 server asks and none is configured; CI runs a TLS 1.2-only server for it
 
-Not covered: scrypt- or DES-encrypted keys, Ed25519 keys, CRLs, RSA blinding (the exponentiation is
-constant-time), a check that `sslkey` matches `sslcert`, channel binding to SHA-224- or
-Ed25519-signed server certificates.
+- [x] Ed25519 client keys (TLS 1.3); keys encrypted with scrypt or 3DES; `sslkey` checked against
+      `sslcert`; RSA signatures blinded; channel binding to SHA-224-signed server certificates
+- [x] `sslcrl`: CRLs verified against their CA, every server certificate checked; CI revokes the
+      test server's certificate
+
+Not covered: Ed25519 client keys on TLS 1.2 (they sign the handshake itself, not a hash), channel
+binding to Ed25519-signed server certificates (no hash defined; Postgres can't bind them either),
+CRLs issued by an intermediate CA unless it's in `sslrootcert`, delta CRLs and fetching CRL
+distribution points.
 
 ### Later
 

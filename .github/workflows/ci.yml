@@ -52,6 +52,12 @@ jobs:
             openssl x509 -req -in certuser-$kind.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 2 -out certuser-$kind.pem
           done
           openssl pkcs8 -topk8 -in certuser-rsa.key -v2 aes-256-cbc -v2prf hmacWithSHA256 -passout pass:kzig-test -out certuser-rsa-enc.key
+          # CRLs from the CA: none revoked, and one revoking the server's certificate.
+          mkdir crldb; touch crldb/index.txt; echo 1000 > crldb/crlnumber
+          printf '[ ca ]\ndefault_ca = ca\n[ ca ]\ndatabase = %s/crldb/index.txt\ncrlnumber = %s/crldb/crlnumber\ndefault_md = sha256\ndefault_crl_days = 2\ncertificate = %s/ca.pem\nprivate_key = %s/ca.key\n' "$d" "$d" "$d" "$d" > crldb/ca.cnf
+          openssl ca -config crldb/ca.cnf -gencrl -out crl-empty.pem
+          openssl ca -config crldb/ca.cnf -revoke server.pem
+          openssl ca -config crldb/ca.cnf -gencrl -out crl-server-revoked.pem
           # pg: TLS 1.3 (the tests' server); pg12: TLS 1.2 only, for its client-certificate path.
           ready() { for i in $(seq 60); do docker exec $1 pg_isready -U kzig -h 127.0.0.1 >/dev/null 2>&1 && return 0; sleep 1; done; docker logs $1; return 1; }
           setup() {

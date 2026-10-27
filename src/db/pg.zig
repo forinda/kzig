@@ -6,6 +6,7 @@ const tls = struct {
     const Client = @import("tls/Client.zig");
 };
 const keys = @import("tls/keys.zig");
+const crl = @import("tls/crl.zig");
 const builtin = @import("builtin");
 const Timestamp = @import("timestamp.zig").Timestamp;
 
@@ -50,6 +51,9 @@ pub const Config = struct {
     sslkey: ?[]const u8 = null,
     /// Unlocks an encrypted `sslkey` (PKCS#8 PBES2, or OpenSSL's DEK-Info PEM).
     sslpassword: ?[]const u8 = null,
+    /// Revocation lists (PEM or DER) signed by a CA in `sslrootcert`: a
+    /// server certificate they list is refused. Needs `sslrootcert`.
+    sslcrl: ?[]const u8 = null,
     /// `insecure_auth=true`: answer a cleartext or MD5 password request on
     /// an unverified connection (an old server); off, that's `error.InsecureAuth`.
     insecure_auth: bool = false,
@@ -88,6 +92,8 @@ pub const Config = struct {
                     c.sslcert = pair["sslcert=".len..];
                 } else if (std.mem.startsWith(u8, pair, "sslkey=")) {
                     c.sslkey = pair["sslkey=".len..];
+                } else if (std.mem.startsWith(u8, pair, "sslcrl=")) {
+                    c.sslcrl = pair["sslcrl=".len..];
                 } else if (std.mem.startsWith(u8, pair, "sslpassword=")) {
                     c.sslpassword = std.Uri.percentDecodeInPlace(try a.dupe(u8, pair["sslpassword=".len..]));
                 } else if (std.mem.startsWith(u8, pair, "sslrootcert=")) {
@@ -98,6 +104,8 @@ pub const Config = struct {
             }
         }
         if ((c.sslcert == null) != (c.sslkey == null)) return error.InvalidDatabaseUrl;
+        // A CRL is checked against the CAs it's signed by: name them.
+        if (c.sslcrl != null and c.sslrootcert == null) return error.InvalidDatabaseUrl;
         // libpq: direct TLS can't fall back to plaintext.
         if (c.sslnegotiation == .direct and (c.sslmode == .disable or c.sslmode == .allow or c.sslmode == .prefer))
             return error.InvalidDatabaseUrl;
@@ -285,6 +293,17 @@ pub const Conn = struct {
             break :blk .{ .chain = chain, .key = key, .io = c.io };
         } else null;
         defer if (client_auth) |*auth| std.crypto.secureZero(u8, std.mem.asBytes(&auth.key));
+        // Revocation lists, each verified against the CAs in sslrootcert.
+        var crl_arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer crl_arena.deinit();
+        const crls: ?crl.Set = if (cfg.sslcrl) |crl_path| blk: {
+            const ca_arena = crl_arena.allocator();
+            const cwd = Io.Dir.cwd();
+            const text = cwd.readFileAlloc(c.io, crl_path, ca_arena, .limited(16 << 20)) catch |err| return tlsConfig("sslcrl", crl_path, err);
+            const roots = cwd.readFileAlloc(c.io, cfg.sslrootcert.?, ca_arena, .limited(16 << 20)) catch |err| return tlsConfig("sslrootcert", cfg.sslrootcert.?, err);
+            const cas = keys.parseChain(ca_arena, roots) catch |err| return tlsConfig("sslrootcert", cfg.sslrootcert.?, err);
+            break :blk crl.Set.load(ca_arena, text, cas, now.toSeconds()) catch |err| return tlsConfig("sslcrl", crl_path, err);
+        } else null;
         var entropy: [tls.Client.Options.entropy_len]u8 = undefined;
         c.io.random(&entropy);
         c.tls = tls.Client.init(&c.reader.interface, &c.writer.interface, .{
@@ -295,6 +314,7 @@ pub const Conn = struct {
             // Direct TLS: the server only accepts it with ALPN `postgresql`.
             .alpn = if (cfg.sslnegotiation == .direct) "postgresql" else null,
             .client_auth = client_auth,
+            .crl = if (crls) |*set| set else null,
             .ca = if (verify) .{ .bundle = .{ .gpa = c.gpa, .io = c.io, .lock = &lock, .bundle = &bundle } } else .no_verification,
             .read_buffer = &c.tls_rbuf,
             .write_buffer = &c.tls_wbuf,

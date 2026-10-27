@@ -291,9 +291,14 @@ More of libpq's options:
   offers it, tying the sign-in to the server's certificate; `require` refuses anything else,
   `disable` turns it off.
 - `sslcert=client.pem&sslkey=client.key`: a client certificate for a server that authenticates
-  by certificate (pg_hba `cert`), over TLS 1.3 or 1.2. Keys: EC P-256/P-384 (SEC1 or PKCS#8) or
-  RSA (PKCS#1 or PKCS#8; RSA-PSS, or PKCS#1 v1.5 for a TLS 1.2 server without PSS). An encrypted
-  key (PKCS#8 PBES2, or OpenSSL's `DEK-Info` PEM, AES) takes `sslpassword=`.
+  by certificate (pg_hba `cert`), over TLS 1.3 or 1.2. Keys: EC P-256/P-384 (SEC1 or PKCS#8), RSA
+  (PKCS#1 or PKCS#8; RSA-PSS, or PKCS#1 v1.5 for a TLS 1.2 server without PSS; blinded) or Ed25519
+  (PKCS#8, TLS 1.3). An encrypted key (PKCS#8 PBES2 with PBKDF2 or scrypt, or OpenSSL's `DEK-Info`
+  PEM; AES or 3DES) takes `sslpassword=`. A key that isn't the certificate's is refused before
+  connecting.
+- `sslcrl=crl.pem`: revocation lists (PEM or DER), each verified against its CA in
+  `sslrootcert`; a server certificate they list is refused. A lapsed or unverifiable CRL is a
+  configuration error.
 
 Passwords: SCRAM (Postgres's default) never sends one. A server asking for a cleartext or MD5
 password gets one only over verified TLS (`verify-ca`/`verify-full`); for an old server on a

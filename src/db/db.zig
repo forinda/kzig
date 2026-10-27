@@ -259,6 +259,7 @@ test {
     _ = @import("relational.zig");
     _ = @import("tls/keys.zig");
     _ = @import("tls/des.zig");
+    _ = @import("tls/crl.zig");
     _ = @import("tls/Client.zig");
     _ = pg;
 }
@@ -465,6 +466,16 @@ test "TLS: verify-full against the server's CA and name; a wrong name or CA is r
     var direct: Pool = try .init(testing.io, testing.allocator, .{ .url = try std.fmt.allocPrint(a, "{s}&sslnegotiation=direct", .{try tlsUrl(a, url, "localhost", "verify-full", ca)}), .max_connections = 1 });
     defer direct.deinit();
     try testing.expect((try direct.queryOne(a, Ssl, on, .{})).?.ssl);
+    // CRLs (PEM, signed by the CA): one listing the server's certificate
+    // refuses it; one that doesn't changes nothing.
+    if (env.get("PG_TEST_CERT_DIR")) |dir| {
+        var clean: Pool = try .init(testing.io, testing.allocator, .{ .url = try std.fmt.allocPrint(a, "{s}&sslcrl={s}/crl-empty.pem", .{ try tlsUrl(a, url, "localhost", "verify-full", ca), dir }), .max_connections = 1 });
+        defer clean.deinit();
+        try clean.ping();
+        var revoked: Pool = try .init(testing.io, testing.allocator, .{ .url = try std.fmt.allocPrint(a, "{s}&sslcrl={s}/crl-server-revoked.pem", .{ try tlsUrl(a, url, "localhost", "verify-full", ca), dir }), .max_connections = 1 });
+        defer revoked.deinit();
+        try testing.expectError(error.TlsHandshakeFailed, revoked.ping());
+    }
     // disable stays in the clear.
     var plain: Pool = try .init(testing.io, testing.allocator, .{ .url = try tlsUrl(a, url, "localhost", "disable", ca), .max_connections = 1 });
     defer plain.deinit();
