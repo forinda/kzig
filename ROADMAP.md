@@ -463,6 +463,10 @@ bind them either).
       against a fake of the endpoint run by local SQLite
 - [ ] A live D1 test (credentials in CI), and `insertMany` that splits at D1's parameter limit
 - [ ] Request timeouts for the HTTP drivers (std's fetch has none)
+- [ ] On D1, kick/db's trigger check before a rebuild and its worded foreign-key error
+- [ ] Parameters bound by their Zig type, not the canonical-integer rule (raw SQL comparing
+      text through a function, `lower(s) = ?1`, can miss rows today)
+- [ ] S3's HTTP client refreshes its TLS clock too (the database drivers do, hourly)
 
 ### Later
 
