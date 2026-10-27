@@ -16,6 +16,8 @@ pub const Route = struct {
     handler: Handler,
     /// Runs around `handler`, after global middleware.
     middleware: []const mw.Fn = &.{},
+    /// `Controller.handler`, for adapters' `onRouteMount`.
+    name: []const u8 = "",
 };
 
 /// A route whose handler returns a value; the value is sent with `Ctx.send`.

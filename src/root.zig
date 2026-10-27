@@ -4,6 +4,9 @@ const problem = @import("problem.zig");
 const router = @import("router.zig");
 const di = @import("di.zig");
 const app = @import("app.zig");
+const adapter = @import("adapter.zig");
+pub const StartInfo = adapter.StartInfo;
+pub const RouteInfo = adapter.RouteInfo;
 pub const testing = @import("testing.zig");
 pub const config = @import("config.zig");
 pub const decode = @import("decode.zig");
@@ -42,6 +45,7 @@ test {
     _ = router;
     _ = di;
     _ = app;
+    _ = adapter;
     _ = testing;
     _ = config;
     _ = decode;

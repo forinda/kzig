@@ -14,6 +14,7 @@ const router = @import("router.zig");
 const mw = @import("middleware.zig");
 const contributor = @import("contributor.zig");
 const decode = @import("decode.zig");
+const adapter_mod = @import("adapter.zig");
 
 /// Injectable as `*const kzig.Process`.
 pub const Process = struct {
@@ -68,7 +69,8 @@ pub fn Module(comptime spec: anytype) type {
 /// `.default_version = 1`, `.health = true` (mounts `/health/live` and
 /// `/health/ready`).
 pub fn App(comptime spec: anytype) type {
-    checkFields(spec, &.{ "modules", "config", "api_prefix", "default_version", "health", "middleware", "contributors", "settings" }, "App");
+    checkFields(spec, &.{ "modules", "config", "api_prefix", "default_version", "health", "middleware", "contributors", "settings", "adapters" }, "App");
+    const adapters = adapter_mod.order(di.unique(opt(spec, "adapters", @as([]const type, &.{}))));
     const global_contributors: []const type = contributor.types(if (@hasField(@TypeOf(spec), "contributors")) spec.contributors else .{}, "App");
     const global_mw = if (@hasField(@TypeOf(spec), "middleware")) spec.middleware else .{};
     const Config = opt(spec, "config", struct {});
@@ -81,9 +83,12 @@ pub fn App(comptime spec: anytype) type {
     comptime var section_list: []const type = &.{Config};
     section_list = section_list ++ opt(spec, "settings", @as([]const type, &.{}));
     inline for (modules) |M| section_list = section_list ++ M.settings;
+    inline for (adapters) |A| {
+        if (@hasDecl(A, "settings")) section_list = section_list ++ A.settings;
+    }
     const sections = di.unique(section_list);
 
-    comptime var listed: []const type = sections ++ &[_]type{ Process, ConfigReport };
+    comptime var listed: []const type = sections ++ &[_]type{ Process, ConfigReport } ++ adapters;
     listed = listed ++ mwTypes(global_mw) ++ global_contributors;
     inline for (modules) |M| {
         if (!@hasDecl(M, "kzig_module")) @compileError(@typeName(M) ++ " is not a kzig.Module");
@@ -105,6 +110,8 @@ pub fn App(comptime spec: anytype) type {
 
         container: Services,
         config_arena: std.heap.ArenaAllocator,
+        /// Adapters whose `beforeMount` ran; they get `shutdown`.
+        mounted: usize = 0,
 
         pub const routes: []const router.Route = buildRoutes(Self, modules, api_prefix, default_version, global_contributors);
         const Routes = router.Router(routes);
@@ -151,11 +158,47 @@ pub fn App(comptime spec: anytype) type {
 
             const process: Process = .{ .io = io, .gpa = gpa, .started_at = std.Io.Clock.awake.now(io), .dev_or_test = config.devOrTest(env) };
             try self.container.initWith(values ++ .{ process, ConfigReport{ .vars = origins.items } } ++ overrides);
+            errdefer self.container.deinit();
+
+            // KickJS boot order, after services are built: beforeMount,
+            // onRouteMount per route, beforeStart. A failure shuts down the
+            // adapters already mounted, in reverse.
+            self.mounted = 0;
+            errdefer self.shutdownAdapters();
+            inline for (adapters) |A| {
+                if (@hasDecl(A, "beforeMount")) try self.get(A).beforeMount();
+                self.mounted += 1;
+            }
+            inline for (routes) |r| inline for (adapters) |A| {
+                if (@hasDecl(A, "onRouteMount")) self.get(A).onRouteMount(.{ .method = r.method, .path = r.path, .handler = r.name });
+            };
+            inline for (adapters) |A| {
+                if (@hasDecl(A, "beforeStart")) try self.get(A).beforeStart();
+            }
         }
 
+        /// Adapter `shutdown` in reverse dependency order, then services'
+        /// `deinit`. Not for an app whose `init` failed (that cleaned up).
         pub fn deinit(self: *Self) void {
+            self.shutdownAdapters();
             self.container.deinit();
             self.config_arena.deinit();
+        }
+
+        /// The server is listening: adapter `afterStart`.
+        pub fn started(self: *Self, info: adapter_mod.StartInfo) void {
+            inline for (adapters) |A| {
+                if (@hasDecl(A, "afterStart")) self.get(A).afterStart(info);
+            }
+        }
+
+        fn shutdownAdapters(self: *Self) void {
+            comptime var k = adapters.len;
+            inline while (k > 0) {
+                k -= 1;
+                if (k < self.mounted and @hasDecl(adapters[k], "shutdown")) self.get(adapters[k]).shutdown();
+            }
+            self.mounted = 0;
         }
 
         pub fn get(self: *Self, comptime S: type) *S {
@@ -206,7 +249,7 @@ fn buildRoutes(comptime AppT: type, comptime modules: []const type, comptime api
                         if (@hasDecl(C, "contributors")) contributor.types(C.contributors, where) else &.{},
                         if (@hasField(@TypeOf(r), "contributors")) contributor.types(r.contributors, where) else &.{},
                     }, contributor.GotOf(@field(C, handler)), where);
-                    list = list ++ .{router.Route{ .method = method, .path = full, .handler = thunk(AppT, C, handler, P, chain) }};
+                    list = list ++ .{router.Route{ .method = method, .path = full, .handler = thunk(AppT, C, handler, P, chain), .name = owner }};
                     owners = owners ++ .{owner};
                 }
             }
