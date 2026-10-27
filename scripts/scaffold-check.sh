@@ -83,13 +83,18 @@ zig build test
 step "generated code is zig fmt clean"
 zig fmt --check build.zig build.zig.zon src
 
-step "kzig g controller/service/middleware/contributor/adapter"
+step "kzig g controller/service/middleware/contributor/adapter/dto/guard/test"
 "$KZIG" g controller audit --module tasks
 "$KZIG" g service audit --module tasks
 "$KZIG" g middleware audit
 "$KZIG" g contributor current-user
 "$KZIG" g adapter cache
 "$KZIG" g middleware error
+"$KZIG" g dto create-order
+"$KZIG" g guard auth
+"$KZIG" g test smoke
+"$KZIG" g test audit --module tasks
+grep -q 'smoke.test.zig' src/main.zig && grep -q 'modules/tasks/audit.test.zig' src/main.zig
 
 step "--module must name an existing module folder inside the project"
 fails "$KZIG" g service evil --module ../../escape
@@ -106,6 +111,31 @@ test {
     std.testing.refAllDecls(@import("contributors/current-user.contributor.zig").LoadCurrentUser);
     std.testing.refAllDecls(@import("adapters/cache.adapter.zig").CacheAdapter);
     std.testing.refAllDecls(@import("middleware/error.middleware.zig"));
+    std.testing.refAllDecls(@import("dtos/create-order.dto.zig").CreateOrder);
+}
+
+// The guard on a route: 401 without a bearer token, the handler with one.
+const kzig = @import("kzig");
+const Guarded = struct {
+    pub const routes = .{.{ .method = .GET, .path = "/", .handler = "index", .middleware = .{@import("guards/auth.guard.zig").authGuard} }};
+    pub fn index(_: *Guarded, _: *kzig.Ctx) []const u8 {
+        return "in";
+    }
+};
+const GuardApp = kzig.App(.{ .modules = &.{kzig.Module(.{ .name = "Guarded", .path = "/guarded", .controllers = &.{Guarded} })} });
+test "auth guard" {
+    var app: GuardApp = undefined;
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("NODE_ENV", "test");
+    try app.init(std.testing.io, std.testing.allocator, &env);
+    defer app.deinit();
+    var denied = try kzig.testing.request(std.testing.allocator, &app, .{ .target = "/api/v1/guarded" });
+    defer denied.deinit();
+    try std.testing.expectEqual(.unauthorized, denied.status);
+    var allowed = try kzig.testing.request(std.testing.allocator, &app, .{ .target = "/api/v1/guarded", .headers = &.{.{ .name = "authorization", .value = "Bearer t" }} });
+    defer allowed.deinit();
+    try std.testing.expectEqualStrings("in", allowed.body);
 }
 ZIG
 edit 's|^    // kzig:tests|    _ = @import("stubs.test.zig");\

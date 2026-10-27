@@ -3,7 +3,8 @@
 //!   kzig new <name> [--kzig <path>] [--no-fetch] [--force]
 //!   kzig g module <name> [--minimal] [--force]
 //!   kzig g controller|service <name> [--module <dir>] [--force]
-//!   kzig g middleware|contributor|adapter <name> [--force]
+//!   kzig g middleware|contributor|adapter|dto|guard <name> [--force]
+//!   kzig g test <name> [--module <dir>] [--force]
 //!   kzig rm module <name>
 const std = @import("std");
 const Names = @import("names.zig").Names;
@@ -26,9 +27,9 @@ const usage =
     \\      in-memory repository, list query, tests; mounted in src/modules.zig.
     \\      --minimal: module, controller and test only.
     \\
-    \\  kzig g controller|service <name> [--module <dir>]
-    \\  kzig g middleware|contributor|adapter <name>
-    \\      One file to wire in yourself.
+    \\  kzig g controller|service|test <name> [--module <dir>]
+    \\  kzig g middleware|contributor|adapter|dto|guard <name>
+    \\      One file to wire in yourself (a test is added to src/main.zig's tests).
     \\
     \\  kzig dev [--bin <name>] [-- <app args>]
     \\      Builds and runs the app; rebuilds and restarts it when src/ or
@@ -88,6 +89,9 @@ const stubs = [_]Stub{
     .{ .kind = "middleware", .dir = "src/middleware", .template = tpl("{{kebab}}.middleware.zig", "stub/middleware.zig.tpl") },
     .{ .kind = "contributor", .dir = "src/contributors", .template = tpl("{{kebab}}.contributor.zig", "stub/contributor.zig.tpl") },
     .{ .kind = "adapter", .dir = "src/adapters", .template = tpl("{{kebab}}.adapter.zig", "stub/adapter.zig.tpl") },
+    .{ .kind = "dto", .dir = "src/dtos", .template = tpl("{{kebab}}.dto.zig", "stub/dto.zig.tpl") },
+    .{ .kind = "guard", .dir = "src/guards", .template = tpl("{{kebab}}.guard.zig", "stub/guard.zig.tpl") },
+    .{ .kind = "test", .dir = null, .template = tpl("{{kebab}}.test.zig", "stub/test.zig.tpl") },
 };
 
 const Cli = struct {
@@ -385,7 +389,19 @@ fn generateStub(cli: Cli, flags: Flags, s: Stub, raw: []const u8) !void {
         };
         break :blk d;
     } else "src";
-    try writeAll(cli, dir, &.{s.template}, try vars(n, &.{}, cli.arena), flags.force);
+    // From the file back to src/, where test_app.zig is.
+    const root = if (std.mem.eql(u8, dir, "src")) "" else "../../";
+    try writeAll(cli, dir, &.{s.template}, try vars(n, &.{.{ "root", root }}, cli.arena), flags.force);
+
+    // Tests run once src/main.zig imports them.
+    if (std.mem.eql(u8, s.kind, "test")) {
+        const rel = if (dir.len > "src".len) dir["src/".len..] else "";
+        const line = try std.fmt.allocPrint(cli.arena, "_ = @import(\"{s}{s}{s}.test.zig\");", .{ rel, if (rel.len > 0) "/" else "", n.kebab });
+        edit(cli, "src/main.zig", registry.insert, .{ "tests", line }) catch |err| switch (err) {
+            error.MarkerNotFound => cli.print("  note: no `// kzig:tests` in src/main.zig; import {s} from your tests\n", .{line}),
+            else => return err,
+        };
+    }
 }
 
 fn removeModule(cli: Cli, flags: Flags, raw: []const u8) !void {
