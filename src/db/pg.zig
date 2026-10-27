@@ -602,7 +602,7 @@ pub fn encodeArgs(a: Allocator, args: anytype) ![]const ?[]const u8 {
     return out;
 }
 
-fn encodeValue(a: Allocator, v: anytype) !?[]const u8 {
+pub fn encodeValue(a: Allocator, v: anytype) !?[]const u8 {
     const T = @TypeOf(v);
     if (T == std.json.Value) return try std.json.Stringify.valueAlloc(a, v, .{});
     if (@typeInfo(T) == .@"struct" and @hasDecl(T, "toPg")) return try v.toPg(a);

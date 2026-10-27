@@ -19,6 +19,28 @@ const schema_ = @import("schema.zig");
 pub const table = schema_.table;
 pub const Schema = schema_.Schema;
 pub const Column = schema_.Column;
+const query_ = @import("query.zig");
+pub const Client = query_.Client;
+pub const eq = query_.eq;
+pub const ne = query_.ne;
+pub const gt = query_.gt;
+pub const gte = query_.gte;
+pub const lt = query_.lt;
+pub const lte = query_.lte;
+pub const like = query_.like;
+pub const notLike = query_.notLike;
+pub const ilike = query_.ilike;
+pub const isNull = query_.isNull;
+pub const isNotNull = query_.isNotNull;
+pub const inArray = query_.inArray;
+pub const notInArray = query_.notInArray;
+pub const between = query_.between;
+pub const all = query_.all;
+pub const any = query_.any;
+pub const not = query_.not;
+pub const exists = query_.exists;
+pub const sql = query_.sql;
+pub const escapeLike = query_.escapeLike;
 
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -83,31 +105,31 @@ pub const Pool = struct {
         p.idle.append(p.gpa, c) catch c.close();
     }
 
-    /// Every row of `sql` as a `T`, by column name; strings in `a`.
-    pub fn query(p: *Pool, a: Allocator, comptime T: type, sql: []const u8, args: anytype) ![]T {
+    /// Every row of `text` as a `T`, by column name; strings in `a`.
+    pub fn query(p: *Pool, a: Allocator, comptime T: type, text: []const u8, args: anytype) ![]T {
         const c = try p.acquire();
         defer p.release(c);
-        return queryOn(c, a, T, sql, args);
+        return queryOn(c, a, T, text, args);
     }
 
     /// The first row, or null.
-    pub fn queryOne(p: *Pool, a: Allocator, comptime T: type, sql: []const u8, args: anytype) !?T {
-        const rows = try p.query(a, T, sql, args);
+    pub fn queryOne(p: *Pool, a: Allocator, comptime T: type, text: []const u8, args: anytype) !?T {
+        const rows = try p.query(a, T, text, args);
         return if (rows.len > 0) rows[0] else null;
     }
 
     /// Rows affected (INSERT, UPDATE, DELETE).
-    pub fn exec(p: *Pool, sql: []const u8, args: anytype) !u64 {
+    pub fn exec(p: *Pool, text: []const u8, args: anytype) !u64 {
         const c = try p.acquire();
         defer p.release(c);
-        return execOn(c, sql, args);
+        return execOn(c, text, args);
     }
 
     /// Several statements, no parameters (a migration).
-    pub fn execScript(p: *Pool, sql: []const u8) !void {
+    pub fn execScript(p: *Pool, text: []const u8) !void {
         const c = try p.acquire();
         defer p.release(c);
-        return c.script(sql);
+        return c.script(text);
     }
 
     /// `SELECT 1`: for `/health/ready`.
@@ -128,21 +150,21 @@ pub const Tx = struct {
     pool: *Pool,
     conn: ?*pg.Conn,
 
-    pub fn query(t: *Tx, a: Allocator, comptime T: type, sql: []const u8, args: anytype) ![]T {
-        return queryOn(t.conn orelse return error.TransactionDone, a, T, sql, args);
+    pub fn query(t: *Tx, a: Allocator, comptime T: type, text: []const u8, args: anytype) ![]T {
+        return queryOn(t.conn orelse return error.TransactionDone, a, T, text, args);
     }
 
-    pub fn queryOne(t: *Tx, a: Allocator, comptime T: type, sql: []const u8, args: anytype) !?T {
-        const rows = try t.query(a, T, sql, args);
+    pub fn queryOne(t: *Tx, a: Allocator, comptime T: type, text: []const u8, args: anytype) !?T {
+        const rows = try t.query(a, T, text, args);
         return if (rows.len > 0) rows[0] else null;
     }
 
-    pub fn exec(t: *Tx, sql: []const u8, args: anytype) !u64 {
-        return execOn(t.conn orelse return error.TransactionDone, sql, args);
+    pub fn exec(t: *Tx, text: []const u8, args: anytype) !u64 {
+        return execOn(t.conn orelse return error.TransactionDone, text, args);
     }
 
-    pub fn execScript(t: *Tx, sql: []const u8) !void {
-        return (t.conn orelse return error.TransactionDone).script(sql);
+    pub fn execScript(t: *Tx, text: []const u8) !void {
+        return (t.conn orelse return error.TransactionDone).script(text);
     }
 
     pub fn commit(t: *Tx) !void {
@@ -170,7 +192,7 @@ pub const Tx = struct {
     }
 };
 
-fn queryOn(c: *pg.Conn, a: Allocator, comptime T: type, sql: []const u8, args: anytype) ![]T {
+fn queryOn(c: *pg.Conn, a: Allocator, comptime T: type, text: []const u8, args: anytype) ![]T {
     if (@typeInfo(T) != .@"struct") @compileError("db: rows decode into a struct, not " ++ @typeName(T));
     const Rows = struct {
         a: Allocator,
@@ -181,18 +203,18 @@ fn queryOn(c: *pg.Conn, a: Allocator, comptime T: type, sql: []const u8, args: a
         }
     };
     var rows: Rows = .{ .a = a };
-    _ = try c.run(sql, try pg.encodeArgs(a, args), &rows, Rows.add);
+    _ = try c.run(text, try pg.encodeArgs(a, args), &rows, Rows.add);
     return rows.list.items;
 }
 
-fn execOn(c: *pg.Conn, sql: []const u8, args: anytype) !u64 {
+fn execOn(c: *pg.Conn, text: []const u8, args: anytype) !u64 {
     var buf: [4096]u8 = undefined;
     var fba: std.heap.FixedBufferAllocator = .init(&buf);
     var arena: std.heap.ArenaAllocator = .init(fba.allocator());
     const Ignore = struct {
         fn add(_: void, _: []const []const u8, _: []const ?[]const u8) !void {}
     };
-    return c.run(sql, try pg.encodeArgs(arena.allocator(), args), {}, Ignore.add);
+    return c.run(text, try pg.encodeArgs(arena.allocator(), args), {}, Ignore.add);
 }
 
 const testing = std.testing;
@@ -201,6 +223,7 @@ test {
     _ = migrate;
     _ = @import("timestamp.zig");
     _ = schema_;
+    _ = query_;
     _ = pg;
 }
 
@@ -322,11 +345,11 @@ test "a row wider than the decoder takes is DbDecode, and the connection stays i
     defer env.deinit();
     var db: Pool = try .init(testing.io, testing.allocator, .{ .url = url, .max_connections = 1 });
     defer db.deinit();
-    var sql: std.ArrayList(u8) = .empty;
-    defer sql.deinit(testing.allocator);
-    try sql.appendSlice(testing.allocator, "SELECT 1 AS c0");
-    for (1..70) |i| try sql.print(testing.allocator, ", 1 AS c{d}", .{i});
-    try testing.expectError(error.DbDecode, db.exec(sql.items, .{}));
+    var wide: std.ArrayList(u8) = .empty;
+    defer wide.deinit(testing.allocator);
+    try wide.appendSlice(testing.allocator, "SELECT 1 AS c0");
+    for (1..70) |i| try wide.print(testing.allocator, ", 1 AS c{d}", .{i});
+    try testing.expectError(error.DbDecode, db.exec(wide.items, .{}));
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const row = try db.queryOne(arena.allocator(), struct { x: i32 }, "SELECT 42 AS x", .{});

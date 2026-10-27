@@ -116,6 +116,8 @@ const compile_errors = [_][2][]const u8{
     .{ "db_unknown_reference", "tasks.projectId: no table nope" },
     .{ "db_unknown_index_column", "users.indexes.nameIdx: no column fullName" },
     .{ "db_unknown_column_option", "users.email: no option .notNull" },
+    .{ "db_where_wrong_type", "people.name: expects []const u8, got comptime_int" },
+    .{ "db_unknown_column_in_query", "people: no column nickname" },
     .{ "unknown_module_option", "Module has no option .paths" },
     .{ "module_path_without_slash", "M: module path must be empty or start with '/'" },
     .{ "api_prefix_without_slash", "api_prefix must be empty or start with '/'" },
