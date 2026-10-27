@@ -192,14 +192,16 @@ Follow-ups:
 - [x] One conformance suite (`runtime/conformance.zig`) over a real socket, run by both runtimes;
       response rules shared in `runtime/wire.zig`; in-process tests (task-api included) are
       engine-free
-- [x] Benchmark both runtimes against KickJS on Express (`benchmarks/`): 10–20× KickJS
+- [x] Benchmark both runtimes against KickJS on Express (`benchmarks/`): 6–23× KickJS
 - [x] **Acceptance:** conformance passes on both runtimes, with http.zig's differences declared
 
 Follow-ups:
 
-- [ ] http.zig: a 431 for an oversized head is lost to a reset (declared difference)
+- [ ] http.zig keeps a reused connection open after `connection: close` (declared difference;
+      report upstream)
 - [ ] http.zig: pipelined requests in one packet are dropped after the first
 - [ ] http.zig: requests in flight aren't cut at `shutdown_timeout_ms`
+- [ ] http.zig: response headers past 64 are dropped silently
 - [ ] Benchmark with a load generator that isn't the bottleneck (wrk/oha, separate machine), and
       against Fastify, before choosing a default between std and http.zig
 

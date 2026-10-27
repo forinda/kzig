@@ -39,9 +39,10 @@ AMD Ryzen 5 5600G (6 cores / 12 threads), 37 GB RAM, Linux 7.0, Zig 0.17.0, Node
 
 ## Reading them
 
-- **kzig vs KickJS**: 10–20× the requests at a tenth of the latency, on every route. The real
-  KickJS app (DI, middleware, return-value handlers) is about half as fast as the bare Express app;
-  the kzig app has the same framework layers and is not slower than its bare routes.
+- **kzig vs KickJS**: 6–23× the requests at a tenth of the latency or less, on every route
+  (slowest pairing: http.zig's `/validate`, 6.2× Express's). The real KickJS app (DI, middleware,
+  return-value handlers) is about half as fast as the bare Express app; every kzig route runs
+  through the full framework (DI, middleware, contributors, return-value send).
 - **std vs http.zig is not settled by this run.** Both are near what one autocannon process (4
   Node workers) on the same 12 threads can generate, so the client is part of what is measured;
   the order changes between routes in ways the work per route doesn't explain (http.zig is faster

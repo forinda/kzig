@@ -34,7 +34,7 @@ pub fn Server(comptime App: type) type {
         /// `engine` holds a pointer to `self`: built on first `run`, once
         /// `self` has its final address.
         gpa: std.mem.Allocator,
-        built: bool = false,
+        built: std.atomic.Value(bool) = .init(false),
 
         pub fn init(io: Io, gpa: std.mem.Allocator, app: *App, options: Options) !Self {
             var o = options;
@@ -46,7 +46,7 @@ pub fn Server(comptime App: type) type {
         }
 
         pub fn deinit(self: *Self) void {
-            if (self.built) self.engine.deinit();
+            if (self.built.load(.acquire)) self.engine.deinit();
         }
 
         pub fn port(self: *const Self) u16 {
@@ -55,9 +55,9 @@ pub fn Server(comptime App: type) type {
 
         /// Serves until `shutdown`; requests in flight finish first.
         pub fn run(self: *Self) !void {
-            if (!self.built) {
+            if (!self.built.load(.acquire)) {
                 self.engine = try .init(self.io, self.gpa, config(self.options, self.io), .{ .server = self });
-                self.built = true;
+                self.built.store(true, .release);
             }
             var announce = try self.io.concurrent(announceStarted, .{self});
             defer announce.cancel(self.io) catch {};
@@ -71,12 +71,12 @@ pub fn Server(comptime App: type) type {
             if (@hasDecl(App, "beginDrain")) self.app.beginDrain();
             // Before listen() bound, there is nothing to stop yet; `run`
             // then sees `draining` once listening (see announceStarted).
-            if (self.built and self.engine._listener != null) self.engine.stop();
+            if (self.built.load(.acquire) and self.listening()) self.engine.stop();
         }
 
         /// `app.started` once http.zig is listening (it binds in listen()).
         fn announceStarted(self: *Self) Io.Cancelable!void {
-            while (self.engine._listener == null) try self.io.sleep(.fromMilliseconds(2), .awake);
+            while (!self.listening()) try self.io.sleep(.fromMilliseconds(2), .awake);
             if (self.draining.load(.acquire)) {
                 self.engine.stop();
                 return;
@@ -84,8 +84,25 @@ pub fn Server(comptime App: type) type {
             if (@hasDecl(App, "started")) self.app.started(.{ .port = self.options.port });
         }
 
+        /// http.zig sets `_listener` under its mutex once bound.
+        fn listening(self: *Self) bool {
+            self.engine._mut.lockUncancelable(self.io);
+            defer self.engine._mut.unlock(self.io);
+            return self.engine._listener != null;
+        }
+
         fn serve(self: *Self, req: *httpz.Request, res: *httpz.Response) void {
             const arena = req.arena;
+            // http.zig drops headers past its count before framing the body:
+            // a content-length after them would be lost and the body read as
+            // the next request. Refuse and close instead.
+            if (req.headers.len == max_request_headers) {
+                req.conn.handover = .close;
+                res.status = 431;
+                res.header("content-type", "application/problem+json");
+                res.body = "{\"type\":\"about:blank\",\"title\":\"Request Header Fields Too Large\",\"status\":431}";
+                return;
+            }
             const method = methodOf(req) orelse return notImplemented(res);
             const headers = arena.alloc(kzig.Header, req.headers.len) catch return internalError(res);
             for (req.headers.keys[0..req.headers.len], req.headers.values[0..req.headers.len], headers) |k, v, *h|
@@ -106,7 +123,7 @@ pub fn Server(comptime App: type) type {
             res.status = @backingInt(w.status);
             for (response.headers.items) |h| if (kzig.runtime.wire.sendable(h)) res.header(h.name, h.value);
             res.body = w.body;
-            if (self.draining.load(.acquire)) res.keepalive = false;
+            if (self.draining.load(.acquire)) req.conn.handover = .close;
         }
     };
 }
@@ -118,20 +135,26 @@ pub fn serve(comptime App: type, app: *App, io: Io, gpa: std.mem.Allocator, opti
     defer server.deinit();
     kzig.runtime.signals.install();
     if (!builtin.is_test) std.log.info("listening on http://{s}:{d} (http.zig)", .{ options.host, server.port() });
-    var fut = try io.concurrent(runErased(App), .{&server});
-    while (kzig.runtime.signals.count() == 0) io.sleep(.fromMilliseconds(100), .awake) catch break;
+    var stopped: std.atomic.Value(bool) = .init(false);
+    var fut = try io.concurrent(runErased(App), .{ &server, &stopped });
+    while (kzig.runtime.signals.count() == 0 and !stopped.load(.acquire)) io.sleep(.fromMilliseconds(100), .awake) catch break;
+    // run ended on its own (a bind error, say): report it.
+    if (stopped.load(.acquire)) return fut.await(io);
     if (!builtin.is_test) std.log.info("shutting down: draining connections", .{});
     server.shutdown();
     try fut.await(io);
 }
 
-fn runErased(comptime App: type) fn (*Server(App)) anyerror!void {
+fn runErased(comptime App: type) fn (*Server(App), *std.atomic.Value(bool)) anyerror!void {
     return struct {
-        fn f(s: *Server(App)) anyerror!void {
+        fn f(s: *Server(App), stopped: *std.atomic.Value(bool)) anyerror!void {
+            defer stopped.store(true, .release);
             return s.run();
         }
     }.f;
 }
+
+const max_request_headers = 100;
 
 fn config(o: Options, io: Io) httpz.Config {
     _ = io;
@@ -143,12 +166,15 @@ fn config(o: Options, io: Io) httpz.Config {
             .max_body_size = o.max_body_bytes,
             .buffer_size = o.max_header_bytes,
             // http.zig drops headers past its default of 32 silently.
-            .max_header_count = 100,
+            .max_header_count = max_request_headers,
         },
         .response = .{ .max_header_count = 64 },
         .timeout = .{
+            // http.zig's `request` runs from the first byte to the end of the
+            // body, `keepalive` between requests: the tighter of our two
+            // budgets bounds a slow head.
             .keepalive = seconds(o.head_timeout_ms),
-            .request = seconds(o.body_timeout_ms),
+            .request = seconds(if (o.head_timeout_ms == 0) o.body_timeout_ms else if (o.body_timeout_ms == 0) o.head_timeout_ms else @min(o.head_timeout_ms, o.body_timeout_ms)),
         },
     };
 }
@@ -194,10 +220,9 @@ fn freePort(io: Io, host: []const u8) !u16 {
 test "httpz runtime conformance" {
     try kzig.runtime.conformance.run(Server, .{
         .differences = &.{
-            // http.zig writes the 431 itself and closes with the head unread:
-            // the kernel's reset can destroy the response before the client
-            // reads it.
-            "oversized head is 431",
+            // http.zig sends the response but keeps a reused connection open
+            // after `connection: close`; a client waiting for EOF hangs.
+            "connection: close is honoured on a reused connection",
         },
     });
 }

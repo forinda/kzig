@@ -32,8 +32,8 @@ zig build              # Build
 zig build test         # Run all tests (std runtime)
 zig build test -Dhttpz # …plus the http.zig runtime (fetches http.zig)
 zig build bench -Dhttpz -Doptimize=ReleaseFast && ./benchmarks/run.sh
-zig fmt build.zig src examples tests              # Format
-zig fmt --check build.zig build.zig.zon src examples tests      # Check formatting
+zig fmt build.zig src examples tests benchmarks              # Format
+zig fmt --check build.zig build.zig.zon src examples tests benchmarks      # Check formatting
 zig build --watch      # Rebuild on change
 ```
 

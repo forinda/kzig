@@ -10,7 +10,7 @@ built on `comptime` instead of decorators, so a missing service or an unknown ha
 > health checks, graceful shutdown, two HTTP runtimes (`std.http`, and http.zig opt-in) and an
 > in-process test runtime work (M1–M6). APIs will change. See the [roadmap](./ROADMAP.md).
 
-Requires **Zig 0.17.0**. No dependencies.
+Requires **Zig 0.17.0**. No dependencies (the optional http.zig runtime fetches http.zig).
 
 ## Example
 
@@ -276,8 +276,9 @@ exe.root_module.addImport("kzig_httpz", kzig.module("kzig_httpz"));
 try @import("kzig_httpz").serve(App, &app, init.io, init.gpa, .{ .port = 3000 });
 ```
 
-Both pass the same socket-level conformance suite; http.zig's known differences are listed in the
-roadmap. Against KickJS on Express, on one machine (see [benchmarks](./benchmarks)):
+Both pass the same socket-level conformance suite, except that http.zig keeps a reused
+connection open after `connection: close` (declared in the suite, listed in the roadmap). std
+stays the default. Against KickJS on Express, on one machine (see [benchmarks](./benchmarks)):
 
 | route | kzig std | kzig http.zig | KickJS / Express |
 | --- | ---: | ---: | ---: |

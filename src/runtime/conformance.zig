@@ -103,25 +103,46 @@ fn Harness(comptime ServerFn: fn (type) type) type {
                 };
             }
         }
-        /// Sends `raw` (then `then`, after reading one response), half-closes
-        /// if asked, returns everything the server wrote.
-        fn exchange(self: *Self, raw: []const u8, then: ?[]const u8, half_close: bool) ![]u8 {
+        /// Sends the check's requests, returns everything the server wrote
+        /// until it closed — or until `deadline_ms`, when the client gives up
+        /// (a server that never closes fails a check instead of hanging it).
+        fn exchange(self: *Self, c: Check, elapsed_ms: *i64) ![]u8 {
             const s = try self.connect();
             defer s.close(testing.io);
+            var guard = try testing.io.concurrent(giveUp, .{ s, deadline_ms });
+            defer guard.cancel(testing.io) catch {};
             var rbuf: [4096]u8 = undefined;
             var r = s.reader(testing.io, &rbuf);
             var out: std.ArrayList(u8) = .empty;
             errdefer out.deinit(testing.allocator);
-            try send(s, raw);
-            if (then) |next| {
+            const t0 = Io.Clock.awake.now(testing.io);
+            try send(s, c.request);
+            if (c.later) |more| {
+                try testing.io.sleep(.fromMilliseconds(50), .awake);
+                // The server may already have answered and closed.
+                send(s, more) catch {};
+            }
+            if (c.then) |next| {
                 try readResponse(&r.interface, &out);
                 try send(s, next);
             }
-            if (half_close) try s.shutdown(testing.io, .send);
-            try r.interface.appendRemaining(testing.allocator, &out, .limited(64 * 1024));
+            if (c.half_close) s.shutdown(testing.io, .send) catch {};
+            r.interface.appendRemaining(testing.allocator, &out, .limited(64 * 1024)) catch |err| switch (err) {
+                // The guard shut the socket: report what arrived.
+                error.ReadFailed => {},
+                else => return err,
+            };
+            elapsed_ms.* = @intCast(@divTrunc(t0.durationTo(Io.Clock.awake.now(testing.io)).toNanoseconds(), std.time.ns_per_ms));
             return out.toOwnedSlice(testing.allocator);
         }
     };
+}
+
+const deadline_ms = 3000;
+
+fn giveUp(s: Io.net.Stream, ms: i64) Io.Cancelable!void {
+    try testing.io.sleep(.fromMilliseconds(ms), .awake);
+    s.shutdown(testing.io, .both) catch {};
 }
 
 fn send(stream: Io.net.Stream, raw: []const u8) !void {
@@ -155,6 +176,15 @@ fn fill(comptime n: usize, comptime c: u8) [n]u8 {
     return @splat(c);
 }
 
+fn manyHeaders(comptime n: usize) []const u8 {
+    comptime {
+        var out: []const u8 = "";
+        for (0..n) |i| out = out ++ std.fmt.comptimePrint("x-h{d}: v\r\n", .{i});
+        const result = out;
+        return result;
+    }
+}
+
 fn has(out: []const u8, needle: []const u8) bool {
     return std.mem.find(u8, out, needle) != null;
 }
@@ -166,6 +196,10 @@ const Check = struct {
     /// Sent on the same connection after the first response was read
     /// (keep-alive as clients use it; pipelining is engine-specific).
     then: ?[]const u8 = null,
+    /// Sent 50 ms after `request`, without reading: a second packet.
+    later: ?[]const u8 = null,
+    /// The server must have closed the connection within this time.
+    close_within_ms: ?i64 = null,
     half_close: bool = false,
     expect: *const fn (out: []const u8) bool,
 };
@@ -205,12 +239,32 @@ const checks = [_]Check{
     }.f },
     .{ .name = "POST without content-length has an empty body", .request = "POST /echo HTTP/1.1\r\nhost: x\r\n\r\n", .then = "GET /hello HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n", .expect = struct {
         fn f(o: []const u8) bool {
-            return std.mem.count(u8, o, "HTTP/1.1 ") == 2;
+            var lower: [1024]u8 = undefined;
+            if (o.len > lower.len) return false;
+            const l = std.ascii.lowerString(&lower, o);
+            return std.mem.count(u8, o, "HTTP/1.1 ") == 2 and std.mem.startsWith(u8, o, "HTTP/1.1 200 ") and
+                std.mem.find(u8, l, "content-length: 0\r\n") != null;
         }
     }.f },
-    .{ .name = "a body on GET is not parsed as the next request", .half_close = true, .request = std.fmt.comptimePrint("GET /hello HTTP/1.1\r\nhost: x\r\ncontent-length: {d}\r\n\r\n", .{smuggled.len}) ++ smuggled, .expect = struct {
+    .{ .name = "a body on GET is not parsed as the next request", .half_close = true, .request = std.fmt.comptimePrint("GET /hello HTTP/1.1\r\nhost: x\r\ncontent-length: {d}\r\n\r\n", .{smuggled.len}), .later = smuggled, .expect = struct {
         fn f(o: []const u8) bool {
             return !has(o, "SECRET");
+        }
+    }.f },
+    .{ .name = "framing after 100 headers is not lost (no smuggling)", .half_close = true, .request = "POST /echo HTTP/1.1\r\nhost: x\r\n" ++ manyHeaders(150) ++
+        std.fmt.comptimePrint("content-length: {d}\r\n\r\n", .{smuggled.len}), .later = smuggled, .expect = struct {
+        fn f(o: []const u8) bool {
+            return !has(o, "SECRET");
+        }
+    }.f },
+    .{ .name = "connection: close is honoured on a reused connection", .request = "GET /hello HTTP/1.1\r\nhost: x\r\n\r\n", .then = "GET /hello HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n", .close_within_ms = 1000, .expect = struct {
+        fn f(o: []const u8) bool {
+            return std.mem.count(u8, o, " 200 ") == 2;
+        }
+    }.f },
+    .{ .name = "a partial head is cut at head_timeout_ms", .opts = .{ .head_timeout_ms = 1000, .body_timeout_ms = 30_000 }, .request = "GET /hello HTTP/1.1\r\nhost: x\r\n", .close_within_ms = 2500, .expect = struct {
+        fn f(_: []const u8) bool {
+            return true;
         }
     }.f },
     .{ .name = "content-length with transfer-encoding is refused", .half_close = true, .request = "POST /echo HTTP/1.1\r\nhost: x\r\ncontent-length: 4\r\ntransfer-encoding: chunked\r\n\r\n0\r\n\r\n" ++ smuggled, .expect = struct {
@@ -250,41 +304,32 @@ pub const Known = struct {
 /// the list stays true.
 pub fn run(comptime ServerFn: fn (type) type, comptime known: Known) !void {
     const H = Harness(ServerFn);
+    var failed: usize = 0;
     inline for (checks) |c| {
         const expected_to_fail = comptime for (known.differences) |d| {
             if (std.mem.eql(u8, d, c.name)) break true;
         } else false;
-        if (expected_to_fail) {
-            if (try passes(H, c)) {
-                std.debug.print("conformance: {s} now passes; drop it from the known differences\n", .{c.name});
-                return error.ConformanceFailed;
-            }
-            continue;
-        }
         var h: H = .{};
         try h.start(c.opts);
-        const out = h.exchange(c.request, c.then, c.half_close) catch |err| {
-            h.stop();
-            std.debug.print("conformance: {s}: {t}\n", .{ c.name, err });
-            return err;
-        };
-        defer testing.allocator.free(out);
+        var ms: i64 = 0;
+        const result = h.exchange(c, &ms);
         h.stop();
-        if (!c.expect(out)) {
-            std.debug.print("conformance: {s} failed; the server wrote:\n{s}\n", .{ c.name, out });
-            return error.ConformanceFailed;
-        }
+        const ok = if (result) |out| blk: {
+            defer testing.allocator.free(out);
+            const pass = c.expect(out) and (c.close_within_ms == null or ms <= c.close_within_ms.?);
+            if (!pass and !expected_to_fail) std.debug.print("conformance: {s} failed after {d} ms; the server wrote:\n{s}\n", .{ c.name, ms, out });
+            break :blk pass;
+        } else |err| blk: {
+            if (!expected_to_fail) std.debug.print("conformance: {s}: {t}\n", .{ c.name, err });
+            break :blk false;
+        };
+        if (expected_to_fail and ok) {
+            std.debug.print("conformance: {s} now passes; drop it from the known differences\n", .{c.name});
+            failed += 1;
+        } else if (!expected_to_fail and !ok) failed += 1;
     }
     try lifecycle(ServerFn);
-}
-
-fn passes(comptime H: type, comptime c: Check) !bool {
-    var h: H = .{};
-    try h.start(c.opts);
-    defer h.stop();
-    const out = h.exchange(c.request, c.then, c.half_close) catch return false;
-    defer testing.allocator.free(out);
-    return c.expect(out);
+    if (failed > 0) return error.ConformanceFailed;
 }
 
 fn lifecycle(comptime ServerFn: fn (type) type) !void {
