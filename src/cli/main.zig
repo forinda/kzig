@@ -35,6 +35,12 @@ const usage =
     \\      Builds and runs the app; rebuilds and restarts it when src/ or
     \\      build.zig changes (NODE_ENV=development unless set).
     \\
+    \\  kzig build [-- <zig build args>]
+    \\      zig build -Doptimize=ReleaseSafe.
+    \\
+    \\  kzig start [--port <n>] [--bin <name>] [-- <app args>]
+    \\      Runs the built app (NODE_ENV=production unless set); --port sets PORT.
+    \\
     \\  kzig rm module <name> [--force]
     \\      Deletes the module's folder and unmounts it (asks first unless --force).
     \\
@@ -125,7 +131,8 @@ const Flags = struct {
     kzig: ?[]const u8 = null,
     module: ?[]const u8 = null,
     bin: ?[]const u8 = null,
-    /// After `--`: passed to the app by `kzig dev`.
+    port: ?[]const u8 = null,
+    /// After `--`: passed on by `kzig dev`, `build` and `start`.
     rest: []const []const u8 = &.{},
 };
 
@@ -146,12 +153,13 @@ fn parse(arena: Allocator, args: []const [:0]const u8) !Flags {
             flags.help = true;
         } else if (std.mem.eql(u8, a, "--no-fetch")) {
             flags.no_fetch = true;
-        } else if (std.mem.eql(u8, a, "--kzig") or std.mem.eql(u8, a, "--module") or std.mem.eql(u8, a, "--bin")) {
+        } else if (std.mem.eql(u8, a, "--kzig") or std.mem.eql(u8, a, "--module") or std.mem.eql(u8, a, "--bin") or std.mem.eql(u8, a, "--port")) {
             i += 1;
             if (i == args.len) return error.MissingValue;
             switch (a[2]) {
                 'k' => flags.kzig = args[i],
                 'm' => flags.module = args[i],
+                'p' => flags.port = args[i],
                 else => flags.bin = args[i],
             }
         } else if (std.mem.startsWith(u8, a, "--")) {
@@ -215,6 +223,16 @@ fn run(cli: Cli, flags: Flags) !void {
         if (p.len != 1) return error.Usage;
         try requireProject(cli);
         return dev.run(cli.io, cli.gpa, cli.arena, cli.environ, cli.out, .{ .bin = flags.bin, .args = flags.rest });
+    }
+    if (std.mem.eql(u8, cmd, "build")) {
+        if (p.len != 1) return error.Usage;
+        try requireProject(cli);
+        return build(cli, flags);
+    }
+    if (std.mem.eql(u8, cmd, "start")) {
+        if (p.len != 1) return error.Usage;
+        try requireProject(cli);
+        return start(cli, flags);
     }
     if (std.mem.eql(u8, cmd, "rm") or std.mem.eql(u8, cmd, "remove")) {
         if (p.len != 3 or !std.mem.eql(u8, p[1], "module")) return error.Usage;
@@ -326,6 +344,33 @@ fn newProject(cli: Cli, flags: Flags, raw: []const u8) !void {
         \\  kzig g module task
         \\
     , .{dir});
+}
+
+/// KickJS's `kick build`: a release build (ReleaseSafe keeps safety checks).
+fn build(cli: Cli, flags: Flags) !void {
+    const argv = try std.mem.concat(cli.arena, []const u8, &.{ &.{ "zig", "build", "-Doptimize=ReleaseSafe" }, flags.rest });
+    var child = try std.process.spawn(cli.io, .{ .argv = argv });
+    if (!(try child.wait(cli.io)).success()) {
+        cli.fail("zig build failed\n", .{});
+        return error.Exists;
+    }
+    cli.print("Built zig-out/bin/. Run it with `kzig start`.\n", .{});
+}
+
+/// KickJS's `kick start`: the built app with NODE_ENV=production. kzig
+/// becomes the app (exec), so a supervisor's signals reach it directly.
+fn start(cli: Cli, flags: Flags) !void {
+    const bin = flags.bin orelse try dev.binName(cli.io, cli.arena, cli.cwd) orelse return error.NoBinary;
+    const exe = try std.fmt.allocPrint(cli.arena, "zig-out/bin/{s}", .{bin});
+    cli.cwd.access(cli.io, exe, .{}) catch {
+        cli.fail("no {s}; run `kzig build` first\n", .{exe});
+        return error.Exists;
+    };
+    var env = try cli.environ.clone(cli.arena);
+    if (env.get("NODE_ENV") == null) try env.put("NODE_ENV", "production");
+    if (flags.port) |port| try env.put("PORT", port);
+    const argv = try std.mem.concat(cli.arena, []const u8, &.{ &.{exe}, flags.rest });
+    return std.process.replace(cli.io, .{ .argv = argv, .environ_map = &env });
 }
 
 /// KickJS asks before deleting a module; `--force` skips it.

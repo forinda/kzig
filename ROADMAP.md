@@ -247,7 +247,7 @@ Follow-ups:
 Follow-ups:
 
 - [x] `kzig dev`: rebuild and restart on change; a failed build keeps the running app
-- [ ] `kzig build` / `start`
+- [x] `kzig build` (ReleaseSafe) / `kzig start` (execs the app, `NODE_ENV=production`)
 - [ ] Generators for DTO-only, guards, tests; `kzig add <feature>` (swagger, http.zig runtime)
 - [ ] Prebuilt `kzig` binaries in releases
 - [x] Errors to stderr; `kzig --help` / `kzig help` exit 0

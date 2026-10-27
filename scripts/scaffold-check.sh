@@ -76,6 +76,18 @@ wait $DEV
 if curl -sf localhost:39811/api/v1/hello >/dev/null 2>&1; then echo "the app outlived kzig dev" >&2; exit 1; fi
 grep -q "restarted" dev.log
 
+step "kzig build and kzig start"
+"$KZIG" build
+"$KZIG" start --port 39812 > start.log 2>&1 &
+START=$!
+waitfor 30 curl -sf localhost:39812/api/v1/hello
+# NODE_ENV=production: Swagger is off.
+if curl -sf localhost:39812/docs >/dev/null; then echo "kzig start isn't production" >&2; exit 1; fi
+# kzig start became the app: its pid takes the signal and drains.
+kill -TERM $START
+wait $START
+grep -q "draining" start.log
+
 step "kzig g module note --minimal"
 "$KZIG" g module note --minimal
 zig build test

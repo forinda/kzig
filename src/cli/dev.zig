@@ -107,7 +107,7 @@ fn exited(pid: std.posix.pid_t) bool {
 
 /// The executable's name from build.zig: the first `addExecutable(.{ .name =
 /// "x"` outside a comment. Null for a computed name (pass --bin).
-fn binName(io: Io, arena: Allocator, cwd: Io.Dir) !?[]const u8 {
+pub fn binName(io: Io, arena: Allocator, cwd: Io.Dir) !?[]const u8 {
     const source = cwd.readFileAlloc(io, "build.zig", arena, .limited(1 << 20)) catch return null;
     var pos: usize = 0;
     while (std.mem.findPos(u8, source, pos, "addExecutable(")) |at| {
