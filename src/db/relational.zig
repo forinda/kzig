@@ -113,7 +113,21 @@ fn SubOpts(comptime W: type, comptime name: []const u8) type {
     return if (F == bool) @TypeOf(.{}) else F;
 }
 
+/// Only `columns` and `with` shape a row: the same shape with or without
+/// `where` is the same type.
 fn RowOf(comptime S: type, comptime tag: []const u8, comptime Opts: type) type {
+    return Shape(S, tag, if (@hasField(Opts, "columns")) @FieldType(Opts, "columns") else void, if (@hasField(Opts, "with")) @FieldType(Opts, "with") else void);
+}
+
+fn ShapeOpts(comptime C: type, comptime W: type) type {
+    if (C == void and W == void) return @TypeOf(.{});
+    if (C == void) return struct { with: W };
+    if (W == void) return struct { columns: C };
+    return struct { columns: C, with: W };
+}
+
+fn Shape(comptime S: type, comptime tag: []const u8, comptime C: type, comptime W0: type) type {
+    const Opts = ShapeOpts(C, W0);
     comptime {
         const T = S.Table(@field(S.Tag, tag));
         const keys = columnKeys(S, tag, Opts);

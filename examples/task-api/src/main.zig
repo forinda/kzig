@@ -61,5 +61,6 @@ test {
     _ = @import("modules/crons/cron.test.zig");
     _ = @import("modules/users/user.test.zig");
     _ = @import("db/schema.test.zig");
+    _ = @import("modules/workspaces/workspace.test.zig");
     // kzig:tests
 }

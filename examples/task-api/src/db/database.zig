@@ -1,3 +1,4 @@
+const std = @import("std");
 const kzig = @import("kzig");
 const Schema = @import("schema.zig").Schema;
 
@@ -36,3 +37,14 @@ pub const Database = struct {
         return .init(.{ .pool = try self.get() });
     }
 };
+
+/// `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`: checked before a query, so a bad id
+/// is no such row (or a 422), not a database error.
+pub fn isUuid(s: []const u8) bool {
+    if (s.len != 36) return false;
+    for (s, 0..) |c, i| {
+        const dash = i == 8 or i == 13 or i == 18 or i == 23;
+        if (if (dash) c != '-' else !std.ascii.isHex(c)) return false;
+    }
+    return true;
+}

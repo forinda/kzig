@@ -10,5 +10,6 @@ pub const modules: []const type = &.{
     @import("modules/chats/chat.module.zig").ChatModule,
     @import("modules/crons/cron.module.zig").CronModule,
     @import("modules/users/user.module.zig").UserModule,
+    @import("modules/workspaces/workspace.module.zig").WorkspaceModule,
     // kzig:modules
 };
