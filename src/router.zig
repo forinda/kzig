@@ -3,6 +3,7 @@
 const std = @import("std");
 const context = @import("context.zig");
 const problem = @import("problem.zig");
+const mw = @import("middleware.zig");
 
 const Ctx = context.Ctx;
 const builtin = @import("builtin");
@@ -13,6 +14,8 @@ pub const Route = struct {
     method: std.http.Method,
     path: []const u8,
     handler: Handler,
+    /// Runs around `handler`, after global middleware.
+    middleware: []const mw.Fn = &.{},
 };
 
 /// A route whose handler returns a value; the value is sent with `Ctx.send`.
@@ -93,7 +96,14 @@ pub fn Router(comptime routes: []const Route) type {
     return struct {
         /// Never fails: every outcome, errors included, becomes a response.
         pub fn handle(_: @This(), ctx: *Ctx) void {
-            dispatch(ctx) catch |err| handleError(ctx, err);
+            handleWith(&.{}, ctx);
+        }
+
+        /// `handle` inside `global` middleware, which runs for every
+        /// request, matched or not (KickJS's `app.use`).
+        pub fn handleWith(comptime global: []const mw.Fn, ctx: *Ctx) void {
+            var next: mw.Next = .{ .ctx = ctx, .chain = global, .final = dispatch };
+            next.run();
             if (!ctx.res.sent) ctx.noContent();
         }
 
@@ -125,7 +135,12 @@ pub fn Router(comptime routes: []const Route) type {
         fn run(ctx: *Ctx, method: std.http.Method, path: Path) !bool {
             inline for (routes) |r| {
                 if (r.method == method and try match(ctx, comptime patternSegments(r.path), path.segments)) {
-                    try r.handler(ctx);
+                    if (r.middleware.len == 0) {
+                        try r.handler(ctx);
+                    } else {
+                        var next: mw.Next = .{ .ctx = ctx, .chain = r.middleware, .final = r.handler };
+                        next.run();
+                    }
                     return true;
                 }
             }
@@ -134,7 +149,7 @@ pub fn Router(comptime routes: []const Route) type {
     };
 }
 
-fn handleError(ctx: *Ctx, err: anyerror) void {
+pub fn handleError(ctx: *Ctx, err: anyerror) void {
     const p: ?problem.Problem = if (err == error.HttpProblem)
         ctx.problem
     else if (problem.statusOf(err)) |s|
@@ -153,7 +168,6 @@ fn handleError(ctx: *Ctx, err: anyerror) void {
 fn internalError(ctx: *Ctx, err: anyerror) void {
     // The test runner fails any test that logs at error level.
     if (!builtin.is_test) std.log.err("{t} {s}: {t}", .{ ctx.req.method, ctx.req.path, err });
-    ctx.res.headers.clearRetainingCapacity();
     ctx.status(.internal_server_error);
     ctx.json(.{
         .message = "Internal Server Error",

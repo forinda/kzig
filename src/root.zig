@@ -6,6 +6,8 @@ const di = @import("di.zig");
 const app = @import("app.zig");
 pub const testing = @import("testing.zig");
 pub const config = @import("config.zig");
+pub const middleware = @import("middleware.zig");
+pub const Next = middleware.Next;
 pub const runtime = struct {
     pub const std = @import("runtime/std.zig");
 };
@@ -34,5 +36,6 @@ test {
     _ = app;
     _ = testing;
     _ = config;
+    _ = middleware;
     _ = runtime.std;
 }

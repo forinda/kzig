@@ -138,9 +138,9 @@ pub const Ctx = struct {
         return error.HttpProblem;
     }
 
-    /// Replaces the response with an RFC 9457 problem body.
+    /// Replaces the body with an RFC 9457 problem. Headers already set stay:
+    /// CORS and security headers from middleware must reach error responses.
     pub fn writeProblem(ctx: *Ctx, p: Problem) !void {
-        ctx.res.headers.clearRetainingCapacity();
         ctx.status(p.status);
         try ctx.writeJson("application/problem+json", .{
             .type = "about:blank",
@@ -323,7 +323,7 @@ test "writeProblem body" {
     try testing.expectEqual(std.http.Status.not_found, f.res.status);
     try testing.expectEqualStrings("{\"type\":\"about:blank\",\"title\":\"Not Found\",\"status\":404}", f.res.body);
     try testing.expectEqualStrings("application/problem+json", f.header("content-type").?);
-    try testing.expectEqual(null, f.header("x-stale"));
+    try testing.expectEqualStrings("1", f.header("x-stale").?);
 
     try f.ctx.writeProblem(.{ .status = .conflict, .detail = "taken" });
     try testing.expectEqualStrings("{\"type\":\"about:blank\",\"title\":\"Conflict\",\"status\":409,\"detail\":\"taken\"}", f.res.body);
