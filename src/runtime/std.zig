@@ -198,6 +198,9 @@ pub fn Server(comptime App: type) type {
             for (res.headers.items) |h| {
                 // std asserts on these; drop the header rather than crash.
                 if (h.name.len == 0 or std.mem.indexOfAny(u8, h.name, ":\r\n") != null or std.mem.indexOfAny(u8, h.value, "\r\n") != null) continue;
+                // std writes the framing itself; a second, different length
+                // would desync the client.
+                if (std.ascii.eqlIgnoreCase(h.name, "content-length") or std.ascii.eqlIgnoreCase(h.name, "transfer-encoding")) continue;
                 out[n] = .{ .name = h.name, .value = h.value };
                 n += 1;
             }
@@ -317,6 +320,13 @@ const TestApp = router.Router(&.{
         fn f(ctx: *Ctx) void {
             ctx.status(.early_hints);
             ctx.res.sent = true;
+        }
+    }.f),
+    router.route(.GET, "/framed", struct {
+        fn f(ctx: *Ctx) ![]const u8 {
+            try ctx.setHeader("content-length", "999");
+            try ctx.setHeader("transfer-encoding", "chunked");
+            return "hi";
         }
     }.f),
     router.route(.DELETE, "/echo", struct {
@@ -519,4 +529,12 @@ test "serves an App with modules" {
     const out = try r.interface.allocRemaining(testing.allocator, .limited(64 * 1024));
     defer testing.allocator.free(out);
     try testing.expect(std.mem.endsWith(u8, out, "{\"message\":\"hi\"}"));
+}
+
+test "framing headers from a handler are not sent" {
+    const out = try roundTrip(.{}, "GET /framed HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n");
+    defer testing.allocator.free(out);
+    try testing.expectEqual(1, std.mem.count(u8, out, "content-length"));
+    try testing.expect(std.mem.indexOf(u8, out, "content-length: 2\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "transfer-encoding") == null);
 }

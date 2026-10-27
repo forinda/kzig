@@ -9,23 +9,26 @@ const Ctx = context.Ctx;
 
 pub const Fn = *const fn (*Ctx, *Next) anyerror!void;
 
+/// One per step: each middleware gets its own `Next`, so a second
+/// `run()` is a no-op and can't skip past a step that stopped the chain.
 pub const Next = struct {
     ctx: *Ctx,
     chain: []const Fn,
     final: *const fn (*Ctx) anyerror!void,
+    /// The step this `Next` runs.
     i: usize = 0,
-    done: bool = false,
+    called: bool = false,
 
     /// Runs the rest of the chain. Never fails: an error becomes the
     /// response here, as KickJS's error handler would write it.
     pub fn run(self: *Next) void {
+        if (self.called) return;
+        self.called = true;
         const ctx = self.ctx;
         if (self.i < self.chain.len) {
-            const f = self.chain[self.i];
-            self.i += 1;
-            f(ctx, self) catch |err| router.handleError(ctx, err);
-        } else if (!self.done) {
-            self.done = true;
+            var rest: Next = .{ .ctx = ctx, .chain = self.chain, .final = self.final, .i = self.i + 1 };
+            self.chain[self.i](ctx, &rest) catch |err| router.handleError(ctx, err);
+        } else {
             self.final(ctx) catch |err| router.handleError(ctx, err);
         }
     }
@@ -72,6 +75,21 @@ const M = struct {
         return error.Conflict;
     }
     fn silent(_: *Ctx, _: *Next) !void {}
+    fn guardStatus(ctx: *Ctx, _: *Next) !void {
+        ctx.status(.forbidden);
+    }
+    fn twice(_: *Ctx, next: *Next) !void {
+        next.run();
+        next.run();
+    }
+    fn unauthorized(ctx: *Ctx, _: *Next) !void {
+        ctx.status(.unauthorized);
+        try ctx.text("no");
+    }
+    fn tail(ctx: *Ctx, next: *Next) !void {
+        try ctx.setHeader("x-tail", "ran");
+        next.run();
+    }
 
     fn hello(ctx: *Ctx) ![]const u8 {
         try trail(ctx, "h");
@@ -90,6 +108,8 @@ fn TestApp(comptime global: []const Fn) type {
             route(router.route(.GET, "/blocked", M.hello), &.{M.block}),
             route(router.route(.GET, "/late", M.hello), &.{M.failAfter}),
             route(router.route(.GET, "/silent", M.hello), &.{M.silent}),
+            route(router.route(.GET, "/guard", M.hello), &.{M.guardStatus}),
+            route(router.route(.GET, "/twice", M.hello), &.{ M.twice, M.unauthorized, M.tail }),
         });
         pub fn handle(_: @This(), ctx: *Ctx) void {
             R.handleWith(global, ctx);
@@ -150,4 +170,18 @@ test "no next and no response is 204" {
     defer a.deinit();
     try testing.expectEqual(std.http.Status.no_content, a.status);
     try testing.expectEqualStrings("", a.body);
+}
+
+test "a status without a body is kept, not turned into 204" {
+    var a = try get(&.{}, "/guard");
+    defer a.deinit();
+    try testing.expectEqual(std.http.Status.forbidden, a.status);
+}
+
+test "calling next.run twice can't get past a guard" {
+    var a = try get(&.{}, "/twice");
+    defer a.deinit();
+    try testing.expectEqual(std.http.Status.unauthorized, a.status);
+    try testing.expectEqualStrings("no", a.body);
+    try testing.expectEqual(null, a.header("x-tail"));
 }

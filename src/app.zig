@@ -244,7 +244,11 @@ fn thunk(comptime AppT: type, comptime C: type, comptime name: []const u8, compt
             var store: P.Store = .{};
             ctx.values = &store;
             defer ctx.values = null;
-            inline for (P.early_order) |K| try contributor.run(K, app.get(K), ctx, &store);
+            inline for (P.early_order) |K| {
+                try contributor.run(K, app.get(K), ctx, &store);
+                // A contributor that answered ends the request, as in KickJS.
+                if (ctx.res.sent) return;
+            }
             if (chain.len == 0) return late(ctx);
             var next: mw.Next = .{ .ctx = ctx, .chain = chain, .final = late };
             next.run();
@@ -253,7 +257,10 @@ fn thunk(comptime AppT: type, comptime C: type, comptime name: []const u8, compt
         fn late(ctx: *Ctx) anyerror!void {
             const app = appOf(AppT, ctx);
             const store: *P.Store = @ptrCast(@alignCast(ctx.values.?));
-            inline for (P.late_order) |K| try contributor.run(K, app.get(K), ctx, store);
+            inline for (P.late_order) |K| {
+                try contributor.run(K, app.get(K), ctx, store);
+                if (ctx.res.sent) return;
+            }
             const h = @field(C, name);
             const result = if (comptime contributor.GotOf(h)) |G|
                 h(app.get(C), ctx, contributor.fill(G, store.*))
@@ -441,14 +448,15 @@ const Mw = struct {
     }
 };
 
-const Counter = struct { hits: u32 = 0 };
+// Services are shared by concurrent requests: shared state needs atomics or a lock.
+const Counter = struct { hits: std.atomic.Value(u32) = .init(0) };
 
 /// Struct middleware: a service with DI fields.
 const CountHits = struct {
     counter: *Counter,
     pub fn handle(self: *CountHits, ctx: *Ctx, next: *kzig_mw.Next) !void {
-        self.counter.hits += 1;
-        try ctx.setHeader("x-hits", try std.fmt.allocPrint(ctx.arena, "{d}", .{self.counter.hits}));
+        const n = self.counter.hits.fetchAdd(1, .monotonic) + 1;
+        try ctx.setHeader("x-hits", try std.fmt.allocPrint(ctx.arena, "{d}", .{n}));
         next.run();
     }
 };
@@ -492,7 +500,7 @@ test "struct middleware gets its service" {
         var a = try testing_rt.request(testing.allocator, &app, .{ .target = "/api/v1/mw" });
         a.deinit();
     }
-    try testing.expectEqual(2, app.get(Counter).hits);
+    try testing.expectEqual(2, app.get(Counter).hits.load(.monotonic));
 }
 
 const Tenant = struct { id: []const u8, name: []const u8 };
@@ -553,6 +561,23 @@ const Trail = struct {
     }
 };
 
+const Deny = struct {
+    pub const key = "deny";
+    pub fn resolve(_: *Deny, ctx: *Ctx) !void {
+        ctx.status(.forbidden);
+        try ctx.text("denied");
+    }
+};
+
+const DenyEarly = struct {
+    pub const key = "deny_early";
+    pub const before_validation = true;
+    pub fn resolve(_: *DenyEarly, ctx: *Ctx) !void {
+        ctx.status(.forbidden);
+        try ctx.text("denied early");
+    }
+};
+
 const ContribController = struct {
     pub const contributors = .{ LoadTenant, Label("controller") };
     pub const routes = .{
@@ -561,6 +586,8 @@ const ContribController = struct {
         .{ .method = .GET, .path = "/levels", .handler = "levels" },
         .{ .method = .GET, .path = "/flag", .handler = "flag", .contributors = .{LoadFlag} },
         .{ .method = .GET, .path = "/order", .handler = "order", .contributors = .{Trail}, .middleware = .{Mw.route} },
+        .{ .method = .GET, .path = "/deny", .handler = "order", .contributors = .{Deny} },
+        .{ .method = .GET, .path = "/deny-early", .handler = "order", .contributors = .{DenyEarly}, .middleware = .{Mw.route} },
     };
     pub fn project(_: *ContribController, _: *Ctx, got: struct { project: []const u8 }) []const u8 {
         return got.project;
@@ -646,4 +673,15 @@ test "contributors run after route middleware" {
     var a = try contribGet("/api/v1/c/order", acme);
     defer a.deinit();
     try testing.expectEqualStrings("r,k,h", a.header("x-trail").?);
+}
+
+test "a contributor that responds skips the handler" {
+    var a = try contribGet("/api/v1/c/deny", acme);
+    defer a.deinit();
+    try testing.expectEqual(std.http.Status.forbidden, a.status);
+    try testing.expectEqualStrings("denied", a.body);
+    var b = try contribGet("/api/v1/c/deny-early", acme);
+    defer b.deinit();
+    try testing.expectEqualStrings("denied early", b.body);
+    try testing.expectEqual(null, b.header("x-trail"));
 }

@@ -118,13 +118,21 @@ pub const Ctx = struct {
         ctx.res.sent = true;
     }
 
+    /// Marks the response done. Nothing written and no status set → 204; a
+    /// status set without a body (a guard's `ctx.status(.forbidden)`) stays.
+    pub fn finish(ctx: *Ctx) void {
+        if (ctx.res.sent) return;
+        if (ctx.res.status == .ok) return ctx.noContent();
+        ctx.res.sent = true;
+    }
+
     /// Sends a handler's return value: `void` → 204 unless already sent,
     /// strings → text, `std.http.Status` → that status, a type with
     /// `sendResponse` sends itself, anything else → JSON.
     pub fn send(ctx: *Ctx, value: anytype) !void {
         const T = @TypeOf(value);
         if (T == void) {
-            if (!ctx.res.sent) ctx.noContent();
+            ctx.finish();
         } else if (T == std.http.Status) {
             ctx.status(value);
             ctx.res.sent = true;
@@ -147,6 +155,7 @@ pub const Ctx = struct {
     /// Replaces the body with an RFC 9457 problem. Headers already set stay:
     /// CORS and security headers from middleware must reach error responses.
     pub fn writeProblem(ctx: *Ctx, p: Problem) !void {
+        ctx.dropRepresentationHeaders();
         ctx.status(p.status);
         try ctx.writeJson("application/problem+json", .{
             .type = "about:blank",
@@ -154,6 +163,22 @@ pub const Ctx = struct {
             .status = @backingInt(p.status),
             .detail = p.detail,
         });
+    }
+
+    pub fn removeHeader(ctx: *Ctx, name: []const u8) void {
+        var i: usize = 0;
+        while (i < ctx.res.headers.items.len) {
+            if (std.ascii.eqlIgnoreCase(ctx.res.headers.items[i].name, name)) {
+                _ = ctx.res.headers.orderedRemove(i);
+            } else i += 1;
+        }
+    }
+
+    /// Headers describing the body a handler meant to send; wrong for the
+    /// error body replacing it (a gzip-encoded or cacheable problem).
+    pub fn dropRepresentationHeaders(ctx: *Ctx) void {
+        for ([_][]const u8{ "content-length", "content-encoding", "content-disposition", "content-range", "etag", "last-modified", "cache-control" }) |h|
+            ctx.removeHeader(h);
     }
 
     fn writeJson(ctx: *Ctx, content_type: []const u8, value: anytype) !void {
@@ -366,4 +391,27 @@ test "query with invalid UTF-8 is BadRequest" {
     f.init(.{ .method = .GET, .path = "/", .query = "x=%FF", .headers = &.{}, .body = "" });
     defer f.deinit();
     try testing.expectError(error.BadRequest, f.ctx.query("x"));
+}
+
+test "send void keeps a status set earlier" {
+    var f: Fixture = undefined;
+    f.init(get_root);
+    defer f.deinit();
+    f.ctx.status(.created);
+    try f.ctx.send({});
+    try testing.expectEqual(std.http.Status.created, f.res.status);
+    try testing.expect(f.res.sent);
+}
+
+test "a problem drops representation headers" {
+    var f: Fixture = undefined;
+    f.init(get_root);
+    defer f.deinit();
+    for ([_][]const u8{ "content-encoding", "content-disposition", "content-length", "etag", "cache-control", "content-range", "last-modified" }) |h|
+        try f.ctx.setHeader(h, "x");
+    try f.ctx.setHeader("access-control-allow-origin", "*");
+    try f.ctx.writeProblem(.{ .status = .conflict });
+    for ([_][]const u8{ "content-encoding", "content-disposition", "content-length", "etag", "cache-control", "content-range", "last-modified" }) |h|
+        try testing.expectEqual(null, f.header(h));
+    try testing.expectEqualStrings("*", f.header("access-control-allow-origin").?);
 }

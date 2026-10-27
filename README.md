@@ -130,8 +130,12 @@ Middleware is `fn (ctx: *kzig.Ctx, next: *kzig.Next) !void` (or a service struct
 `handle`), registered on the App, a controller (`pub const middleware`) or a route
 (`.middleware`). Code after `next.run()` sees the final response, errors included. Contributors
 register on the App, a module, a controller or a route; the more specific one wins for a key.
-On a matched route the order is: controller and route middleware, then contributors, then the
-handler.
+On a matched route the order is: `before_validation` contributors, then controller and route
+middleware around the other contributors and the handler. A contributor or middleware that
+answers (or sets a status and returns) ends the request there.
+
+Services, middleware and contributors are app-wide singletons shared by concurrent requests:
+keep per-request data on `ctx`, and guard shared state with atomics or a lock.
 
 ## Testing
 

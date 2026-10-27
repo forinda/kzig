@@ -119,6 +119,9 @@ Follow-ups:
 
 - [ ] Contributor `skipWhen` / `onlyWhen` route flags and `onError` replacement values
 - [ ] Contributor params (`LoadAuthUser({ on401: 'allow' })`)
+- [ ] Clear compile errors for middleware with the wrong signature and a non-struct `got`
+- [ ] `requestId` reuses an id set earlier in the chain; works without `ctx.io`
+- [ ] Decide whether global contributors apply to `/health/*`
 
 ### M4 — Validation and bodies
 

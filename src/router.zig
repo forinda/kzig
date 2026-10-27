@@ -104,7 +104,7 @@ pub fn Router(comptime routes: []const Route) type {
         pub fn handleWith(comptime global: []const mw.Fn, ctx: *Ctx) void {
             var next: mw.Next = .{ .ctx = ctx, .chain = global, .final = dispatch };
             next.run();
-            if (!ctx.res.sent) ctx.noContent();
+            ctx.finish();
         }
 
         fn dispatch(ctx: *Ctx) !void {
@@ -168,6 +168,7 @@ pub fn handleError(ctx: *Ctx, err: anyerror) void {
 fn internalError(ctx: *Ctx, err: anyerror) void {
     // The test runner fails any test that logs at error level.
     if (!builtin.is_test) std.log.err("{t} {s}: {t}", .{ ctx.req.method, ctx.req.path, err });
+    ctx.dropRepresentationHeaders();
     ctx.status(.internal_server_error);
     ctx.json(.{
         .message = "Internal Server Error",
