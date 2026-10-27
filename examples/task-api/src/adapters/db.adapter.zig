@@ -5,6 +5,10 @@ const database = @import("../db/database.zig");
 /// migrations are applied on boot in development and test, and anywhere
 /// else a pending one stops the boot. `postgres` on `/health/ready`.
 pub const DbAdapter = struct {
+    /// What `kzig db generate --db postgres` writes migrations for.
+    pub const db_name = "postgres";
+    pub const db_schema = @import("../db/schema.zig").Schema;
+
     database: *database.Database,
     settings: *const database.DbSettings,
     process: *const kzig.Process,

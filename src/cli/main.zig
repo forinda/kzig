@@ -47,8 +47,8 @@ const usage =
     \\      Runs the built app (NODE_ENV=production unless set); --port sets PORT.
     \\
     \\  kzig db new <name> | migrate | rollback | status [--dir db/migrations]
-    \\  kzig db generate [name] [--empty] [--rename-table old=new] [--rename-column table.old=new] [--exe zig-out/bin/app]
-    \\  kzig db check [--exe zig-out/bin/app]          fail when the schema has changes no migration holds
+    \\  kzig db generate [name] [--db name] [--empty] [--rename-table old=new] [--rename-column table.old=new] [--exe zig-out/bin/app]
+    \\  kzig db check [--db name] [--exe zig-out/bin/app]   fail when the schema has changes no migration holds
     \\      Migrations in kick/db's layout; migrate/rollback/status use DATABASE_URL.
     \\
     \\  kzig rm module <name> [--force]
@@ -146,6 +146,7 @@ const Flags = struct {
     port: ?[]const u8 = null,
     dir: ?[]const u8 = null,
     exe: ?[]const u8 = null,
+    db: ?[]const u8 = null,
     empty: bool = false,
     rename_tables: []const []const u8 = &.{},
     rename_columns: []const []const u8 = &.{},
@@ -174,10 +175,10 @@ fn parse(arena: Allocator, args: []const [:0]const u8) !Flags {
             flags.no_fetch = true;
         } else if (std.mem.eql(u8, a, "--empty")) {
             flags.empty = true;
-        } else if (std.mem.eql(u8, a, "--exe") or std.mem.eql(u8, a, "--rename-table") or std.mem.eql(u8, a, "--rename-column")) {
+        } else if (std.mem.eql(u8, a, "--exe") or std.mem.eql(u8, a, "--db") or std.mem.eql(u8, a, "--rename-table") or std.mem.eql(u8, a, "--rename-column")) {
             i += 1;
             if (i == args.len) return error.MissingValue;
-            if (a[2] == 'e') flags.exe = args[i] else if (std.mem.eql(u8, a, "--rename-table")) try rename_tables.append(arena, args[i]) else try rename_columns.append(arena, args[i]);
+            if (std.mem.eql(u8, a, "--db")) flags.db = args[i] else if (a[2] == 'e') flags.exe = args[i] else if (std.mem.eql(u8, a, "--rename-table")) try rename_tables.append(arena, args[i]) else try rename_columns.append(arena, args[i]);
         } else if (std.mem.eql(u8, a, "--kzig") or std.mem.eql(u8, a, "--module") or std.mem.eql(u8, a, "--bin") or std.mem.eql(u8, a, "--port") or std.mem.eql(u8, a, "--dir")) {
             i += 1;
             if (i == args.len) return error.MissingValue;
@@ -260,6 +261,7 @@ fn run(cli: Cli, flags: Flags) !void {
         return db_cli.run(cli.io, cli.gpa, cli.arena, cli.environ, .{ .out = cli.out, .err = cli.err }, p[1..], .{
             .dir = flags.dir orelse "db/migrations",
             .exe = flags.exe,
+            .db = flags.db,
             .empty = flags.empty,
             .rename_tables = flags.rename_tables,
             .rename_columns = flags.rename_columns,

@@ -127,6 +127,7 @@ const compile_errors = [_][2][]const u8{
     .{ "db_compare_column_types", "people.role and people.name: compares role with []const u8" },
     .{ "db_index_option", "t.indexes.n: no option .uniqe" },
     .{ "db_constraint_key", "t: no constraint kind .check (indexes, checks, primary_key)" },
+    .{ "db_schema_duplicate_name", "two adapters bring a schema named \"main\"" },
     .{ "db_enum_default", "t.r: default \"zzz\" is not a value of role" },
     .{ "unknown_module_option", "Module has no option .paths" },
     .{ "module_path_without_slash", "M: module path must be empty or start with '/'" },

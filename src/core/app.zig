@@ -99,7 +99,7 @@ pub fn Plugin(comptime spec: anytype) type {
 /// `.default_version = 1`, `.health = true` (mounts `/health/live` and
 /// `/health/ready`).
 pub fn App(comptime spec: anytype) type {
-    checkFields(spec, &.{ "modules", "config", "api_prefix", "default_version", "health", "middleware", "contributors", "settings", "adapters", "plugins", "ws", "schema" }, "App");
+    checkFields(spec, &.{ "modules", "config", "api_prefix", "default_version", "health", "middleware", "contributors", "settings", "adapters", "plugins", "ws" }, "App");
     const plugins: []const type = opt(spec, "plugins", @as([]const type, &.{}));
     comptime var plugin_modules: []const type = &.{};
     comptime var plugin_adapters: []const type = &.{};
@@ -179,14 +179,23 @@ pub fn App(comptime spec: anytype) type {
         /// Each gateway's full path; runtimes upgrade requests to these.
         pub const ws_paths: []const []const u8 = ws.paths(gateways, ws_opts);
         pub const ws_options: ws.Options = ws_opts;
-        /// The `kzig.db.Schema` that `kzig db generate` writes migrations for.
-        pub const schema: ?type = if (@hasField(@TypeOf(spec), "schema")) spec.schema else null;
+        /// Each database adapter's schema (`pub const db_schema`, named by
+        /// `pub const db_name`): what `kzig db generate --db <name>` writes
+        /// migrations for. Databases without migrations declare none.
+        pub const schemas: []const DbSchema = dbSchemas(adapters);
 
-        /// The schema's snapshot.json text, as kick/db writes it; owned by `gpa`.
-        pub fn snapshotJson(gpa: std.mem.Allocator) ![]const u8 {
+        /// The named database's snapshot.json text, as kick/db writes it;
+        /// owned by `gpa`. Without a name, the only one there is.
+        pub fn snapshotJson(gpa: std.mem.Allocator, name: ?[]const u8) ![]const u8 {
+            if (schemas.len == 0) return error.NoSchema;
+            if (name == null and schemas.len > 1) return error.WhichDatabase;
             var arena: std.heap.ArenaAllocator = .init(gpa);
             defer arena.deinit();
-            return gpa.dupe(u8, try db_snapshot.toJson(arena.allocator(), db_snapshot.fromSchema(schema.?)));
+            inline for (schemas) |d| {
+                if (name == null or std.mem.eql(u8, name.?, d.name))
+                    return gpa.dupe(u8, try db_snapshot.toJson(arena.allocator(), db_snapshot.fromSchema(d.schema)));
+            }
+            return error.NoSuchDatabase;
         }
         const cron_infos = cron.infosOf(cron_defs);
         const cron_exprs = cron.exprsOf(cron_defs);
@@ -211,11 +220,19 @@ pub fn App(comptime spec: anytype) type {
             if (@typeInfo(@TypeOf(overrides)).@"struct".field_names.len > 0 and !builtin.is_test)
                 @compileError("App overrides are only allowed in tests");
             // `kzig db generate` runs the app for its schema: print it, stop.
-            if (!builtin.is_test) if (env.get("KZIG_DB_SNAPSHOT") != null) {
-                // No schema: say so and stop, rather than start serving.
-                if (comptime schema == null) std.process.exit(3);
-                const json = try snapshotJson(gpa);
+            // `kzig db generate` runs the app for a schema: print it and stop,
+            // or say why not; never start serving.
+            if (!builtin.is_test) if (env.get("KZIG_DB_SNAPSHOT")) |which| {
                 var buf: [4096]u8 = undefined;
+                const named = if (which.len == 0 or std.mem.eql(u8, which, "1")) null else which;
+                const json = snapshotJson(gpa, named) catch |err| {
+                    var errw: std.Io.File.Writer = .init(.stderr(), io, &buf);
+                    errw.interface.print("{t}; databases with a schema:", .{err}) catch {};
+                    inline for (schemas) |d| errw.interface.print(" {s}", .{d.name}) catch {};
+                    errw.interface.writeAll("\n") catch {};
+                    errw.interface.flush() catch {};
+                    std.process.exit(3);
+                };
                 var out: std.Io.File.Writer = .init(.stdout(), io, &buf);
                 try out.interface.writeAll(json);
                 try out.interface.flush();
@@ -719,6 +736,20 @@ fn opt(comptime spec: anytype, comptime name: []const u8, comptime default: anyt
     return if (@hasField(@TypeOf(spec), name)) @field(spec, name) else default;
 }
 
+pub const DbSchema = struct { name: []const u8, schema: type };
+
+fn dbSchemas(comptime adapters: []const type) []const DbSchema {
+    comptime {
+        var out: []const DbSchema = &.{};
+        for (adapters) |A| if (@hasDecl(A, "db_schema")) {
+            const name: []const u8 = if (@hasDecl(A, "db_name")) A.db_name else @compileError(@typeName(A) ++ ": an adapter with db_schema needs `pub const db_name`");
+            for (out) |d| if (std.mem.eql(u8, d.name, name)) @compileError("two adapters bring a schema named \"" ++ name ++ "\"");
+            out = out ++ [_]DbSchema{.{ .name = name, .schema = A.db_schema }};
+        };
+        return out;
+    }
+}
+
 /// A misspelt spec field would otherwise be ignored silently.
 fn checkFields(comptime spec: anytype, comptime allowed: []const []const u8, comptime what: []const u8) void {
     for (@typeInfo(@TypeOf(spec)).@"struct".field_names) |f| {
@@ -784,13 +815,38 @@ fn boot(app: *TestApp, pairs: []const [2][]const u8) !void {
     try app.init(testing.io, testing.allocator, &env);
 }
 
-test "an App with a schema gives kzig db generate its snapshot" {
-    const db_schema = @import("../db/schema.zig");
-    const t = db_schema.table("notes", .{ .id = .{ .type = .serial, .primary_key = true } }, .{});
-    const A = App(.{ .modules = &.{}, .schema = db_schema.Schema(.{ .notes = t }, .{}) });
-    const json = try A.snapshotJson(testing.allocator);
-    defer testing.allocator.free(json);
-    try testing.expect(std.mem.startsWith(u8, json, "{\n  \"version\": 1,\n  \"dialect\": \"postgres\",\n  \"tables\": {\n    \"notes\""));
+test "database adapters bring their schemas; kzig db generate picks one by name" {
+    const dbs = @import("../db/schema.zig");
+    const notes = dbs.table("notes", .{ .id = .{ .type = .serial, .primary_key = true } }, .{});
+    const events = dbs.table("events", .{ .id = .{ .type = .bigserial, .primary_key = true } }, .{});
+    const Pg = struct {
+        pub const db_name = "postgres";
+        pub const db_schema = dbs.Schema(.{ .notes = notes }, .{});
+    };
+    const Analytics = struct {
+        pub const db_name = "analytics";
+        pub const db_schema = dbs.Schema(.{ .events = events }, .{});
+    };
+    // A database without migrations (Mongo, Redis) declares no schema.
+    const Mongo = struct {};
+    const A = App(.{ .modules = &.{}, .adapters = &.{ Pg, Analytics, Mongo } });
+    try testing.expectEqual(2, A.schemas.len);
+    const pg = try A.snapshotJson(testing.allocator, "postgres");
+    defer testing.allocator.free(pg);
+    try testing.expect(std.mem.find(u8, pg, "\"notes\"") != null and std.mem.find(u8, pg, "\"events\"") == null);
+    const an = try A.snapshotJson(testing.allocator, "analytics");
+    defer testing.allocator.free(an);
+    try testing.expect(std.mem.find(u8, an, "\"events\"") != null);
+    // Two databases: the name is required; an unknown one is refused.
+    try testing.expectError(error.WhichDatabase, A.snapshotJson(testing.allocator, null));
+    try testing.expectError(error.NoSuchDatabase, A.snapshotJson(testing.allocator, "nope"));
+    // One database: no name needed.
+    const B = App(.{ .modules = &.{}, .adapters = &.{ Pg, Mongo } });
+    const only = try B.snapshotJson(testing.allocator, null);
+    defer testing.allocator.free(only);
+    try testing.expect(std.mem.find(u8, only, "\"notes\"") != null);
+    const C = App(.{ .modules = &.{}, .adapters = &.{Mongo} });
+    try testing.expectError(error.NoSchema, C.snapshotJson(testing.allocator, null));
 }
 
 test "mounts under /api/v1 + module path" {

@@ -30,12 +30,16 @@ pub const Opts = struct {
     /// The built app to read the schema from; `zig build` and build.zig's
     /// executable when null.
     exe: ?[]const u8 = null,
+    /// Which database adapter's schema (`db_name`); needed when there are several.
+    db: ?[]const u8 = null,
     empty: bool = false,
     rename_tables: []const []const u8 = &.{},
     rename_columns: []const []const u8 = &.{},
     /// Ask about drops that could be renames (a terminal on stdin).
     stdin: ?*Io.Reader = null,
     version: []const u8 = "dev",
+    /// How long the app may take to print its schema.
+    answer_s: i64 = 60,
 };
 
 pub fn run(io: Io, gpa: Allocator, a: Allocator, environ: *const std.process.Environ.Map, o: Out, args: []const []const u8, opts: Opts) !void {
@@ -88,13 +92,21 @@ fn appSnapshot(io: Io, gpa: Allocator, a: Allocator, environ: *const std.process
         break :blk try a.print("zig-out/bin/{s}", .{bin});
     };
     var env = try environ.clone(a);
-    try env.put("KZIG_DB_SNAPSHOT", "1");
-    const result = std.process.run(gpa, io, .{ .argv = &.{exe}, .environ_map = &env }) catch |err|
-        return o.fail("{s}: {t}\n", .{ exe, err });
+    try env.put("KZIG_DB_SNAPSHOT", opts.db orelse "1");
+    // An app built against a kzig that doesn't know the variable would start
+    // serving instead of answering.
+    const result = std.process.run(gpa, io, .{
+        .argv = &.{exe},
+        .environ_map = &env,
+        .timeout = .{ .deadline = .fromNow(io, .{ .raw = .fromSeconds(opts.answer_s), .clock = .awake }) },
+    }) catch |err| switch (err) {
+        error.Timeout => return o.fail("{s} didn't print its schema within {d} s (built against an older kzig?)\n", .{ exe, opts.answer_s }),
+        else => return o.fail("{s}: {t}\n", .{ exe, err }),
+    };
     defer gpa.free(result.stderr);
     if (!result.term.success() or !std.mem.startsWith(u8, result.stdout, "{")) {
         gpa.free(result.stdout);
-        return o.fail("{s} printed no schema: add `.schema = Schema` to its App(.{{ … }})\n{s}", .{ exe, result.stderr });
+        return o.fail("{s} printed no schema: {s}A database adapter brings one with `pub const db_name` and `pub const db_schema`; pick it with --db <name>.\n", .{ exe, result.stderr });
     }
     const text = try a.dupe(u8, result.stdout);
     gpa.free(result.stdout);
@@ -276,4 +288,23 @@ test "rename prompt: a number picks, Enter or end of input drops" {
     var none: Io.Reader = .fixed("");
     const dropped = try askRenames(a, &none, .{ .out = &out, .err = &err }, prev, next);
     try testing.expectEqual(0, dropped.tables.len);
+}
+
+test "an app that never answers doesn't hang kzig db check" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "serve.sh", .data = "#!/bin/sh\nexec sleep 30\n", .flags = .{ .permissions = .executable_file } });
+    const exe = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/serve.sh", .{tmp.sub_path});
+    var out_buf: [512]u8 = undefined;
+    var out: Io.Writer = .fixed(&out_buf);
+    var err_buf: [512]u8 = undefined;
+    var err: Io.Writer = .fixed(&err_buf);
+    var env = try testing.environ.createMap(a);
+    _ = &env;
+    try testing.expectError(error.Reported, run(testing.io, testing.allocator, a, &env, .{ .out = &out, .err = &err }, &.{"check"}, .{ .exe = exe, .answer_s = 1 }));
+    try testing.expect(std.mem.find(u8, err.buffered(), "didn't print its schema within 1 s") != null);
 }

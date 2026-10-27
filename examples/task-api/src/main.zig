@@ -21,8 +21,6 @@ pub const App = kzig.App(.{
     })},
     // ws://…/ws/<gateway path>; pings every 30 s.
     .ws = .{ .heartbeat_ms = 30_000 },
-    // task-kickdb-api's tables: `kzig db generate` writes migrations from them.
-    .schema = @import("db/schema.zig").Schema,
     .adapters = &.{
         MailAdapter("transactional", mail.TransactionalMail),
         MailAdapter("marketing", mail.MarketingMail),
