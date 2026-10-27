@@ -5,9 +5,10 @@ middleware, context contributors and adapters, with KickJS's boot order and requ
 built on `comptime` instead of decorators, so a missing service or an unknown handler fails
 `zig build`, not the first request.
 
-> **Status: pre-alpha.** Modules, compile-time DI, env config, the router, problem bodies, an
-> HTTP server on `std.http` and an in-process test runtime work (M1–M2). Middleware and context
-> contributors (M3) are next. APIs will change. See the [roadmap](./ROADMAP.md).
+> **Status: pre-alpha.** Modules, compile-time DI, env config, middleware, context contributors,
+> the router, problem bodies, an HTTP server on `std.http` and an in-process test runtime work
+> (M1–M3). Validation and request bodies (M4) are next. APIs will change. See the
+> [roadmap](./ROADMAP.md).
 
 Requires **Zig 0.17.0**. No dependencies.
 
@@ -90,6 +91,48 @@ These fail `zig build`, not the first request: a service field pointing at an un
 dependency cycle, a route naming a missing handler, two routes with the same method and path,
 a misspelt `Module`/`App` option.
 
+## Middleware and contributors
+
+From [`multi-tenant-api`](./examples/multi-tenant-api), the in-memory port of KickJS's
+multi-tenant example:
+
+```zig
+pub const App = kzig.App(.{
+    .modules = modules,
+    .config = Config,
+    .middleware = .{ // global: runs for every request, matched or not
+        kzig.middleware.requestId(),
+        kzig.middleware.requestLogger(.{ .skip = &.{"/health"} }),
+        kzig.middleware.helmet(.{}),
+    },
+});
+
+/// A context contributor: a service with a `key` and a `resolve`.
+pub const LoadTenant = struct {
+    pub const key = "tenant";
+    repo: *TenantRepository,
+
+    // Reading `user` makes LoadAuthUser run first; no `dependsOn` list.
+    pub fn resolve(self: *LoadTenant, ctx: *kzig.Ctx, got: struct { user: AuthUser }) !Tenant { … }
+};
+
+pub const ProjectController = struct {
+    projects: *ProjectRepository,
+    pub const contributors = .{ LoadTenant, LoadAuthUser };
+    pub const routes = .{.{ .method = .GET, .path = "/", .handler = "list" }};
+
+    // `got.tenant` is typed; drop LoadTenant above and this doesn't compile.
+    pub fn list(self: *ProjectController, ctx: *kzig.Ctx, got: struct { tenant: Tenant }) !Projects { … }
+};
+```
+
+Middleware is `fn (ctx: *kzig.Ctx, next: *kzig.Next) !void` (or a service struct with that
+`handle`), registered on the App, a controller (`pub const middleware`) or a route
+(`.middleware`). Code after `next.run()` sees the final response, errors included. Contributors
+register on the App, a module, a controller or a route; the more specific one wins for a key.
+On a matched route the order is: controller and route middleware, then contributors, then the
+handler.
+
 ## Testing
 
 `kzig.testing.request` runs the full pipeline in-process, no socket:
@@ -150,6 +193,10 @@ UTF-8 and malformed escapes answer 400. A request with both `content-length` and
 | `loadEnv(zodSchema)` / `@Value('PORT')` | a `Config` struct; inject `*const Config` |
 | `@PostConstruct` / `@PreDestroy` | `pub fn init(self: *S) !void` / `pub fn deinit(self: *S) void` |
 | `throw new HttpException(422, …)` | `return ctx.fail(.unprocessable_entity, …)` |
+| `defineContextDecorator({ key, deps, resolve })` | a struct with `key`, DI fields and `resolve` |
+| `ctx.get('tenant')` | a `got: struct { tenant: Tenant }` handler parameter |
+| `@Middleware(fn)` / `bootstrap({ middlewares })` | `.middleware = .{fn}` on a route, controller or App |
+| `requestId()`, `requestLogger()`, `cors()`, `helmet()` | `kzig.middleware.requestId()`, … |
 | `createTestApp` + supertest | `app.init` / `initWith` + `kzig.testing.request` |
 
 The full list of deliberate differences is in the [roadmap](./ROADMAP.md).

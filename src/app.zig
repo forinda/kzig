@@ -207,7 +207,12 @@ fn mwFn(comptime AppT: type, comptime e: anytype, comptime where: []const u8) mw
             }
         }.call;
     }
-    if (@typeInfo(@TypeOf(e)) != .@"fn") @compileError(bad);
+    const is_fn = switch (@typeInfo(@TypeOf(e))) {
+        .@"fn" => true,
+        .pointer => |p| @typeInfo(p.child) == .@"fn",
+        else => false,
+    };
+    if (!is_fn) @compileError(bad);
     return struct {
         fn call(ctx: *Ctx, next: *mw.Next) anyerror!void {
             return e(ctx, next);

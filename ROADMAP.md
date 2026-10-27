@@ -17,7 +17,8 @@ Engines come in this order: the standard library (`std.http.Server` on `std.Io`)
   (method > class > module > adapter > global), `/api/v1` mounting, RFC 9457 problem bodies.
   A KickJS user should recognise every file.
 - **Compile errors over boot errors.** A missing service, an unknown handler, a contributor cycle
-  or a `ctx.get` of a value no contributor sets fails `zig build`, not the first request.
+  or a handler reading a value no contributor on its route sets fails `zig build`, not the first
+  request.
 - **Explicit over global.** Modules are listed, not discovered by import side effects. No global
   container, no `Container.reset()`.
 - **Engine-neutral.** User code talks to `Ctx`, never to the engine. Every runtime runs the same
@@ -32,7 +33,8 @@ Engines come in this order: the standard library (`std.http.Server` on `std.Io`)
 | Decorators + `reflect-metadata` | `pub const routes = .{ … }` tuples, `@typeInfo` | Zig has no decorators; comptime does the same work earlier |
 | Global container, import-time registration | Modules listed in `App(.{ .modules })`, wired at comptime | Removes "No provider for X" and test resets |
 | DI cycles found at resolve time | Found at compile time | `container.bootstrap()` is a no-op in KickJS |
-| `ctx.get('key')` untyped, fails open | Route context type built from its contributors | A dropped contributor is a compile error |
+| `ctx.get('key')` untyped, fails open | `got: struct { tenant: Tenant }` handler parameter, checked against the route's contributors | A dropped contributor is a compile error |
+| `dependsOn: ['user']` | read `user` in `resolve`'s `got` parameter | The dependency and its type are one declaration |
 | `AsyncLocalStorage` request store | `*Ctx` passed explicitly, request arena | No hidden state |
 | `throw new HttpException(422, details)` | `return ctx.fail(.unprocessable_entity, details)` | Zig errors carry no payload; details live on `ctx` |
 | Adapter `shutdown` run concurrently | Run in reverse mount order | A DB adapter must outlive the adapters that use it |
@@ -103,15 +105,20 @@ Follow-ups:
 
 ### M3 — Middleware and contributors
 
-- [ ] Middleware `fn (*Ctx, *Next) !void` with `next.run()`, so it can wrap the handler
-- [ ] Global phases in KickJS order: `beforeGlobal`, global, `afterGlobal`, `beforeRoutes`,
-      `afterRoutes`; module, controller and route middleware
-- [ ] Contributors: `key`, `depends_on`, `before_validation`, `optional`, DI deps; precedence and
-      comptime topo sort
-- [ ] Typed `ctx.get(.key)` per route
-- [ ] Built-ins: `requestId`, `requestLogger`, `cors`, `helmet`
-- [ ] **Acceptance:** a tenant contributor port of `multi-tenant-kickdb-api`'s request flow
-      (in memory, no DB)
+- [x] Middleware `fn (*Ctx, *Next) !void` with `next.run()`, so it can wrap the handler; a
+      service struct with `handle` gets DI
+- [x] Global (App), controller and route middleware; global runs for unmatched requests too
+- [x] Contributors: `key`, `before_validation`, `optional`, DI deps; dependencies read through
+      `got`; precedence (method > controller > module > global) and comptime topo sort
+- [x] Typed contributor values per route via the handler's `got` parameter
+- [x] Built-ins: `requestId`, `requestLogger`, `cors`, `helmet`
+- [x] **Acceptance:** `examples/multi-tenant-api` — `multi-tenant-kickdb-api`'s auth → tenant →
+      handler flow, in memory
+
+Follow-ups:
+
+- [ ] Contributor `skipWhen` / `onlyWhen` route flags and `onError` replacement values
+- [ ] Contributor params (`LoadAuthUser({ on401: 'allow' })`)
 
 ### M4 — Validation and bodies
 
@@ -123,6 +130,8 @@ Follow-ups:
 
 ### M5 — Lifecycle
 
+- [ ] Adapter middleware phases in KickJS order: `beforeGlobal`, global, `afterGlobal`,
+      `beforeRoutes`, `afterRoutes`
 - [ ] Adapters: `beforeMount`, `middleware`, `contributors`, `onRouteMount`, `beforeStart`,
       `afterStart`, `onError`, `onResponse`, `onHealthCheck`, `shutdown`; `depends_on` order
 - [ ] Plugins bundling modules, adapters, middleware and contributors
