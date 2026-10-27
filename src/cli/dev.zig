@@ -108,22 +108,49 @@ fn exited(pid: std.posix.pid_t) bool {
     };
 }
 
-/// The executable's name from build.zig: `addExecutable(.{ .name = "x"`.
+/// The executable's name from build.zig: the first `addExecutable(.{ .name =
+/// "x"` outside a comment. Null for a computed name (pass --bin).
 fn binName(io: Io, arena: Allocator, cwd: Io.Dir) !?[]const u8 {
     const source = cwd.readFileAlloc(io, "build.zig", arena, .limited(1 << 20)) catch return null;
-    const at = std.mem.find(u8, source, "addExecutable(") orelse return null;
-    const name_at = std.mem.findPos(u8, source, at, ".name = \"") orelse return null;
-    const start_i = name_at + ".name = \"".len;
-    const end = std.mem.findScalarPos(u8, source, start_i, '"') orelse return null;
-    return source[start_i..end];
+    var pos: usize = 0;
+    while (std.mem.findPos(u8, source, pos, "addExecutable(")) |at| {
+        pos = at + "addExecutable(".len;
+        const line = if (std.mem.findScalarLast(u8, source[0..at], '\n')) |n| n + 1 else 0;
+        if (std.mem.find(u8, source[line..at], "//") != null) continue;
+        const call = source[pos..closing(source, pos)];
+        const name_at = std.mem.find(u8, call, ".name = ") orelse return null;
+        const value = call[name_at + ".name = ".len ..];
+        if (value.len == 0 or value[0] != '"') return null;
+        const end = std.mem.findScalarPos(u8, value, 1, '"') orelse return null;
+        return value[1..end];
+    }
+    return null;
+}
+
+/// The `)` closing a call whose arguments start at `from` (strings holding
+/// parentheses aside).
+fn closing(source: []const u8, from: usize) usize {
+    var depth: usize = 1;
+    for (source[from..], from..) |c, i| switch (c) {
+        '(' => depth += 1,
+        ')' => {
+            depth -= 1;
+            if (depth == 0) return i;
+        },
+        else => {},
+    };
+    return source.len;
 }
 
 /// A hash of every watched file's path, size and modification time.
+/// Contents, not modification times: a coarse clock (HFS+ keeps seconds)
+/// would miss a second same-size edit within the second.
+/// ponytail: reads every source each tick; fine for an app's src/.
 /// Only Zig sources count: editor swap and backup files would restart the app
 /// while you type. Null when the walk fails (a directory removed under it).
 fn snapshot(io: Io, gpa: Allocator, cwd: Io.Dir) ?u64 {
     var h: std.hash.Wyhash = .init(0);
-    for ([_][]const u8{ "build.zig", "build.zig.zon" }) |f| hashFile(io, cwd, f, &h);
+    for ([_][]const u8{ "build.zig", "build.zig.zon" }) |f| hashFile(io, gpa, cwd, f, &h);
     var src = cwd.openDir(io, "src", .{ .iterate = true }) catch return h.final();
     defer src.close(io);
     var walker = src.walk(gpa) catch return null;
@@ -132,15 +159,15 @@ fn snapshot(io: Io, gpa: Allocator, cwd: Io.Dir) ?u64 {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.path, ".zig") and !std.mem.endsWith(u8, entry.path, ".zon")) continue;
         h.update(entry.path);
-        hashFile(io, src, entry.path, &h);
+        hashFile(io, gpa, src, entry.path, &h);
     }
     return h.final();
 }
 
-fn hashFile(io: Io, dir: Io.Dir, path: []const u8, h: *std.hash.Wyhash) void {
-    const st = dir.statFile(io, path, .{}) catch return;
-    h.update(std.mem.asBytes(&st.size));
-    h.update(std.mem.asBytes(&st.mtime.nanoseconds));
+fn hashFile(io: Io, gpa: Allocator, dir: Io.Dir, path: []const u8, h: *std.hash.Wyhash) void {
+    const bytes = dir.readFileAlloc(io, path, gpa, .limited(16 << 20)) catch return;
+    defer gpa.free(bytes);
+    h.update(bytes);
 }
 
 const signals = struct {
@@ -169,4 +196,39 @@ test "binName reads the executable's name" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     try std.testing.expectEqualStrings("demo-app", (try binName(std.testing.io, arena.allocator(), tmp.dir)).?);
+}
+
+test "binName skips commented-out calls and doesn't read past the call" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "build.zig", .data =
+        \\// const old = b.addExecutable(.{ .name = "old" });
+        \\const exe = b.addExecutable(.{ .name = "demo-app", .root_module = mod });
+    });
+    try std.testing.expectEqualStrings("demo-app", (try binName(io, a, tmp.dir)).?);
+
+    // A computed name: not the `.name` of the test that follows.
+    try tmp.dir.writeFile(io, .{ .sub_path = "build.zig", .data =
+        \\const exe = b.addExecutable(.{ .name = name, .root_module = mod });
+        \\const t = b.addTest(.{ .name = "unit", .root_module = mod });
+    });
+    try std.testing.expectEqual(null, try binName(io, a, tmp.dir));
+}
+
+test "snapshot sees an edit that keeps the size and modification time" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try tmp.dir.createDirPath(io, "src");
+    try tmp.dir.writeFile(io, .{ .sub_path = "src/a.zig", .data = "aaa" });
+    const mtime = (try tmp.dir.statFile(io, "src/a.zig", .{})).mtime;
+    const before = snapshot(io, std.testing.allocator, tmp.dir).?;
+    try tmp.dir.writeFile(io, .{ .sub_path = "src/a.zig", .data = "bbb" });
+    try tmp.dir.setTimestamps(io, "src/a.zig", .{ .modify_timestamp = .{ .new = mtime } });
+    try std.testing.expect(snapshot(io, std.testing.allocator, tmp.dir).? != before);
 }
