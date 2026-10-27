@@ -26,13 +26,56 @@ pub const PrivateKey = union(enum) {
     ec384: EcP384.KeyPair,
     rsa: Rsa,
 
-    /// The first private key in `text`.
-    pub fn parsePem(a: Allocator, text: []const u8) !PrivateKey {
-        if (std.mem.find(u8, text, "-----BEGIN ENCRYPTED PRIVATE KEY-----") != null) return error.EncryptedKey;
-        if (try pemBlock(a, text, "EC PRIVATE KEY")) |der| return sec1(der, null);
-        if (try pemBlock(a, text, "RSA PRIVATE KEY")) |der| return pkcs1(der);
-        if (try pemBlock(a, text, "PRIVATE KEY")) |der| return pkcs8(der);
+    /// The first private key in `text`; `password` unlocks an encrypted one
+    /// (PKCS#8 PBES2, or OpenSSL's `DEK-Info` PEM with AES).
+    pub fn parsePem(a: Allocator, text: []const u8, password: ?[]const u8) !PrivateKey {
+        if (try pemBlock(a, text, "ENCRYPTED PRIVATE KEY")) |block| {
+            const pw = password orelse return error.PasswordRequired;
+            const der = try pbes2(block.der, pw);
+            // Garbage from a wrong password rarely parses; when it does, it's no key.
+            return pkcs8(der) catch error.BadPassword;
+        }
+        if (try pemBlock(a, text, "EC PRIVATE KEY")) |block| return sec1(try legacyDecrypt(block, password), null) catch |err| wrongIfEncrypted(block, err);
+        if (try pemBlock(a, text, "RSA PRIVATE KEY")) |block| return pkcs1(try legacyDecrypt(block, password)) catch |err| wrongIfEncrypted(block, err);
+        if (try pemBlock(a, text, "PRIVATE KEY")) |block| return pkcs8(block.der);
         return error.UnsupportedKey;
+    }
+
+    /// TLS 1.2: the scheme to sign CertificateVerify with, among those the
+    /// server's CertificateRequest lists; null when none fits this key.
+    pub fn tls12Scheme(k: PrivateKey, offered: []const u16) ?SignatureScheme {
+        const ours: []const SignatureScheme = switch (k) {
+            .ec256 => &.{.ecdsa_secp256r1_sha256},
+            .ec384 => &.{.ecdsa_secp384r1_sha384},
+            .rsa => &.{ .rsa_pss_rsae_sha256, .rsa_pkcs1_sha256 },
+        };
+        for (ours) |s| for (offered) |o| if (o == @backingInt(s)) return s;
+        return null;
+    }
+
+    /// A signature over `digest` (SHA-256, or SHA-384 for P-384) with `scheme`.
+    pub fn signDigest(k: PrivateKey, io: std.Io, sig_scheme: SignatureScheme, digest: []const u8, out: *[max_signature_len]u8) ![]const u8 {
+        switch (k) {
+            inline .ec256, .ec384 => |kp, tag| {
+                const E = if (tag == .ec256) EcP256 else EcP384;
+                if (digest.len != E.Signature.encoded_length / 2) return error.UnsupportedKey;
+                var noise: [E.noise_length]u8 = undefined;
+                io.random(&noise);
+                const sig = try kp.signPrehashed(digest[0 .. E.Signature.encoded_length / 2].*, noise);
+                var der: [E.Signature.der_encoded_length_max]u8 = undefined;
+                const bytes = sig.toDer(&der);
+                @memcpy(out[0..bytes.len], bytes);
+                return out[0..bytes.len];
+            },
+            .rsa => |r| {
+                if (digest.len != 32) return error.UnsupportedKey;
+                return switch (sig_scheme) {
+                    .rsa_pss_rsae_sha256 => rsaPss(io, r, digest[0..32].*, out),
+                    .rsa_pkcs1_sha256 => rsaPkcs1(r, digest[0..32].*, out),
+                    else => error.UnsupportedKey,
+                };
+            },
+        }
     }
 
     /// The TLS 1.3 scheme this key signs with.
@@ -57,13 +100,18 @@ pub const PrivateKey = union(enum) {
                 @memcpy(out[0..bytes.len], bytes);
                 return out[0..bytes.len];
             },
-            .rsa => |r| return rsaPss(io, r, msg, out),
+            .rsa => |r| {
+                var m_hash: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(msg, &m_hash, .{});
+                return rsaPss(io, r, m_hash, out);
+            },
         }
     }
 };
 
-/// RFC 8017 RSASSA-PSS with SHA-256, MGF1-SHA-256 and a 32-byte salt.
-fn rsaPss(io: std.Io, r: Rsa, msg: []const u8, out: *[max_signature_len]u8) ![]const u8 {
+/// RFC 8017 RSASSA-PSS with SHA-256, MGF1-SHA-256 and a 32-byte salt, over
+/// the message's SHA-256 `m_hash`.
+fn rsaPss(io: std.Io, r: Rsa, m_hash: [32]u8, out: *[max_signature_len]u8) ![]const u8 {
     const Sha256 = std.crypto.hash.sha2.Sha256;
     const M = std.crypto.ff.Modulus(max_signature_len * 8);
     const n = try M.fromBytes(r.n, .big);
@@ -75,8 +123,6 @@ fn rsaPss(io: std.Io, r: Rsa, msg: []const u8, out: *[max_signature_len]u8) ![]c
     const s_len = h_len;
     if (em_len < h_len + s_len + 2 or k > max_signature_len) return error.UnsupportedKey;
 
-    var m_hash: [h_len]u8 = undefined;
-    Sha256.hash(msg, &m_hash, .{});
     var salt: [s_len]u8 = undefined;
     io.random(&salt);
     var h: [h_len]u8 = undefined;
@@ -111,15 +157,39 @@ fn rsaPss(io: std.Io, r: Rsa, msg: []const u8, out: *[max_signature_len]u8) ![]c
     @memcpy(em[db_len..][0..h_len], &h);
     em[em_len - 1] = 0xbc;
 
-    // s = EM^d mod n, constant-time in d.
     var padded: [max_signature_len]u8 = @splat(0);
     @memcpy(padded[k - em_len .. k], em);
-    const x = try M.Fe.fromBytes(n, padded[0..k], .big);
+    defer std.crypto.secureZero(u8, &padded);
+    defer std.crypto.secureZero(u8, &em_buf);
+    return rsaPrivate(r, padded[0..k], out);
+}
+
+/// RFC 8017 RSASSA-PKCS1-v1_5 with SHA-256 (TLS 1.2 servers without PSS).
+fn rsaPkcs1(r: Rsa, m_hash: [32]u8, out: *[max_signature_len]u8) ![]const u8 {
+    const M = std.crypto.ff.Modulus(max_signature_len * 8);
+    const n = try M.fromBytes(r.n, .big);
+    const k = (n.bits() + 7) / 8;
+    const digest_info = [_]u8{ 0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20 };
+    const t_len = digest_info.len + m_hash.len;
+    if (k < t_len + 11 or k > max_signature_len) return error.UnsupportedKey;
+    var em: [max_signature_len]u8 = undefined;
+    em[0] = 0x00;
+    em[1] = 0x01;
+    @memset(em[2 .. k - t_len - 1], 0xff);
+    em[k - t_len - 1] = 0x00;
+    @memcpy(em[k - t_len ..][0..digest_info.len], &digest_info);
+    @memcpy(em[k - m_hash.len .. k], &m_hash);
+    return rsaPrivate(r, em[0..k], out);
+}
+
+/// `em`^d mod n, constant-time in d; `em` is as long as the modulus.
+fn rsaPrivate(r: Rsa, em: []const u8, out: *[max_signature_len]u8) ![]const u8 {
+    const M = std.crypto.ff.Modulus(max_signature_len * 8);
+    const n = try M.fromBytes(r.n, .big);
+    const x = try M.Fe.fromBytes(n, em, .big);
     const sig = try n.powWithEncodedExponent(x, r.d, .big);
-    try sig.toBytes(out[0..k], .big);
-    std.crypto.secureZero(u8, &padded);
-    std.crypto.secureZero(u8, &em_buf);
-    return out[0..k];
+    try sig.toBytes(out[0..em.len], .big);
+    return out[0..em.len];
 }
 
 /// Each certificate's DER, in the file's order (leaf first).
@@ -129,26 +199,161 @@ pub fn parseChain(a: Allocator, text: []const u8) ![]const []const u8 {
     while (true) {
         const begin = "-----BEGIN CERTIFICATE-----";
         const at = std.mem.find(u8, rest, begin) orelse break;
-        const der = (try pemBlock(a, rest[at..], "CERTIFICATE")).?;
-        try list.append(a, der);
+        const block = (try pemBlock(a, rest[at..], "CERTIFICATE")).?;
+        try list.append(a, block.der);
         rest = rest[at + begin.len ..];
     }
     if (list.items.len == 0) return error.NoCertificate;
     return list.items;
 }
 
-/// The first `-----BEGIN <label>-----` block's bytes; null when there is none.
-fn pemBlock(a: Allocator, text: []const u8, comptime label: []const u8) !?[]const u8 {
+const Block = struct {
+    der: []u8,
+    /// OpenSSL's traditional encryption: `DEK-Info: AES-256-CBC,<iv>`.
+    dek: ?struct { key_len: usize, iv: [16]u8 } = null,
+};
+
+/// The first `-----BEGIN <label>-----` block (exactly that label); null
+/// when there is none.
+fn pemBlock(a: Allocator, text: []const u8, comptime label: []const u8) !?Block {
     const begin = "-----BEGIN " ++ label ++ "-----";
     const end = "-----END " ++ label ++ "-----";
     const start = std.mem.find(u8, text, begin) orelse return null;
-    const body_start = start + begin.len;
+    var body_start = start + begin.len;
     const stop = std.mem.findPos(u8, text, body_start, end) orelse return error.InvalidPem;
+    var block: Block = .{ .der = &.{} };
+    // RFC 1421 headers, up to a blank line.
+    if (std.mem.find(u8, text[body_start..stop], "Proc-Type:")) |_| {
+        const blank = std.mem.findPos(u8, text, body_start, "\n\n") orelse std.mem.findPos(u8, text, body_start, "\r\n\r\n") orelse return error.InvalidPem;
+        var lines = std.mem.tokenizeAny(u8, text[body_start..blank], "\r\n");
+        while (lines.next()) |line| {
+            if (!std.mem.startsWith(u8, line, "DEK-Info:")) continue;
+            const info = std.mem.trim(u8, line["DEK-Info:".len..], " ");
+            const comma = std.mem.findScalar(u8, info, ',') orelse return error.InvalidPem;
+            const cipher = info[0..comma];
+            const key_len: usize = if (std.mem.eql(u8, cipher, "AES-128-CBC")) 16 else if (std.mem.eql(u8, cipher, "AES-256-CBC")) 32 else return error.UnsupportedKey;
+            var iv: [16]u8 = undefined;
+            _ = std.fmt.hexToBytes(&iv, info[comma + 1 ..]) catch return error.InvalidPem;
+            block.dek = .{ .key_len = key_len, .iv = iv };
+        }
+        if (block.dek == null) return error.UnsupportedKey;
+        body_start = blank;
+    }
     var b64: std.ArrayList(u8) = .empty;
+    defer {
+        std.crypto.secureZero(u8, b64.items);
+        b64.deinit(a);
+    }
     for (text[body_start..stop]) |ch| if (!std.ascii.isWhitespace(ch)) try b64.append(a, ch);
-    const out = try a.alloc(u8, std.base64.standard.Decoder.calcSizeForSlice(b64.items) catch return error.InvalidPem);
-    std.base64.standard.Decoder.decode(out, b64.items) catch return error.InvalidPem;
-    return out;
+    block.der = try a.alloc(u8, std.base64.standard.Decoder.calcSizeForSlice(b64.items) catch return error.InvalidPem);
+    std.base64.standard.Decoder.decode(block.der, b64.items) catch return error.InvalidPem;
+    return block;
+}
+
+fn wrongIfEncrypted(block: Block, err: anyerror) anyerror {
+    return if (block.dek != null and err != error.PasswordRequired) error.BadPassword else err;
+}
+
+/// A traditional PEM block, decrypted in place: OpenSSL's EVP_BytesToKey
+/// (MD5, one round, the IV's first 8 bytes as salt), then AES-CBC.
+fn legacyDecrypt(block: Block, password: ?[]const u8) ![]const u8 {
+    const dek = block.dek orelse return block.der;
+    const pw = password orelse return error.PasswordRequired;
+    const Md5 = std.crypto.hash.Md5;
+    var key: [32]u8 = undefined;
+    defer std.crypto.secureZero(u8, &key);
+    var prev: [16]u8 = undefined;
+    var have: usize = 0;
+    while (have < dek.key_len) {
+        var h = Md5.init(.{});
+        if (have > 0) h.update(&prev);
+        h.update(pw);
+        h.update(dek.iv[0..8]);
+        h.final(&prev);
+        const take = @min(16, dek.key_len - have);
+        @memcpy(key[have..][0..take], prev[0..take]);
+        have += take;
+    }
+    return cbcDecrypt(block.der, key[0..dek.key_len], dek.iv);
+}
+
+/// AES-CBC with PKCS#7 padding, in place; a bad pad is a wrong password.
+fn cbcDecrypt(data: []u8, key: []const u8, iv: [16]u8) ![]const u8 {
+    if (data.len == 0 or data.len % 16 != 0) return error.BadPassword;
+    var chain = iv;
+    var i: usize = 0;
+    while (i < data.len) : (i += 16) {
+        const block = data[i..][0..16];
+        const next_chain = block.*;
+        var plain: [16]u8 = undefined;
+        switch (key.len) {
+            16 => std.crypto.core.aes.Aes128.initDec(key[0..16].*).decrypt(&plain, block),
+            32 => std.crypto.core.aes.Aes256.initDec(key[0..32].*).decrypt(&plain, block),
+            else => return error.UnsupportedKey,
+        }
+        for (block, plain, chain) |*o, p, c| o.* = p ^ c;
+        chain = next_chain;
+    }
+    const pad = data[data.len - 1];
+    if (pad == 0 or pad > 16) return error.BadPassword;
+    for (data[data.len - pad ..]) |b| if (b != pad) return error.BadPassword;
+    return data[0 .. data.len - pad];
+}
+
+const oid_pbes2 = [_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x05, 0x0D };
+const oid_pbkdf2 = [_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x05, 0x0C };
+const oid_hmac_sha1 = [_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x02, 0x07 };
+const oid_hmac_sha256 = [_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x02, 0x09 };
+const oid_hmac_sha384 = [_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x02, 0x0A };
+const oid_hmac_sha512 = [_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x02, 0x0B };
+const oid_aes128_cbc = [_]u8{ 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x01, 0x02 };
+const oid_aes256_cbc = [_]u8{ 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x01, 0x2A };
+
+/// PKCS#8 `EncryptedPrivateKeyInfo` with PBES2 (RFC 8018): PBKDF2 with an
+/// HMAC-SHA PRF, AES-CBC. Decrypted in place.
+fn pbes2(der: []u8, password: []const u8) ![]const u8 {
+    var top: Der = .{ .buf = der };
+    var info: Der = .{ .buf = try top.next(0x30) };
+    var alg: Der = .{ .buf = try info.next(0x30) };
+    if (!std.mem.eql(u8, try alg.next(0x06), &oid_pbes2)) return error.UnsupportedKey;
+    var params: Der = .{ .buf = try alg.next(0x30) };
+    var kdf: Der = .{ .buf = try params.next(0x30) };
+    if (!std.mem.eql(u8, try kdf.next(0x06), &oid_pbkdf2)) return error.UnsupportedKey;
+    var kdf_params: Der = .{ .buf = try kdf.next(0x30) };
+    const salt = try kdf_params.next(0x04);
+    const iter_bytes = try kdf_params.int();
+    if (iter_bytes.len > 4) return error.UnsupportedKey;
+    var iterations: u32 = 0;
+    for (iter_bytes) |b| iterations = (iterations << 8) | b;
+    if (iterations == 0 or iterations > 10_000_000) return error.UnsupportedKey;
+    if (kdf_params.peek() == 0x02) _ = try kdf_params.int(); // keyLength: the cipher's
+    var prf: []const u8 = &oid_hmac_sha1;
+    if (kdf_params.peek() == 0x30) {
+        var p: Der = .{ .buf = try kdf_params.next(0x30) };
+        prf = try p.next(0x06);
+    }
+    var enc: Der = .{ .buf = try params.next(0x30) };
+    const enc_oid = try enc.next(0x06);
+    const key_len: usize = if (std.mem.eql(u8, enc_oid, &oid_aes128_cbc)) 16 else if (std.mem.eql(u8, enc_oid, &oid_aes256_cbc)) 32 else return error.UnsupportedKey;
+    const iv_bytes = try enc.next(0x04);
+    if (iv_bytes.len != 16) return error.InvalidKey;
+    const data_const = try info.next(0x04);
+    // `der` is ours: decrypt where the ciphertext is.
+    const data = der[@intFromPtr(data_const.ptr) - @intFromPtr(der.ptr) ..][0..data_const.len];
+
+    var key: [32]u8 = undefined;
+    defer std.crypto.secureZero(u8, &key);
+    const hmac = std.crypto.auth.hmac;
+    if (std.mem.eql(u8, prf, &oid_hmac_sha1)) {
+        try std.crypto.pwhash.pbkdf2(key[0..key_len], password, salt, iterations, hmac.HmacSha1);
+    } else if (std.mem.eql(u8, prf, &oid_hmac_sha256)) {
+        try std.crypto.pwhash.pbkdf2(key[0..key_len], password, salt, iterations, hmac.sha2.HmacSha256);
+    } else if (std.mem.eql(u8, prf, &oid_hmac_sha384)) {
+        try std.crypto.pwhash.pbkdf2(key[0..key_len], password, salt, iterations, hmac.sha2.HmacSha384);
+    } else if (std.mem.eql(u8, prf, &oid_hmac_sha512)) {
+        try std.crypto.pwhash.pbkdf2(key[0..key_len], password, salt, iterations, hmac.sha2.HmacSha512);
+    } else return error.UnsupportedKey;
+    return cbcDecrypt(data, key[0..key_len], iv_bytes[0..16].*);
 }
 
 /// A minimal DER reader: what private keys need.
@@ -248,7 +453,7 @@ test "every key format reads, and its signatures verify with its public key" {
     const msg = "TLS 1.3, client CertificateVerify";
     var out: [max_signature_len]u8 = undefined;
     inline for (.{ "ec256-sec1.pem", "ec384-pkcs8.pem", "rsa2048-pkcs1.pem", "rsa2048-pkcs8.pem" }) |file| {
-        const key = try PrivateKey.parsePem(a, @embedFile("../testdata/" ++ file));
+        const key = try PrivateKey.parsePem(a, @embedFile("../testdata/" ++ file), null);
         const sig = try key.sign(testing.io, msg, &out);
         switch (key) {
             .ec256 => |kp| {
@@ -268,7 +473,7 @@ test "every key format reads, and its signatures verify with its public key" {
             },
         }
     }
-    try testing.expectError(error.UnsupportedKey, PrivateKey.parsePem(a, @embedFile("../testdata/unrelated-ca.pem")));
+    try testing.expectError(error.UnsupportedKey, PrivateKey.parsePem(a, @embedFile("../testdata/unrelated-ca.pem"), null));
 }
 
 test "a PEM chain gives each certificate's DER in order" {
@@ -281,4 +486,56 @@ test "a PEM chain gives each certificate's DER in order" {
     try testing.expectEqual(0x30, chain[0][0]);
     try testing.expectEqualSlices(u8, chain[0], chain[1]);
     try testing.expectError(error.NoCertificate, parseChain(a, "no pem here"));
+}
+
+test "encrypted keys: PBES2 and OpenSSL's DEK-Info PEM, unlocked with the password" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var out: [max_signature_len]u8 = undefined;
+    const msg = "signed";
+    inline for (.{
+        .{ "ec256-pbes2-sha256.pem", "ec256-sec1.pem" },
+        .{ "rsa2048-pbes2-sha1.pem", "rsa2048-pkcs1.pem" },
+        .{ "ec384-legacy-aes256.pem", "ec384-pkcs8.pem" },
+        .{ "rsa2048-legacy-aes128.pem", "rsa2048-pkcs1.pem" },
+    }) |pair| {
+        const locked = @embedFile("../testdata/" ++ pair[0]);
+        const key = try PrivateKey.parsePem(a, locked, "kzig-test");
+        const plain = try PrivateKey.parsePem(a, @embedFile("../testdata/" ++ pair[1]), null);
+        // The same key as the unencrypted file.
+        switch (key) {
+            .ec256 => |kp| try testing.expectEqualSlices(u8, &plain.ec256.secret_key.toBytes(), &kp.secret_key.toBytes()),
+            .ec384 => |kp| try testing.expectEqualSlices(u8, &plain.ec384.secret_key.toBytes(), &kp.secret_key.toBytes()),
+            .rsa => |r| try testing.expectEqualSlices(u8, plain.rsa.d, r.d),
+        }
+        _ = try key.sign(testing.io, msg, &out);
+        try testing.expectError(error.BadPassword, PrivateKey.parsePem(a, locked, "wrong"));
+        try testing.expectError(error.PasswordRequired, PrivateKey.parsePem(a, locked, null));
+    }
+}
+
+test "TLS 1.2 CertificateVerify signs a digest; the scheme follows what the server takes" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+    var digest: [32]u8 = undefined;
+    Sha256.hash("handshake messages", &digest, .{});
+    var out: [max_signature_len]u8 = undefined;
+    const ec = try PrivateKey.parsePem(a, @embedFile("../testdata/ec256-sec1.pem"), null);
+    const scheme = ec.tls12Scheme(&.{ @backingInt(SignatureScheme.rsa_pkcs1_sha256), @backingInt(SignatureScheme.ecdsa_secp256r1_sha256) }).?;
+    try testing.expectEqual(SignatureScheme.ecdsa_secp256r1_sha256, scheme);
+    const sig = try ec.signDigest(testing.io, scheme, &digest, &out);
+    try (try EcP256.Signature.fromDer(sig)).verifyPrehashed(digest, ec.ec256.public_key);
+
+    const rsa = try PrivateKey.parsePem(a, @embedFile("../testdata/rsa2048-pkcs1.pem"), null);
+    const Cert = std.crypto.Certificate;
+    const pk = try Cert.rsa.PublicKey.fromBytes(rsa.rsa.e, rsa.rsa.n);
+    // PKCS#1 v1.5 when the server doesn't take PSS.
+    const pkcs1_scheme = rsa.tls12Scheme(&.{@backingInt(SignatureScheme.rsa_pkcs1_sha256)}).?;
+    try testing.expectEqual(SignatureScheme.rsa_pkcs1_sha256, pkcs1_scheme);
+    const s1 = try rsa.signDigest(testing.io, pkcs1_scheme, &digest, &out);
+    try Cert.rsa.PKCS1v1_5Signature.verify(256, s1[0..256], "handshake messages", pk, Sha256);
+    try testing.expectEqual(null, rsa.tls12Scheme(&.{@backingInt(SignatureScheme.ecdsa_secp256r1_sha256)}));
 }

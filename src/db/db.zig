@@ -583,5 +583,6 @@ test "database URLs" {
     try testing.expectEqual(pg.SslNegotiation.direct, (try pg.Config.parse(a, "postgres://ada@h/app?sslmode=require&sslnegotiation=direct")).sslnegotiation);
     try testing.expectError(error.InvalidDatabaseUrl, pg.Config.parse(a, "postgres://ada@h/app?sslnegotiation=direct"));
     try testing.expectEqual(pg.ChannelBinding.require, (try pg.Config.parse(a, "postgres://ada@h/app?channel_binding=require")).channel_binding);
+    try testing.expectEqualStrings("p@ss word", (try pg.Config.parse(a, "postgres://ada@h/app?sslcert=c.pem&sslkey=k.pem&sslpassword=p%40ss%20word")).sslpassword.?);
     try testing.expectError(error.InvalidDatabaseUrl, pg.Config.parse(a, "mysql://ada@h/app"));
 }

@@ -48,6 +48,8 @@ pub const Config = struct {
     /// that authenticates clients by certificate (pg_hba `cert`).
     sslcert: ?[]const u8 = null,
     sslkey: ?[]const u8 = null,
+    /// Unlocks an encrypted `sslkey` (PKCS#8 PBES2, or OpenSSL's DEK-Info PEM).
+    sslpassword: ?[]const u8 = null,
     /// `insecure_auth=true`: answer a cleartext or MD5 password request on
     /// an unverified connection (an old server); off, that's `error.InsecureAuth`.
     insecure_auth: bool = false,
@@ -86,6 +88,8 @@ pub const Config = struct {
                     c.sslcert = pair["sslcert=".len..];
                 } else if (std.mem.startsWith(u8, pair, "sslkey=")) {
                     c.sslkey = pair["sslkey=".len..];
+                } else if (std.mem.startsWith(u8, pair, "sslpassword=")) {
+                    c.sslpassword = std.Uri.percentDecodeInPlace(try a.dupe(u8, pair["sslpassword=".len..]));
                 } else if (std.mem.startsWith(u8, pair, "sslrootcert=")) {
                     c.sslrootcert = pair["sslrootcert=".len..];
                 } else if (std.mem.startsWith(u8, pair, "application_name=")) {
@@ -276,7 +280,7 @@ pub const Conn = struct {
             const key_pem = cwd.readFileAlloc(c.io, cfg.sslkey.?, ca, .limited(16 << 10)) catch |err| return tlsConfig("sslkey", cfg.sslkey.?, err);
             break :blk .{
                 .chain = keys.parseChain(ca, cert_pem) catch |err| return tlsConfig("sslcert", cert_path, err),
-                .key = keys.PrivateKey.parsePem(ca, key_pem) catch |err| return tlsConfig("sslkey", cfg.sslkey.?, err),
+                .key = keys.PrivateKey.parsePem(ca, key_pem, cfg.sslpassword) catch |err| return tlsConfig("sslkey", cfg.sslkey.?, err),
                 .io = c.io,
             };
         } else null;
