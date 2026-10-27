@@ -778,23 +778,7 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                             const subject = try subject_cert.parse();
                             if (cert_index == 0) {
                                 // kzig: tls-server-end-point, from the leaf's DER.
-                                switch (subject.signature_algorithm) {
-                                    .sha384WithRSAEncryption, .ecdsa_with_SHA384 => {
-                                        crypto.hash.sha2.Sha384.hash(certd.buf, end_point[0..48], .{});
-                                        end_point_len = 48;
-                                    },
-                                    .sha512WithRSAEncryption, .ecdsa_with_SHA512 => {
-                                        crypto.hash.sha2.Sha512.hash(certd.buf, end_point[0..64], .{});
-                                        end_point_len = 64;
-                                    },
-                                    // No hash (Ed25519), or one Postgres would compute
-                                    // differently (SHA-224): no channel binding.
-                                    .curveEd25519, .sha224WithRSAEncryption, .ecdsa_with_SHA224 => end_point_len = 0,
-                                    else => {
-                                        crypto.hash.sha2.Sha256.hash(certd.buf, end_point[0..32], .{});
-                                        end_point_len = 32;
-                                    },
-                                }
+                                end_point_len = if (serverEndPoint(certd.buf, &end_point)) |h| @intCast(h.len) else |_| 0;
                                 // Verify the host on the first certificate.
                                 switch (options.host) {
                                     .no_verification => {},
@@ -1869,6 +1853,33 @@ fn clientAuthMessages(out: []u8, transcript: anytype, auth: ?ClientAuth, scheme_
     return w.end;
 }
 
+/// kzig: RFC 5929 §4.1 `tls-server-end-point` for a certificate (DER): its
+/// hash with the certificate's signature hash, SHA-256 for MD5 and SHA-1.
+/// Empty for Ed25519, which has none (Postgres can't bind those either).
+pub fn serverEndPoint(der: []const u8, out: *[64]u8) ![]const u8 {
+    const parsed = try (Certificate{ .buffer = der, .index = 0 }).parse();
+    const sha2 = crypto.hash.sha2;
+    switch (parsed.signature_algorithm) {
+        .sha224WithRSAEncryption, .ecdsa_with_SHA224 => {
+            sha2.Sha224.hash(der, out[0..28], .{});
+            return out[0..28];
+        },
+        .sha384WithRSAEncryption, .ecdsa_with_SHA384 => {
+            sha2.Sha384.hash(der, out[0..48], .{});
+            return out[0..48];
+        },
+        .sha512WithRSAEncryption, .ecdsa_with_SHA512 => {
+            sha2.Sha512.hash(der, out[0..64], .{});
+            return out[0..64];
+        },
+        .curveEd25519 => return out[0..0],
+        else => {
+            sha2.Sha256.hash(der, out[0..32], .{});
+            return out[0..32];
+        },
+    }
+}
+
 /// kzig: TLS 1.2's client Certificate (RFC 5246 §7.4.6) as a handshake
 /// record: the chain, or empty without `auth`.
 fn tls12Certificate(out: []u8, auth: ?ClientAuth) ![]const u8 {
@@ -2065,4 +2076,26 @@ test "zero-length key_update body" {
             .client_iv = undefined,
         } } },
     ));
+}
+
+test "tls-server-end-point: the certificate's own signature hash, SHA-256 for weaker ones" {
+    const keys_test = @import("keys.zig");
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    inline for (.{
+        .{ "ec256-cert-sha224.pem", "5da96ffe55aaf7a358d521db1d4e6d54516d276d8b09f1cdb91209dc" },
+        .{ "ec384-cert-sha384.pem", "d9a688ab15625370082d161d000ae81b7ae8864ab0dab324ba5e31b854499079bb371e4242695523fed73fe8ea3d4a9b" },
+        .{ "ec256-cert.pem", "9d93ae966c0b342d75a3e626d7bee85de2f53a6693d35df6b606a71bfc97075a" },
+    }) |case| {
+        const der = (try keys_test.parseChain(a, @embedFile("../testdata/" ++ case[0])))[0];
+        var out: [64]u8 = undefined;
+        const got = try serverEndPoint(der, &out);
+        var want: [64]u8 = undefined;
+        const w = try std.fmt.hexToBytes(&want, case[1]);
+        try std.testing.expectEqualSlices(u8, w, got);
+    }
+    const ed = (try keys_test.parseChain(a, @embedFile("../testdata/ed25519-cert.pem")))[0];
+    var out: [64]u8 = undefined;
+    try std.testing.expectEqual(0, (try serverEndPoint(ed, &out)).len);
 }

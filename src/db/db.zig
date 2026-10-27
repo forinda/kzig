@@ -259,6 +259,7 @@ test {
     _ = @import("relational.zig");
     _ = @import("tls/keys.zig");
     _ = @import("tls/des.zig");
+    _ = @import("tls/Client.zig");
     _ = pg;
 }
 
