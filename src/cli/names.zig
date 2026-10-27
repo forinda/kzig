@@ -20,7 +20,9 @@ pub const Names = struct {
         var start: usize = 0;
         for (raw, 0..) |c, i| {
             const boundary = c == '-' or c == '_';
-            const camel_step = i > 0 and std.ascii.isUpper(c) and std.ascii.isLower(raw[i - 1]);
+            // `taskList` → task|List; `HTTPClient` → HTTP|Client.
+            const camel_step = i > 0 and std.ascii.isUpper(c) and (!std.ascii.isUpper(raw[i - 1]) and std.ascii.isAlphanumeric(raw[i - 1]) or
+                std.ascii.isUpper(raw[i - 1]) and i + 1 < raw.len and std.ascii.isLower(raw[i + 1]));
             if (boundary or camel_step) {
                 if (i > start) try words.append(a, try std.ascii.allocLowerString(a, raw[start..i]));
                 start = if (boundary) i + 1 else i;
@@ -31,9 +33,9 @@ pub const Names = struct {
 
         const kebab = try std.mem.join(a, "-", words.items);
         const pascal = try capitalized(a, words.items, true);
-        const plural_kebab = try plural(a, kebab);
         var plural_words = try a.dupe([]const u8, words.items);
         plural_words[plural_words.len - 1] = try plural(a, words.items[words.items.len - 1]);
+        const plural_kebab = try std.mem.join(a, "-", plural_words);
         return .{
             .pascal = pascal,
             .camel = try capitalized(a, words.items, false),
@@ -55,8 +57,20 @@ fn capitalized(a: Allocator, words: []const []const u8, first_upper: bool) ![]co
     return out.items;
 }
 
-/// English plural of a lower-case word, the common rules only.
+const irregular = [_][2][]const u8{
+    .{ "person", "people" }, .{ "child", "children" }, .{ "man", "men" },   .{ "woman", "women" },
+    .{ "mouse", "mice" },    .{ "goose", "geese" },    .{ "foot", "feet" }, .{ "tooth", "teeth" },
+};
+const uncountable = [_][]const u8{ "data", "information", "news", "series", "species", "sheep", "fish", "equipment", "metadata" };
+const takes_oes = [_][]const u8{ "hero", "potato", "tomato", "echo" };
+
+/// English plural of a lower-case word: the common rules and the usual
+/// irregular and uncountable words.
 pub fn plural(a: Allocator, word: []const u8) ![]const u8 {
+    for (irregular) |p| if (std.mem.eql(u8, word, p[0])) return a.dupe(u8, p[1]);
+    for (uncountable) |u| if (std.mem.eql(u8, word, u)) return a.dupe(u8, word);
+    for (takes_oes) |o| if (std.mem.eql(u8, word, o)) return std.mem.concat(a, u8, &.{ word, "es" });
+    if (std.mem.endsWith(u8, word, "z") and !std.mem.endsWith(u8, word, "zz")) return std.mem.concat(a, u8, &.{ word, "zes" });
     const vowels = "aeiou";
     if (word.len > 1 and word[word.len - 1] == 'y' and std.mem.findScalar(u8, vowels, word[word.len - 2]) == null)
         return std.mem.concat(a, u8, &.{ word[0 .. word.len - 1], "ies" });
@@ -96,4 +110,31 @@ test "invalid names" {
     defer arena.deinit();
     for ([_][]const u8{ "", "1task", "task!", "-task", "a b" }) |bad|
         try testing.expectError(error.InvalidName, Names.init(arena.allocator(), bad));
+}
+
+test "irregular and uncountable plurals" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][2][]const u8{
+        .{ "person", "people" },     .{ "child", "children" }, .{ "man", "men" },       .{ "woman", "women" },
+        .{ "mouse", "mice" },        .{ "goose", "geese" },    .{ "foot", "feet" },     .{ "tooth", "teeth" },
+        .{ "data", "data" },         .{ "news", "news" },      .{ "series", "series" }, .{ "sheep", "sheep" },
+        .{ "metadata", "metadata" }, .{ "quiz", "quizzes" },   .{ "hero", "heroes" },   .{ "photo", "photos" },
+        .{ "status", "statuses" },
+    }) |c| try testing.expectEqualStrings(c[1], try plural(a, c[0]));
+    // The last word is the one pluralized.
+    const n = try Names.init(a, "sales-person");
+    try testing.expectEqualStrings("sales-people", n.plural);
+    try testing.expectEqualStrings("SalesPeople", n.plural_pascal);
+}
+
+test "acronyms split before the last capital of a run" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const n = try Names.init(arena.allocator(), "HTTPClient");
+    try testing.expectEqualStrings("http-client", n.kebab);
+    try testing.expectEqualStrings("HttpClient", n.pascal);
+    const m = try Names.init(arena.allocator(), "userID");
+    try testing.expectEqualStrings("user-id", m.kebab);
 }
