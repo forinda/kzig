@@ -48,6 +48,8 @@ after M6.
 | Typegen, Vite HMR | None; `zig build --watch` | Zig types are already the source of truth |
 | Swagger from zod schemas + decorators | OpenAPI from the Zig types, at comptime | The schema can't drift from the code |
 | Swagger operations untagged without `@ApiTags` | Tagged with the module's name | Swagger UI groups by module |
+| `@FileUpload({ maxSize: getEnv(…) })` | `kzig.Upload(.{ .max_size })` is comptime; a limit from env is checked in the handler | Route types are built at compile time |
+| `..%2F` in a path reaches validation (422) | 400 at the router | Traversal never reaches a handler |
 
 Kept for parity even where Zig would allow otherwise: route middleware runs **after** validation.
 
@@ -260,7 +262,7 @@ Follow-ups:
 - [x] `kzig.Upload(.{ .field, .max_size, .max_count, .allowed_types })` read as `got.upload`:
       multipart parsed from the body; 415 for a type not allowed, 413 over the size or count,
       400 malformed; server-side names never from the client; OpenAPI `multipart/form-data`
-- [ ] task-api `files` module (`file-storage-api`, disk storage): API key, signed download links
+- [x] task-api `files` module (`file-storage-api`, disk storage): API key, signed download links
 - [ ] WebSocket gateways (`@forinda/kickjs-ws`): `.gateways` on modules, `{event, data}` frames,
       rooms, `connect`/`disconnect`/`draining`, heartbeat, close codes; on both runtimes
 - [ ] task-api `chat` module (`ws-chat`, without Redis): tokens, rooms, presence

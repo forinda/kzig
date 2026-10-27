@@ -5,6 +5,7 @@ const AppSettings = @import("config/app.settings.zig").AppSettings;
 const modules = @import("modules.zig").modules;
 const MailAdapter = @import("adapters/mail.adapter.zig").MailAdapter;
 const mail = @import("adapters/mail.settings.zig");
+const FileSettings = @import("modules/files/file.settings.zig").FileSettings;
 
 pub const App = kzig.App(.{
     .modules = modules,
@@ -33,7 +34,9 @@ pub fn main(init: std.process.Init) !void {
 
     // Until SIGINT/SIGTERM; then in-flight requests finish and `deinit`
     // runs the adapters' shutdown hooks.
-    try kzig.runtime.std.serve(App, &app, init.io, init.gpa, .{ .port = app.get(Config).port });
+    // An upload's body is the file plus its form: allow a megabyte over the file limit.
+    const max_body = app.get(FileSettings).max_upload_bytes + 1024 * 1024;
+    try kzig.runtime.std.serve(App, &app, init.io, init.gpa, .{ .port = app.get(Config).port, .max_body_bytes = max_body });
 }
 
 test {
@@ -44,5 +47,6 @@ test {
     _ = @import("adapters/mail.test.zig");
     _ = @import("openapi.test.zig");
     _ = @import("modules/tasks/task.test.zig");
+    _ = @import("modules/files/file.test.zig");
     // kzig:tests
 }
