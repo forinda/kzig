@@ -2,8 +2,8 @@
 //! a connection cap, and size/time limits at the edge.
 const std = @import("std");
 const builtin = @import("builtin");
-const context = @import("../context.zig");
-const router = @import("../router.zig");
+const context = @import("../core/context.zig");
+const router = @import("../core/router.zig");
 const wire = @import("wire.zig");
 const ws_serve = @import("../ws/serve.zig");
 
@@ -591,7 +591,7 @@ test "transient accept errors are retried" {
 }
 
 test "serves an App with modules" {
-    const kapp = @import("../app.zig");
+    const kapp = @import("../core/app.zig");
     const Hello = struct {
         pub const routes = .{.{ .method = .GET, .path = "/", .handler = "index" }};
         pub fn index(_: *@This(), _: *Ctx) struct { message: []const u8 } {
@@ -656,7 +656,7 @@ const LifecycleApp = struct {
     pub fn handle(_: *LifecycleApp, ctx: *Ctx) void {
         (R{}).handle(ctx);
     }
-    pub fn started(self: *LifecycleApp, info: @import("../adapter.zig").StartInfo) void {
+    pub fn started(self: *LifecycleApp, info: @import("../core/adapter.zig").StartInfo) void {
         self.port = info.port;
     }
     pub fn beginDrain(self: *LifecycleApp) void {

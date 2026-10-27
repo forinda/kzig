@@ -1,38 +1,38 @@
 //! kzig — KickJS for Zig. The public API is re-exported from here as milestones land.
-const context = @import("context.zig");
-const problem = @import("problem.zig");
-const router = @import("router.zig");
-const di = @import("di.zig");
-const app = @import("app.zig");
-const adapter = @import("adapter.zig");
+const context = @import("core/context.zig");
+const problem = @import("core/problem.zig");
+const router = @import("core/router.zig");
+const di = @import("core/di.zig");
+const app = @import("core/app.zig");
+const adapter = @import("core/adapter.zig");
 pub const StartInfo = adapter.StartInfo;
 pub const RouteInfo = adapter.RouteInfo;
-pub const testing = @import("testing.zig");
-pub const config = @import("config.zig");
-pub const decode = @import("decode.zig");
+pub const testing = @import("core/testing.zig");
+pub const config = @import("core/config.zig");
+pub const decode = @import("core/decode.zig");
 pub const Issues = decode.Issues;
 pub const FieldError = decode.FieldError;
-const query = @import("query.zig");
+const query = @import("core/query.zig");
 pub const ListQuery = query.ListQuery;
 pub const Paginated = query.Paginated;
 pub const Sort = query.Sort;
 pub const Filter = query.Filter;
-pub const openapi = @import("openapi.zig");
-pub const multipart = @import("multipart.zig");
+pub const openapi = @import("openapi/openapi.zig");
+pub const multipart = @import("upload/multipart.zig");
 /// WebSocket gateways (KickJS `@forinda/kickjs-ws`).
-pub const ws = @import("ws.zig");
+pub const ws = @import("ws/ws.zig");
 /// Scheduled jobs (KickJS `@Cron`).
-pub const cron = @import("cron.zig");
+pub const cron = @import("cron/cron.zig");
 /// File storage: memory, disk and S3 (KickJS `@forinda/kickjs-storage`).
-pub const storage = @import("storage.zig");
+pub const storage = @import("storage/storage.zig");
 /// A WebSocket connection's loop, for runtimes (std, http.zig).
 pub const ws_serve = @import("ws/serve.zig");
 pub const Upload = multipart.Upload;
 pub const UploadedFile = multipart.File;
-pub const swagger = @import("swagger.zig");
-pub const middleware = @import("middleware.zig");
+pub const swagger = @import("openapi/swagger.zig");
+pub const middleware = @import("core/middleware.zig");
 pub const Next = middleware.Next;
-pub const contributor = @import("contributor.zig");
+pub const contributor = @import("core/contributor.zig");
 pub const runtime = struct {
     pub const std = @import("runtime/std.zig");
     pub const Options = @import("runtime/options.zig").Options;
@@ -60,7 +60,7 @@ pub const App = app.App;
 pub const Plugin = app.Plugin;
 pub const Process = app.Process;
 pub const ConfigReport = app.ConfigReport;
-pub const HealthCheck = @import("health.zig").HealthCheck;
+pub const HealthCheck = @import("core/health.zig").HealthCheck;
 pub const Version = app.Version;
 
 test {

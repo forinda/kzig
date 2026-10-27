@@ -5,8 +5,8 @@ const builtin = @import("builtin");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
-pub const S3 = @import("storage/s3.zig").S3;
-pub const S3Settings = @import("storage/s3.zig").Settings;
+pub const S3 = @import("s3.zig").S3;
+pub const S3Settings = @import("s3.zig").Settings;
 
 pub const PutOptions = struct { content_type: ?[]const u8 = null };
 
@@ -306,7 +306,7 @@ pub const Disk = struct {
         defer parent.close(d.io);
         const name = try d.leaf(parent, key);
         var buf: [std.fs.max_path_bytes]u8 = undefined;
-        const temp = try std.mem.print(&buf, "{s}.{s}.tmp", .{ name, &@import("multipart.zig").uuid(d.io) });
+        const temp = try std.mem.print(&buf, "{s}.{s}.tmp", .{ name, &@import("../upload/multipart.zig").uuid(d.io) });
         errdefer parent.deleteFile(d.io, temp) catch {};
         try parent.writeFile(d.io, .{ .sub_path = temp, .data = data });
         // rename replaces the entry itself; it never follows a link there.
@@ -445,7 +445,7 @@ pub fn expectContract(s: Storage) !void {
 }
 
 test {
-    _ = @import("storage/s3.zig");
+    _ = @import("s3.zig");
 }
 
 test "memory storage keeps the contract" {

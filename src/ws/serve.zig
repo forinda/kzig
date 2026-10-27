@@ -2,7 +2,7 @@
 //! 101: frames in, the App's gateway hooks, frames out. Both runtimes run it,
 //! so the socket is closed by the runtime only after the App let go of it.
 const std = @import("std");
-const ws = @import("../ws.zig");
+const ws = @import("ws.zig");
 const frame = @import("frame.zig");
 
 const Io = std.Io;

@@ -43,32 +43,28 @@ zig build --watch      # Rebuild on change
 ```
 src/
   root.zig             # Public API — re-exports only, selective
-  app.zig              # App(.{ … }), Module(.{ … }), Plugin(.{ … }), boot and shutdown
-  adapter.zig          # Adapter hooks, ordering, StartInfo/RouteInfo
-  di.zig               # Comptime container
-  contributor.zig      # Context contributors: precedence, order, typed `got` values
-  config.zig           # Config and settings sections from env
-  decode.zig           # JSON/strings into types with field issues
-  query.zig            # ListQuery (filter/sort/page) and Paginated
-  openapi.zig          # JSON Schema / OpenAPI operations from types, at comptime
-  swagger.zig          # Swagger plugin: /openapi.json, /docs, /redoc
-  health.zig           # Built-in /health/live, /health/ready
-  context.zig          # Ctx, Request/Response views, return-value send
-  router.zig           # Route table as a comptime segment tree, matching, 404/405
-  problem.zig          # RFC 9457 problem bodies, error-set → status
-  middleware.zig       # Next chain; re-exports the built-ins
-  middleware/          # requestId, requestLogger, cors, helmet
-  multipart.zig        # kzig.Upload: multipart/form-data, 413/415
-  cron.zig             # kzig.cron: expressions, zoneinfo timezones, Jobs and the scheduler
-  storage.zig          # kzig.storage: the Storage interface, memory and disk drivers
-  storage/s3.zig       # S3 driver: SigV4, presigned GET, ListObjectsV2 (std.http.Client)
-  ws.zig               # WebSocket gateways: hub, rooms, heartbeat, ws.Ctx
-  ws/frame.zig         # RFC 6455 framing (std runtime; http.zig frames itself)
-  runtime/std.zig      # std.http.Server engine
-  runtime/httpz.zig    # http.zig engine (module kzig_httpz, -Dhttpz)
-  runtime/conformance.zig # Socket behaviour every runtime must pass
-  runtime/wire.zig     # Response rules every runtime applies
-  testing.zig          # In-process runtime and assertions
+  core/                # The pipeline and DI; every app uses all of it
+    app.zig            # App(.{ … }), Module(.{ … }), Plugin(.{ … }), boot and shutdown
+    adapter.zig        # Adapter hooks, ordering, StartInfo/RouteInfo
+    di.zig             # Comptime container
+    contributor.zig    # Context contributors: precedence, order, typed `got` values
+    config.zig         # Config and settings sections from env
+    decode.zig         # JSON/strings into types with field issues
+    context.zig        # Ctx, Request/Response views, return-value send
+    router.zig         # Route table as a comptime segment tree, matching, 404/405
+    problem.zig        # RFC 9457 problem bodies, error-set → status
+    query.zig          # ListQuery (filter/sort/page) and Paginated
+    health.zig         # Built-in /health/live, /health/ready
+    testing.zig        # In-process runtime and assertions, WsClient
+    middleware.zig     # Next chain; re-exports the built-ins
+    middleware/        # requestId, requestLogger, cors, helmet
+  runtime/             # Engines: std.zig, httpz.zig (module kzig_httpz, -Dhttpz),
+                       # conformance.zig (socket behaviour all must pass), wire.zig
+  openapi/             # openapi.zig (schemas/operations at comptime), swagger.zig (/docs)
+  upload/              # multipart.zig: kzig.Upload, 413/415
+  ws/                  # ws.zig (gateways, hub, rooms, heartbeat), frame.zig, serve.zig
+  cron/                # cron.zig: expressions, zoneinfo timezones, Jobs and the scheduler
+  storage/             # storage.zig (interface, memory, disk), s3.zig (SigV4, std.http.Client)
   cli/                 # The `kzig` CLI: main.zig, dev.zig, names, templates/*.tpl, registry
 examples/task-api/     # The one example app; grows each milestone
 benchmarks/            # bench.zig servers + run.sh against KickJS

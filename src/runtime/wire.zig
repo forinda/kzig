@@ -3,7 +3,7 @@
 //! be sent, headers the engine owns.
 const std = @import("std");
 const builtin = @import("builtin");
-const context = @import("../context.zig");
+const context = @import("../core/context.zig");
 
 pub const Wire = struct {
     status: std.http.Status,

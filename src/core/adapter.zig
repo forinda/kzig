@@ -23,7 +23,7 @@ pub const RouteInfo = struct {
     path: []const u8,
     handler: []const u8,
     /// The route's OpenAPI operation (see `kzig.swagger`).
-    doc: ?*const @import("openapi.zig").RouteDoc = null,
+    doc: ?*const @import("../openapi/openapi.zig").RouteDoc = null,
 };
 
 /// `adapters` with each one after the adapters it `depends_on`.

@@ -2,8 +2,8 @@
 //! as `got: struct { upload: kzig.Upload(.{ … }) }`. The runtime's
 //! `max_body_bytes` still bounds the whole request.
 const std = @import("std");
-const Ctx = @import("context.zig").Ctx;
-const kzig_testing = @import("testing.zig");
+const Ctx = @import("../core/context.zig").Ctx;
+const kzig_testing = @import("../core/testing.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -303,7 +303,7 @@ fn form(comptime items: []const [3][]const u8) []const u8 {
     };
 }
 
-const multipart_type: @import("context.zig").Header = .{ .name = "content-type", .value = "multipart/form-data; boundary=XyZ" };
+const multipart_type: @import("../core/context.zig").Header = .{ .name = "content-type", .value = "multipart/form-data; boundary=XyZ" };
 
 test "parts: files and fields, quoted names, the closing delimiter" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
@@ -365,19 +365,19 @@ const UploadController = struct {
         .{ .method = .POST, .path = "/many", .handler = "many" },
         .{ .method = .POST, .path = "/typed/:n", .handler = "typed" },
     };
-    pub fn typed(_: *UploadController, _: *@import("context.zig").Ctx, got: struct { params: struct { n: u8 }, upload: Doc }) void {
+    pub fn typed(_: *UploadController, _: *@import("../core/context.zig").Ctx, got: struct { params: struct { n: u8 }, upload: Doc }) void {
         _ = got;
     }
-    pub fn one(_: *UploadController, _: *@import("context.zig").Ctx, got: struct { upload: Doc }) !struct { name: []const u8, size: usize, title: ?[]const u8, stored: []const u8 } {
+    pub fn one(_: *UploadController, _: *@import("../core/context.zig").Ctx, got: struct { upload: Doc }) !struct { name: []const u8, size: usize, title: ?[]const u8, stored: []const u8 } {
         const f = got.upload.file() orelse return error.BadRequest;
         return .{ .name = f.original_name, .size = f.data.len, .title = got.upload.field("title"), .stored = f.filename };
     }
-    pub fn many(_: *UploadController, _: *@import("context.zig").Ctx, got: struct { upload: Many }) !struct { count: usize } {
+    pub fn many(_: *UploadController, _: *@import("../core/context.zig").Ctx, got: struct { upload: Many }) !struct { count: usize } {
         return .{ .count = got.upload.files.len };
     }
 };
 
-const UploadApp = @import("app.zig").App(.{ .modules = &.{@import("app.zig").Module(.{ .name = "Up", .path = "/up", .controllers = &.{UploadController} })} });
+const UploadApp = @import("../core/app.zig").App(.{ .modules = &.{@import("../core/app.zig").Module(.{ .name = "Up", .path = "/up", .controllers = &.{UploadController} })} });
 
 fn post(target: []const u8, body: []const u8) !kzig_testing.TestResponse {
     var env: std.process.Environ.Map = .init(testing.allocator);

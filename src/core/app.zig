@@ -15,9 +15,9 @@ const mw = @import("middleware.zig");
 const contributor = @import("contributor.zig");
 const decode = @import("decode.zig");
 const adapter_mod = @import("adapter.zig");
-const openapi = @import("openapi.zig");
-const ws = @import("ws.zig");
-const cron = @import("cron.zig");
+const openapi = @import("../openapi/openapi.zig");
+const ws = @import("../ws/ws.zig");
+const cron = @import("../cron/cron.zig");
 
 /// Injectable as `*const kzig.Process`.
 pub const Process = struct {
@@ -1364,7 +1364,7 @@ const DocsController = struct {
 
 const DocsApp = App(.{ .modules = &.{Module(.{ .name = "ItemsModule", .path = "/items", .controllers = &.{DocsController} })}, .health = false });
 
-fn docOf(comptime path: []const u8, comptime method: std.http.Method) *const @import("openapi.zig").RouteDoc {
+fn docOf(comptime path: []const u8, comptime method: std.http.Method) *const @import("../openapi/openapi.zig").RouteDoc {
     inline for (DocsApp.routes) |r| {
         if (comptime std.mem.eql(u8, r.path, path) and r.method == method) return r.doc.?;
     }

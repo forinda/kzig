@@ -713,7 +713,7 @@ test "next run in a zone (KickJS's cron.test: 02:00 Nairobi is 23:00 UTC)" {
     try testing.expectEqual(@as(?i64, at(2026, 7, 15, 10, 0, 0)), noon.nextIn(&berlin, at(2026, 7, 15, 0, 0, 0)));
 }
 
-const app_mod = @import("app.zig");
+const app_mod = @import("../core/app.zig");
 
 const Ticker = struct {
     ticks: std.atomic.Value(u32) = .init(0),

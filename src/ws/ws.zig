@@ -19,9 +19,9 @@
 //! ```
 const std = @import("std");
 const builtin = @import("builtin");
-const context = @import("context.zig");
-const decode = @import("decode.zig");
-const uuid = @import("multipart.zig").uuid;
+const context = @import("../core/context.zig");
+const decode = @import("../core/decode.zig");
+const uuid = @import("../upload/multipart.zig").uuid;
 
 const Io = std.Io;
 const Allocator = std.mem.Allocator;

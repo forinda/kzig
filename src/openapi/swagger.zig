@@ -2,10 +2,10 @@
 //! `/openapi.json`, Swagger UI at `/docs` and ReDoc at `/redoc`, built from
 //! the app's own types. Mount with `.plugins = &.{kzig.swagger.Plugin(.{ … })}`.
 const std = @import("std");
-const app = @import("app.zig");
+const app = @import("../core/app.zig");
 const openapi = @import("openapi.zig");
-const Ctx = @import("context.zig").Ctx;
-const adapter = @import("adapter.zig");
+const Ctx = @import("../core/context.zig").Ctx;
+const adapter = @import("../core/adapter.zig");
 
 pub const Server = struct {
     url: []const u8,
@@ -235,7 +235,7 @@ fn redocHtml(comptime o: Options) []const u8 {
 }
 
 const testing = std.testing;
-const testing_rt = @import("testing.zig");
+const testing_rt = @import("../core/testing.zig");
 
 const Item = struct { id: u32, title: []const u8 };
 

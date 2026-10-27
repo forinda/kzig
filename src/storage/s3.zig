@@ -3,9 +3,9 @@
 //! multipart uploads, upload forms, compose or credential providers.
 const std = @import("std");
 const builtin = @import("builtin");
-const store = @import("../storage.zig");
-const cron = @import("../cron.zig");
-const kzig_config = @import("../config.zig");
+const store = @import("storage.zig");
+const cron = @import("../cron/cron.zig");
+const kzig_config = @import("../core/config.zig");
 
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -37,7 +37,7 @@ pub const Settings = struct {
     /// `bucket` in the path rather than the host; on by default with an endpoint.
     force_path_style: ?bool = null,
 
-    pub fn validate(self: *const Settings, issues: *@import("../decode.zig").Issues) !void {
+    pub fn validate(self: *const Settings, issues: *@import("../core/decode.zig").Issues) !void {
         if ((self.access_key_id == null) != (self.secret_access_key == null))
             try issues.add(if (self.access_key_id == null) "access_key_id" else "secret_access_key", "required with the other key");
         if (self.endpoint) |e| _ = std.Uri.parse(e) catch try issues.add("endpoint", "must be a URL");
@@ -686,10 +686,10 @@ test "list XML and HTTP dates" {
     try testing.expectEqualStrings("Fri, 24 May 2013 00:00:00 GMT", httpDate(&buf, example_time));
 }
 
-const app_mod = @import("../app.zig");
+const app_mod = @import("../core/app.zig");
 const fake_token = "test-session-token";
-const Ctx = @import("../context.zig").Ctx;
-const percentDecode = @import("../context.zig").percentDecode;
+const Ctx = @import("../core/context.zig").Ctx;
+const percentDecode = @import("../core/context.zig").percentDecode;
 
 /// A bucket that checks every request's signature (header or presigned)
 /// the way S3 does, backed by the memory driver.

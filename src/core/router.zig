@@ -19,7 +19,7 @@ pub const Route = struct {
     /// `Controller.handler`, for adapters' `onRouteMount`.
     name: []const u8 = "",
     /// Its OpenAPI part, for adapters (swagger).
-    doc: ?*const @import("openapi.zig").RouteDoc = null,
+    doc: ?*const @import("../openapi/openapi.zig").RouteDoc = null,
 };
 
 /// A route whose handler returns a value; the value is sent with `Ctx.send`.

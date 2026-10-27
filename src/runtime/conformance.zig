@@ -3,13 +3,13 @@
 //! tests call it. Engine-specific behaviour (timeouts, signals) is tested
 //! next to the engine.
 const std = @import("std");
-const context = @import("../context.zig");
-const router = @import("../router.zig");
-const adapter = @import("../adapter.zig");
+const context = @import("../core/context.zig");
+const router = @import("../core/router.zig");
+const adapter = @import("../core/adapter.zig");
 const Options = @import("options.zig").Options;
-const app_mod = @import("../app.zig");
-const ws = @import("../ws.zig");
-const WsClient = @import("../testing.zig").WsClient;
+const app_mod = @import("../core/app.zig");
+const ws = @import("../ws/ws.zig");
+const WsClient = @import("../core/testing.zig").WsClient;
 
 const Io = std.Io;
 const Ctx = context.Ctx;
