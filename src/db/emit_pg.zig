@@ -31,7 +31,7 @@ fn ident(w: W, name: []const u8) !void {
     try w.writeByte('"');
 }
 
-fn literal(w: W, v: []const u8) !void {
+pub fn literal(w: W, v: []const u8) !void {
     try w.writeByte('\'');
     for (v) |ch| {
         if (ch == '\'') try w.writeByte('\'');
@@ -439,13 +439,13 @@ fn startsWord(s: []const u8, words: []const []const u8) bool {
     return false;
 }
 
-fn allowsExpressionDefault(sql_type: []const u8) bool {
+pub fn allowsExpressionDefault(sql_type: []const u8) bool {
     const base = if (std.mem.endsWith(u8, sql_type, "[]")) sql_type[0 .. sql_type.len - 2] else sql_type;
     return startsWord(base, &.{ "tinyint", "smallint", "mediumint", "integer", "int", "int2", "int4", "int8", "bigint", "serial", "bigserial", "smallserial", "real", "float", "float4", "float8", "double", "double precision", "numeric", "decimal", "money", "bit", "bool", "boolean", "timestamp", "timestamptz", "datetime", "date", "time", "timetz", "year", "interval", "uuid" });
 }
 
 /// `-?\d+(\.\d+)?`
-fn isNumber(s: []const u8) bool {
+pub fn isNumber(s: []const u8) bool {
     var i: usize = 0;
     if (i < s.len and s[i] == '-') i += 1;
     const start = i;
@@ -459,7 +459,7 @@ fn isNumber(s: []const u8) bool {
     return i > frac and i == s.len;
 }
 
-fn isFunctionCall(s: []const u8) bool {
+pub fn isFunctionCall(s: []const u8) bool {
     if (std.mem.findScalar(u8, s, '\\') != null) return false;
     if (s.len == 0 or !(std.ascii.isAlphabetic(s[0]) or s[0] == '_')) return false;
     var i: usize = 1;

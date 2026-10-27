@@ -36,7 +36,7 @@ pub fn Relational(comptime S: type, comptime tag: []const u8) type {
         }
 
         pub fn toSql(_: Self, a: Allocator, opts: anytype, comptime first: bool) !query.Sql {
-            var w: Writer = .{ .a = a };
+            var w: Writer = .{ .a = a, .dialect = S.dialect };
             const alias = comptime aliasOf(S, tag, 0);
             try renderSelect(S, tag, 0, opts, &w);
             if (@hasField(@TypeOf(opts), "where")) {

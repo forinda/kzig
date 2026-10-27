@@ -5,6 +5,7 @@ const std = @import("std");
 const schema = @import("schema.zig");
 const Timestamp = @import("timestamp.zig").Timestamp;
 const pg = @import("pg.zig");
+const emit_sqlite = @import("emit_sqlite.zig");
 const relational = @import("relational.zig");
 const dbm = @import("db.zig");
 
@@ -12,7 +13,8 @@ const Allocator = std.mem.Allocator;
 const EnumLiteral = @TypeOf(.enum_literal);
 
 /// A query as written: SQL with `$n` placeholders and their values as text.
-pub const Sql = struct { sql: []const u8, params: []const ?[]const u8 };
+pub const Sql = struct { sql: []const u8, params: []const ?[]const u8, dialect: Dialect = .postgres };
+const Dialect = dbm.Dialect;
 
 /// Where queries run: the pool, or a transaction.
 pub const Conn = union(enum) { pool: *dbm.Pool, tx: *dbm.Tx };
@@ -110,6 +112,7 @@ pub fn Client(comptime S: type) type {
 
 pub const Writer = struct {
     a: Allocator,
+    dialect: Dialect = .postgres,
     buf: std.ArrayList(u8) = .empty,
     params: std.ArrayList(?[]const u8) = .empty,
 
@@ -127,12 +130,19 @@ pub const Writer = struct {
     }
 
     pub fn param(w: *Writer, v: anytype) !void {
-        try w.params.append(w.a, try pg.encodeValue(w.a, v, .postgres));
-        try w.buf.print(w.a, "${d}", .{w.params.items.len});
+        try w.params.append(w.a, try pg.encodeValue(w.a, v, w.dialect));
+        try w.buf.print(w.a, "{s}{d}", .{ if (w.dialect == .sqlite) "?" else "$", w.params.items.len });
+    }
+
+    /// A comparison's operator; SQLite has no ILIKE, and its LIKE already
+    /// ignores ASCII case.
+    pub fn op(w: *Writer, comptime o: []const u8) !void {
+        if (w.dialect == .sqlite and comptime std.mem.endsWith(u8, o, "ILIKE")) return w.raw(" " ++ o[0 .. o.len - 5] ++ "LIKE ");
+        try w.raw(" " ++ o ++ " ");
     }
 
     pub fn done(w: *Writer) Sql {
-        return .{ .sql = w.buf.items, .params = w.params.items };
+        return .{ .sql = w.buf.items, .params = w.params.items, .dialect = w.dialect };
     }
 };
 
@@ -254,7 +264,7 @@ fn Cmp(comptime col: []const u8, comptime op: []const u8, comptime V: type, comp
         pub fn render(self: @This(), comptime sc: Scope, w: *Writer) !void {
             const l = comptime resolveCol(sc, col);
             try writeCol(w, l);
-            try w.raw(" " ++ op ++ " ");
+            try w.op(op);
             if (lit) |name| {
                 // An enum's value, or another column (`.@"teams.id"`).
                 if (comptime @typeInfo(l.Z) == .@"enum" and @hasField(l.Z, name)) return w.param(@as([]const u8, name));
@@ -498,7 +508,16 @@ fn opExpr(comptime col: anytype, comptime op: Op, value: anytype) OpExpr(col, op
 
 // ---- running
 
+fn connDialect(conn: Conn) Dialect {
+    return switch (conn) {
+        .pool => |p| p.dialect(),
+        .tx => |t| t.pool.dialect(),
+    };
+}
+
 pub fn runRows(conn: Conn, a: Allocator, comptime Row: type, q: Sql) ![]Row {
+    // A schema's SQL only runs on its own kind of database.
+    if (connDialect(conn) != q.dialect) return error.DialectMismatch;
     return switch (conn) {
         .pool => |p| p.queryParams(a, Row, q.sql, q.params),
         .tx => |t| t.queryParams(a, Row, q.sql, q.params),
@@ -506,6 +525,7 @@ pub fn runRows(conn: Conn, a: Allocator, comptime Row: type, q: Sql) ![]Row {
 }
 
 fn runExec(conn: Conn, q: Sql) !u64 {
+    if (connDialect(conn) != q.dialect) return error.DialectMismatch;
     return switch (conn) {
         .pool => |p| p.execParams(q.sql, q.params),
         .tx => |t| t.execParams(q.sql, q.params),
@@ -812,7 +832,7 @@ pub fn Select(comptime S: type, comptime spec: SelectSpec, comptime W: type, com
         }
 
         pub fn toSql(self: Self, a: Allocator) !Sql {
-            var w: Writer = .{ .a = a };
+            var w: Writer = .{ .a = a, .dialect = S.dialect };
             try self.renderInto(&w);
             return w.done();
         }
@@ -820,7 +840,7 @@ pub fn Select(comptime S: type, comptime spec: SelectSpec, comptime W: type, com
         /// `count(*)` of the rows this query matches (its columns, order and
         /// limit left out).
         pub fn count(self: Self, a: Allocator) !i64 {
-            var w: Writer = .{ .a = a };
+            var w: Writer = .{ .a = a, .dialect = S.dialect };
             if (spec.distinct or spec.group.len > 0) {
                 // Distinct rows or groups: count the query's own rows.
                 var inner = self;
@@ -958,7 +978,7 @@ pub fn Insert(comptime S: type, comptime tag: []const u8, comptime ret: ?[]const
             for (rows) |row| inline for (keys, 0..) |k, i| {
                 if (comptime @typeInfo(@FieldType(T.Insert, k)) != .optional) given[i] = true else if (@field(row, k) != null) given[i] = true;
             };
-            var w: Writer = .{ .a = a };
+            var w: Writer = .{ .a = a, .dialect = S.dialect };
             try w.raw("INSERT INTO ");
             try w.ident(info.name);
             if (std.mem.findScalar(bool, &given, true) == null) {
@@ -981,7 +1001,15 @@ pub fn Insert(comptime S: type, comptime tag: []const u8, comptime ret: ?[]const
                         first = false;
                         const v = @field(row, k);
                         if (comptime @typeInfo(@TypeOf(v)) == .optional) {
-                            if (v) |x| try w.param(x) else try w.raw("DEFAULT");
+                            if (v) |x| try w.param(x) else if (S.dialect == .sqlite) {
+                                // No DEFAULT in SQLite's VALUES: the default itself.
+                                const col = info.columns[i];
+                                if (col.default) |d| {
+                                    var out: std.Io.Writer.Allocating = .init(w.a);
+                                    try emit_sqlite.formatDefault(&out.writer, d, col.sql_type, col.default_sql);
+                                    try w.raw(out.written());
+                                } else try w.raw("NULL");
+                            } else try w.raw("DEFAULT");
                         } else try w.param(v);
                     };
                     try w.raw(")");
@@ -1068,7 +1096,7 @@ pub fn Update(comptime S: type, comptime tag: []const u8, comptime W: type, comp
 
         pub fn toSql(self: Self, a: Allocator) !Sql {
             const info = S.info(@field(S.Tag, tag));
-            var w: Writer = .{ .a = a };
+            var w: Writer = .{ .a = a, .dialect = S.dialect };
             try w.raw("UPDATE ");
             try w.ident(info.name);
             try w.raw(" SET ");
@@ -1130,7 +1158,7 @@ pub fn Delete(comptime S: type, comptime tag: []const u8, comptime W: type, comp
         }
 
         pub fn toSql(self: Self, a: Allocator) !Sql {
-            var w: Writer = .{ .a = a };
+            var w: Writer = .{ .a = a, .dialect = S.dialect };
             try w.raw("DELETE FROM ");
             try w.ident(S.info(@field(S.Tag, tag)).name);
             try renderWheres(self.wheres, scope, &w);
@@ -1162,6 +1190,7 @@ const people = schema.table("people", .{
 }, .{});
 const TestSchema = schema.Schema(.{ .teams = teams, .people = people }, .{});
 const Snake = schema.Schema(.{ .teams = teams, .people = people }, .{ .casing = .snake_case });
+const Lite = schema.Schema(.{ .teams = teams, .people = people }, .{ .dialect = .sqlite });
 
 fn expectSql(q: anytype, text: []const u8, params: []const ?[]const u8) !void {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
@@ -1256,6 +1285,58 @@ test "snake_case: database names in SQL, keys in rows" {
     try expectSql(sc.insertInto(.people).values(.{ .name = "A", .teamId = 1 }), "INSERT INTO \"people\" (\"name\", \"team_id\") VALUES ($1, $2)", &.{ "A", "1" });
 }
 
+test "sqlite: ?n placeholders, LIKE for ilike, 1/0 booleans, a missing cell takes the column's default" {
+    const lc: Client(Lite) = .{ .conn = undefined };
+    try expectSql(
+        lc.selectFrom(.people).select(.{ .id, .name }).where(.role, .eq, .admin).where(.age, .gte, 18)
+            .orderBy(.joined, .desc).limit(20).offset(40),
+        "SELECT \"id\", \"name\" FROM \"people\" WHERE \"role\" = ?1 AND \"age\" >= ?2 ORDER BY \"joined\" DESC LIMIT ?3 OFFSET ?4",
+        &.{ "admin", "18", "20", "40" },
+    );
+    // SQLite has no ILIKE; its LIKE ignores ASCII case.
+    try expectSql(lc.selectFrom(.people).select(.{.id}).whereExpr(ilike(.name, "ad%")), "SELECT \"id\" FROM \"people\" WHERE \"name\" LIKE ?1", &.{"ad%"});
+    try expectSql(lc.selectFrom(.people).select(.{.id}).where(.name, .ilike, "ad%"), "SELECT \"id\" FROM \"people\" WHERE \"name\" LIKE ?1", &.{"ad%"});
+    try expectSql(lc.selectFrom(.people).select(.{.id}).whereExpr(not(lt(.joined, Timestamp{ .us = 1_500 }))), "SELECT \"id\" FROM \"people\" WHERE NOT (\"joined\" < ?1)", &.{"1970-01-01 00:00:00.001"});
+    // No DEFAULT keyword in SQLite's VALUES: the column's default, or NULL.
+    try expectSql(
+        lc.insertInto(.people).valuesMany(&.{ .{ .name = "A", .role = .admin }, .{ .name = "B", .age = 3, .joined = Timestamp{ .us = 0 } } }),
+        "INSERT INTO \"people\" (\"name\", \"role\", \"age\", \"joined\") VALUES (?1, ?2, NULL, (strftime('%Y-%m-%d %H:%M:%f', 'now'))), (?3, 'member', ?4, ?5)",
+        &.{ "A", "admin", "B", "3", "1970-01-01 00:00:00.000" },
+    );
+}
+
+test "sqlite: the builder against a Postgres pool, or the reverse, is refused" {
+    var pool: dbm.Pool = .{ .io = testing.io, .gpa = testing.allocator, .driver = .{ .pg = undefined }, .arena = .init(testing.allocator), .permits = .{ .permits = 0 } };
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const db: Client(Lite) = .init(.{ .pool = &pool });
+    try testing.expectError(error.DialectMismatch, db.selectFrom(.teams).execute(arena.allocator()));
+}
+
+fn setupLite(pool: *dbm.Pool) !void {
+    try pool.execScript(
+        \\CREATE TABLE teams (id integer PRIMARY KEY, title text NOT NULL UNIQUE);
+        \\CREATE TABLE people (id integer PRIMARY KEY, name text NOT NULL, email text UNIQUE,
+        \\  role text NOT NULL DEFAULT 'member' CHECK (role IN ('admin', 'member')), age integer,
+        \\  joined text NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now')),
+        \\  "teamId" integer REFERENCES teams(id));
+    );
+}
+
+test "runs on SQLite: insert, select, join, update, delete; upsert and findOrCreate" {
+    if (!@import("kzig_options").sqlite) return error.SkipZigTest;
+    {
+        var pool: dbm.Pool = try .init(testing.io, testing.allocator, .{ .url = "sqlite::memory:" });
+        defer pool.deinit();
+        try setupLite(&pool);
+        try insertSelectSuite(Lite, &pool);
+    }
+    var pool: dbm.Pool = try .init(testing.io, testing.allocator, .{ .url = "sqlite::memory:" });
+    defer pool.deinit();
+    try setupLite(&pool);
+    try upsertSuite(Lite, &pool);
+}
+
 fn setupPeople(pool: *dbm.Pool) !void {
     try pool.execScript(
         \\DROP TABLE IF EXISTS people, teams; DROP TYPE IF EXISTS role;
@@ -1282,10 +1363,14 @@ test "runs on Postgres: insert, select, join, update, delete" {
     defer pool.deinit();
     try setupPeople(&pool);
     defer dropPeople(&pool);
+    try insertSelectSuite(TestSchema, &pool);
+}
+
+fn insertSelectSuite(comptime S: type, pool: *dbm.Pool) !void {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const db: Client(TestSchema) = .init(.{ .pool = &pool });
+    const db: Client(S) = .init(.{ .pool = pool });
 
     const team = try db.insertInto(.teams).values(.{ .title = "core" }).returningAll().executeTakeFirstOrThrow(a);
     const tricky = "O'Brien; DROP TABLE teams --";
@@ -1332,10 +1417,14 @@ test "upsert and findOrCreate" {
     defer pool.deinit();
     try setupPeople(&pool);
     defer dropPeople(&pool);
+    try upsertSuite(TestSchema, &pool);
+}
+
+fn upsertSuite(comptime S: type, pool: *dbm.Pool) !void {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const db: Client(TestSchema) = .init(.{ .pool = &pool });
+    const db: Client(S) = .init(.{ .pool = pool });
 
     const first = try db.upsert(a, .people, .{ .name = "A", .email = "a@x" }, .{ .target = .{.email} });
     const second = try db.upsert(a, .people, .{ .name = "A2", .email = "a@x", .age = 5 }, .{ .target = .{.email} });
@@ -1362,7 +1451,7 @@ test "upsert and findOrCreate" {
 
     // Racing creators: one creates, every one gets the same row.
     const Race = struct {
-        fn run(d: Client(TestSchema), created: *std.atomic.Value(u32), failed: *std.atomic.Value(u32)) void {
+        fn run(d: Client(S), created: *std.atomic.Value(u32), failed: *std.atomic.Value(u32)) void {
             var ar: std.heap.ArenaAllocator = .init(testing.allocator);
             defer ar.deinit();
             const r = d.findOrCreate(ar.allocator(), .teams, .{ .title = "race" }, .{}) catch {
@@ -1380,6 +1469,8 @@ test "upsert and findOrCreate" {
     try testing.expectEqual(0, failed.load(.acquire));
     try testing.expectEqual(1, created.load(.acquire));
 
+    // SQLite has one writer: no second transaction to race against.
+    if (S.dialect == .sqlite) return;
     // Inside a transaction a lost race doesn't abort it (savepoint): another
     // transaction holds an uncommitted "taken", so our read misses, our
     // insert waits for it, and conflicts once it commits.
@@ -1395,7 +1486,7 @@ test "upsert and findOrCreate" {
     var later = try testing.io.concurrent(Commit.run, .{&other});
     var tx = try pool.begin();
     defer tx.deinit();
-    const txdb: Client(TestSchema) = .init(.{ .tx = &tx });
+    const txdb: Client(S) = .init(.{ .tx = &tx });
     const taken = try txdb.findOrCreate(a, .teams, .{ .title = "taken" }, .{});
     later.await(testing.io);
     try testing.expect(!taken.created);

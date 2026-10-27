@@ -108,13 +108,18 @@ pub const SchemaOptions = struct {
     /// kick/db's `casing: 'snake_case'`: keys stay camelCase, the database's
     /// names are snake_case.
     casing: ?enum { snake_case } = null,
+    /// The SQL the schema's database speaks.
+    dialect: @import("db.zig").Dialect = .postgres,
 };
 
 /// `Schema`'s options as given: `.casing` and `.relations`.
 fn optionsOf(comptime o: anytype) SchemaOptions {
-    for (@typeInfo(@TypeOf(o)).@"struct".field_names) |f| if (!std.mem.eql(u8, f, "casing") and !std.mem.eql(u8, f, "relations"))
-        @compileError("Schema: no option ." ++ f ++ " (casing, relations)");
-    return .{ .casing = if (@hasField(@TypeOf(o), "casing")) o.casing else null };
+    for (@typeInfo(@TypeOf(o)).@"struct".field_names) |f| if (!std.mem.eql(u8, f, "casing") and !std.mem.eql(u8, f, "relations") and !std.mem.eql(u8, f, "dialect"))
+        @compileError("Schema: no option ." ++ f ++ " (casing, dialect, relations)");
+    return .{
+        .casing = if (@hasField(@TypeOf(o), "casing")) o.casing else null,
+        .dialect = if (@hasField(@TypeOf(o), "dialect")) o.dialect else .postgres,
+    };
 }
 
 pub const RelationKind = enum { one, many };
@@ -318,6 +323,7 @@ pub fn Schema(comptime tables: anytype, comptime given: anytype) type {
             /// pg enums used by the columns, sorted by name.
             pub const enums: []const EnumInfo = enums_final;
             pub const casing = options.casing;
+            pub const dialect = options.dialect;
 
             pub fn Table(comptime t: Tag) type {
                 return @field(tables, @tagName(t));
