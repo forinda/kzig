@@ -9,6 +9,7 @@ const std = @import("std");
 const Names = @import("names.zig").Names;
 const render = @import("templates.zig").render;
 const registry = @import("registry.zig");
+const dev = @import("dev.zig");
 
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -28,6 +29,10 @@ const usage =
     \\  kzig g controller|service <name> [--module <dir>]
     \\  kzig g middleware|contributor|adapter <name>
     \\      One file to wire in yourself.
+    \\
+    \\  kzig dev [--bin <name>] [-- <app args>]
+    \\      Builds and runs the app; rebuilds and restarts it when src/ or
+    \\      build.zig changes (NODE_ENV=development unless set).
     \\
     \\  kzig rm module <name> [--force]
     \\      Deletes the module's folder and unmounts it (asks first unless --force).
@@ -91,6 +96,7 @@ const Cli = struct {
     gpa: Allocator,
     out: *Io.Writer,
     cwd: Io.Dir,
+    environ: *const std.process.Environ.Map,
 
     fn print(cli: Cli, comptime fmt: []const u8, args: anytype) void {
         cli.out.print(fmt, args) catch {};
@@ -105,6 +111,9 @@ const Flags = struct {
     no_fetch: bool = false,
     kzig: ?[]const u8 = null,
     module: ?[]const u8 = null,
+    bin: ?[]const u8 = null,
+    /// After `--`: passed to the app by `kzig dev`.
+    rest: []const []const u8 = &.{},
 };
 
 fn parse(arena: Allocator, args: []const [:0]const u8) !Flags {
@@ -113,16 +122,23 @@ fn parse(arena: Allocator, args: []const [:0]const u8) !Flags {
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const a = args[i];
-        if (std.mem.eql(u8, a, "--force")) {
+        if (std.mem.eql(u8, a, "--")) {
+            flags.rest = args[i + 1 ..];
+            break;
+        } else if (std.mem.eql(u8, a, "--force")) {
             flags.force = true;
         } else if (std.mem.eql(u8, a, "--minimal")) {
             flags.minimal = true;
         } else if (std.mem.eql(u8, a, "--no-fetch")) {
             flags.no_fetch = true;
-        } else if (std.mem.eql(u8, a, "--kzig") or std.mem.eql(u8, a, "--module")) {
+        } else if (std.mem.eql(u8, a, "--kzig") or std.mem.eql(u8, a, "--module") or std.mem.eql(u8, a, "--bin")) {
             i += 1;
             if (i == args.len) return error.MissingValue;
-            if (a[2] == 'k') flags.kzig = args[i] else flags.module = args[i];
+            switch (a[2]) {
+                'k' => flags.kzig = args[i],
+                'm' => flags.module = args[i],
+                else => flags.bin = args[i],
+            }
         } else if (std.mem.startsWith(u8, a, "--")) {
             return error.UnknownFlag;
         } else try positional.append(arena, a);
@@ -135,7 +151,7 @@ pub fn main(init: std.process.Init) !u8 {
     const arena = init.arena.allocator();
     var buf: [4096]u8 = undefined;
     var stdout: Io.File.Writer = .init(.stdout(), init.io, &buf);
-    const cli: Cli = .{ .io = init.io, .arena = arena, .gpa = init.gpa, .out = &stdout.interface, .cwd = Io.Dir.cwd() };
+    const cli: Cli = .{ .io = init.io, .arena = arena, .gpa = init.gpa, .out = &stdout.interface, .cwd = Io.Dir.cwd(), .environ = init.environ_map };
 
     const args = try init.minimal.args.toSlice(arena);
     const flags = parse(arena, args[1..]) catch |err| {
@@ -168,6 +184,11 @@ fn run(cli: Cli, flags: Flags) !void {
         if (std.mem.eql(u8, p[1], "module")) return generateModule(cli, flags, p[2]);
         for (stubs) |s| if (std.mem.eql(u8, p[1], s.kind)) return generateStub(cli, flags, s, p[2]);
         return error.Usage;
+    }
+    if (std.mem.eql(u8, cmd, "dev")) {
+        if (p.len != 1) return error.Usage;
+        try requireProject(cli);
+        return dev.run(cli.io, cli.gpa, cli.arena, cli.environ, cli.out, .{ .bin = flags.bin, .args = flags.rest });
     }
     if (std.mem.eql(u8, cmd, "rm") or std.mem.eql(u8, cmd, "remove")) {
         if (p.len != 3 or !std.mem.eql(u8, p[1], "module")) return error.Usage;
@@ -373,4 +394,5 @@ test {
     _ = @import("names.zig");
     _ = @import("templates.zig");
     _ = @import("registry.zig");
+    _ = @import("dev.zig");
 }

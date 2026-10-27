@@ -219,6 +219,7 @@ before the response is written — a response body must not borrow memory `dispo
 $ zig build                  # builds zig-out/bin/kzig
 $ kzig new my-api            # an App with a hello module, tests and Swagger; fetches kzig
 $ cd my-api && zig build test
+$ kzig dev                   # zig build + run; rebuilds and restarts on change
 $ kzig g module task         # src/modules/tasks: REST CRUD with an in-memory repository and tests
 $ kzig g middleware audit    # also: controller, service, contributor, adapter
 $ kzig rm module task
@@ -227,6 +228,10 @@ $ kzig rm module task
 `kzig g module` writes KickJS's REST module — `GET /` (filter/sort/page), `GET /:id`, `POST /`
 (201), `PATCH /:id`, `DELETE /:id` (204) — and mounts it. task-api's `tasks` module was generated
 this way.
+
+`kzig dev` watches `src/`, `build.zig` and `build.zig.zon`, sets `NODE_ENV=development` unless
+it is set, and passes arguments after `--` to the app. A build that fails leaves the running app
+up; Ctrl-C stops both.
 
 ## Testing
 
@@ -347,7 +352,7 @@ stays the default. Against KickJS on Express, on one machine (see [benchmarks](.
 | `definePlugin({ modules, adapters, … })` | `kzig.Plugin(.{ … })` in `.plugins` |
 | `app.shutdown()` on SIGTERM | `kzig.runtime.std.serve(…)` + `defer app.deinit()` |
 | `SwaggerAdapter({ info })`, `@ApiTags`, `@ApiOperation`, `@ApiResponse` | `kzig.swagger.Plugin(.{ … })`, `docs` / `.docs` data |
-| `kick new`, `kick g module`, `kick rm module` | `kzig new`, `kzig g module`, `kzig rm module` |
+| `kick new`, `kick dev`, `kick g module`, `kick rm module` | `kzig new`, `kzig dev`, `kzig g module`, `kzig rm module` |
 | `bootstrap({ runtime: fastifyRuntime() })` | `@import("kzig_httpz").serve(…)` (`-Dhttpz`) |
 | `@Post('/', { body: zodSchema })` / `ctx.body` | `got: struct { body: CreateProject }` |
 | `ctx.qs(config)` / `ctx.paginate(…)` | `got.query: kzig.ListQuery(config)` / `query.paginate(…)` |

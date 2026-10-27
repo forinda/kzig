@@ -40,6 +40,27 @@ step "module names that shadow template names: query, page, error"
 "$KZIG" g module error
 zig build test
 
+step "kzig dev rebuilds and restarts on change"
+PORT=39811 "$KZIG" dev > dev.log 2>&1 &
+DEV=$!
+waitfor() { # seconds command…
+  local until=$((SECONDS + $1)); shift
+  until "$@" >/dev/null 2>&1; do
+    if [ $SECONDS -ge $until ]; then echo "timed out: $*" >&2; cat dev.log >&2; kill $DEV 2>/dev/null; exit 1; fi
+    sleep 0.5
+  done
+}
+says() { curl -sf localhost:39811/api/v1/hello | grep -q "$1"; }
+waitfor 180 says "Hello World"
+edit 's/Hello {s} from kzig!/Hi {s} from kzig!/' src/modules/hello/hello.service.zig
+waitfor 180 says "Hi World"
+edit 's/Hi {s} from kzig!/Hello {s} from kzig!/' src/modules/hello/hello.service.zig
+waitfor 180 says "Hello World"
+kill -INT $DEV
+wait $DEV
+if curl -sf localhost:39811/api/v1/hello >/dev/null 2>&1; then echo "the app outlived kzig dev" >&2; exit 1; fi
+grep -q "restarted" dev.log
+
 step "kzig g module note --minimal"
 "$KZIG" g module note --minimal
 zig build test
