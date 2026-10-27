@@ -13,7 +13,7 @@ const std = @import("std");
 const Ctx = @import("context.zig").Ctx;
 
 /// `got` fields filled from the request instead of a contributor.
-pub const request_data = [_][]const u8{ "body", "query", "params" };
+pub const request_data = [_][]const u8{ "body", "query", "params", "upload" };
 
 fn isRequestData(comptime name: []const u8) bool {
     for (request_data) |r| if (std.mem.eql(u8, r, name)) return true;
@@ -95,6 +95,8 @@ pub fn Plan(comptime levels: [5][]const type, comptime handler_got: ?type, compt
             };
         };
 
+        if (data_types[0] != null and data_types[3] != null)
+            @compileError(where ++ ": reads both 'body' and 'upload'; a multipart route's fields are in upload.fields");
         const sorted = topoSort(merged, where);
         var early: []const type = &.{};
         var late: []const type = &.{};
@@ -142,6 +144,7 @@ pub fn Plan(comptime levels: [5][]const type, comptime handler_got: ?type, compt
             pub const Body: ?type = data_final[0];
             pub const Query: ?type = data_final[1];
             pub const Params: ?type = data_final[2];
+            pub const Upload: ?type = data_final[3];
             pub const late_order: []const type = late_final;
             /// One `?V` per key; null until its contributor ran (or failed, if optional).
             pub const Store = StoreT;

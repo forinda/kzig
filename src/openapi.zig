@@ -144,6 +144,11 @@ pub fn routeDoc(
         const params = parameters(path, P.Params, P.Query);
         if (params.len > 0) op = op ++ ",\"parameters\":[" ++ params ++ "]";
         if (P.Body) |B| op = op ++ ",\"requestBody\":{\"required\":true,\"content\":{\"application/json\":{\"schema\":" ++ schema(B) ++ "}}}";
+        if (P.Upload) |U| {
+            const binary = "{\"type\":\"string\",\"format\":\"binary\"}";
+            op = op ++ ",\"requestBody\":{\"required\":true,\"content\":{\"multipart/form-data\":{\"schema\":{\"type\":\"object\",\"properties\":{\"" ++
+                escape(U.config.field) ++ "\":" ++ (if (U.config.max_count > 1) "{\"type\":\"array\",\"items\":" ++ binary ++ "}" else binary) ++ "}}}}}";
+        }
 
         var responses: []const u8 = "";
         var listed: []const u16 = &.{};
@@ -157,6 +162,11 @@ pub fn routeDoc(
             responses = defaultResponse(C, handler);
         }
         if (P.Body != null and !has(listed, 400)) responses = responses ++ ",\"400\":{\"description\":\"Malformed JSON\",\"content\":" ++ problem_ref ++ "}";
+        if (P.Upload != null) {
+            if (!has(listed, 400)) responses = responses ++ ",\"400\":{\"description\":\"Malformed multipart body\",\"content\":" ++ problem_ref ++ "}";
+            if (!has(listed, 413)) responses = responses ++ ",\"413\":{\"description\":\"File too large, or too many\",\"content\":" ++ problem_ref ++ "}";
+            if (!has(listed, 415)) responses = responses ++ ",\"415\":{\"description\":\"File type not allowed\",\"content\":" ++ problem_ref ++ "}";
+        }
         if ((P.Body != null or P.Query != null or P.Params != null) and !has(listed, 422))
             responses = responses ++ ",\"422\":{\"description\":\"Validation error\",\"content\":" ++ problem_ref ++ "}";
         op = op ++ ",\"responses\":{" ++ responses ++ "}";

@@ -134,6 +134,13 @@ pub const Ctx = struct {
         ctx.res.sent = true;
     }
 
+    /// Raw data, a download say, with its content type.
+    pub fn bytes(ctx: *Ctx, content_type: []const u8, data: []const u8) !void {
+        try ctx.setHeader("content-type", content_type);
+        ctx.res.body = data;
+        ctx.res.sent = true;
+    }
+
     pub fn noContent(ctx: *Ctx) void {
         ctx.status(.no_content);
         ctx.res.body = "";
@@ -290,6 +297,16 @@ const Fixture = struct {
 };
 
 const get_root: Request = .{ .method = .GET, .path = "/", .query = "", .headers = &.{}, .body = "" };
+
+test "bytes sends raw data with its content type" {
+    var f: Fixture = undefined;
+    f.init(get_root);
+    defer f.deinit();
+    try f.ctx.bytes("image/png", "\x89PNG");
+    try testing.expectEqualStrings("\x89PNG", f.res.body);
+    try testing.expectEqualStrings("image/png", f.header("content-type").?);
+    try testing.expect(f.res.sent);
+}
 
 test "json sets content-type and body" {
     var f: Fixture = undefined;

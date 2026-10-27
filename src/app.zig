@@ -503,8 +503,10 @@ fn thunk(comptime AppT: type, comptime C: type, comptime name: []const u8, compt
 }
 
 /// KickJS's `validate()`: body, then query, then params; the first that
-/// fails answers 422 with every field error.
+/// fails answers 422 with every field error. An upload is read first.
 fn decodeRequest(comptime P: type, ctx: *Ctx, store: *P.Store) !void {
+    // Before validation, as KickJS's upload middleware runs first.
+    if (P.Upload) |T| store.upload = try T.parse(ctx);
     if (P.Body) |T| {
         var issues: decode.Issues = .init(ctx.arena);
         store.body = try decode.json(T, ctx.arena, try jsonBody(ctx), &issues) orelse

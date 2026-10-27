@@ -18,6 +18,9 @@ pub const Paginated = query.Paginated;
 pub const Sort = query.Sort;
 pub const Filter = query.Filter;
 pub const openapi = @import("openapi.zig");
+pub const multipart = @import("multipart.zig");
+pub const Upload = multipart.Upload;
+pub const UploadedFile = multipart.File;
 pub const swagger = @import("swagger.zig");
 pub const middleware = @import("middleware.zig");
 pub const Next = middleware.Next;
@@ -53,6 +56,7 @@ pub const HealthCheck = @import("health.zig").HealthCheck;
 pub const Version = app.Version;
 
 test {
+    _ = multipart;
     _ = context;
     _ = problem;
     _ = router;

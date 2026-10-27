@@ -255,10 +255,20 @@ Follow-ups:
 - [x] Plurals for irregular words (`person`, `data`, `quiz`) and acronyms (`HTTPClient`)
 - [x] Generated tests: a search test with more than one row; 404 documented on `/:id` routes
 
+### M9 — File uploads and WebSockets
+
+- [x] `kzig.Upload(.{ .field, .max_size, .max_count, .allowed_types })` read as `got.upload`:
+      multipart parsed from the body; 415 for a type not allowed, 413 over the size or count,
+      400 malformed; server-side names never from the client; OpenAPI `multipart/form-data`
+- [ ] task-api `files` module (`file-storage-api`, disk storage): API key, signed download links
+- [ ] WebSocket gateways (`@forinda/kickjs-ws`): `.gateways` on modules, `{event, data}` frames,
+      rooms, `connect`/`disconnect`/`draining`, heartbeat, close codes; on both runtimes
+- [ ] task-api `chat` module (`ws-chat`, without Redis): tokens, rooms, presence
+
 ### Later
 
-Radix-tree router, SSE, multipart uploads (`file-storage-api`), WebSockets (`ws-chat`), cron
-(`cron-jobs-api`), queues, database layer, a third engine (`io_uring`, edge).
+Radix-tree router, SSE, S3 storage, a WebSocket broker (Redis), cron (`cron-jobs-api`), queues,
+database layer, a third engine (`io_uring`, edge).
 
 ## Open questions
 
