@@ -79,7 +79,13 @@ pub fn Server(comptime App: type) type {
                 stream.close(io);
                 self.permits.post(io);
             }
-            setReadTimeout(stream, self.options.read_timeout_ms);
+            var deadline: std.atomic.Value(i64) = .init(std.math.maxInt(i64));
+            var dog = if (self.options.read_timeout_ms > 0)
+                io.concurrent(watchdog, .{ io, stream, &deadline }) catch null
+            else
+                null;
+            defer if (dog) |*d| d.cancel(io) catch {};
+            const timeout_ms = self.options.read_timeout_ms;
 
             const read_buf = self.gpa.alloc(u8, self.options.max_header_bytes) catch return;
             defer self.gpa.free(read_buf);
@@ -92,6 +98,7 @@ pub fn Server(comptime App: type) type {
 
             while (true) {
                 _ = arena.reset(.retain_capacity);
+                arm(io, &deadline, timeout_ms);
                 var req = server.receiveHead() catch |err| {
                     const status: http.Status = switch (err) {
                         error.HttpHeadersOversize => .request_header_fields_too_large,
@@ -101,7 +108,7 @@ pub fn Server(comptime App: type) type {
                     writeRaw(&sw.interface, status);
                     return lingerClose(io, stream, &sr.interface);
                 };
-                switch (self.serveRequest(&req, arena.allocator()) catch return) {
+                switch (self.serveRequest(&req, arena.allocator(), &deadline) catch return) {
                     .keep_alive => {},
                     .close => return,
                     .linger => return lingerClose(io, stream, &sr.interface),
@@ -109,7 +116,8 @@ pub fn Server(comptime App: type) type {
             }
         }
 
-        fn serveRequest(self: *Self, req: *http.Server.Request, arena: std.mem.Allocator) !Next {
+        fn serveRequest(self: *Self, req: *http.Server.Request, arena: std.mem.Allocator, deadline: *std.atomic.Value(i64)) !Next {
+            const io = self.io;
             // Reading the body invalidates the head's strings, so copy first.
             const target = try arena.dupe(u8, req.head.target);
             var headers: std.ArrayList(context.Header) = .empty;
@@ -124,13 +132,20 @@ pub fn Server(comptime App: type) type {
             const max = self.options.max_body_bytes;
             if (req.head.content_length) |len| if (len > max) return tooLarge(req);
             var body: []const u8 = "";
-            if (method.requestHasBody()) {
+            // RFC 9112 §6.3: a request with neither header has no body; reading
+            // to EOF would swallow the next request on the connection.
+            const has_body = req.head.content_length != null or req.head.transfer_encoding != .none;
+            if (method.requestHasBody() and has_body) {
                 var body_buf: [4096]u8 = undefined;
                 const r = try req.readerExpectContinue(&body_buf);
                 body = r.allocRemaining(arena, .limited(max)) catch |err| switch (err) {
                     error.StreamTooLong => return tooLarge(req),
                     else => return err,
                 };
+            } else if (method.requestHasBody()) {
+                // std.http asserts a body-carrying method has a length when it
+                // discards the body before responding; there is none to discard.
+                req.server.reader.state = .ready;
             }
 
             const q = std.mem.indexOfScalar(u8, target, '?');
@@ -143,13 +158,16 @@ pub fn Server(comptime App: type) type {
             };
             var res: context.Response = .{};
             var ctx: Ctx = .{ .arena = arena, .req = &request, .res = &res };
+            // The timeout bounds the client, not the handler.
+            deadline.store(std.math.maxInt(i64), .monotonic);
             App.handle(&ctx);
+            arm(io, deadline, self.options.read_timeout_ms);
 
             const out = try arena.alloc(http.Header, res.headers.items.len);
             var n: usize = 0;
             for (res.headers.items) |h| {
-                // std asserts on CR/LF in headers; drop them rather than crash.
-                if (std.mem.indexOfAny(u8, h.name, "\r\n") != null or std.mem.indexOfAny(u8, h.value, "\r\n") != null) continue;
+                // std asserts on these; drop the header rather than crash.
+                if (h.name.len == 0 or std.mem.indexOfAny(u8, h.name, ":\r\n") != null or std.mem.indexOfAny(u8, h.value, "\r\n") != null) continue;
                 out[n] = .{ .name = h.name, .value = h.value };
                 n += 1;
             }
@@ -199,12 +217,31 @@ fn writeRaw(w: *Io.Writer, status: http.Status) void {
     w.flush() catch return;
 }
 
-// ponytail: SO_RCVTIMEO only bounds blocking reads (Io.Threaded); an evented
-// Io (Uring, Kqueue) ignores it and needs a timer-based watchdog per connection.
-fn setReadTimeout(stream: Io.net.Stream, ms: u32) void {
-    if (builtin.os.tag == .windows or ms == 0) return;
-    const tv: std.posix.timeval = .{ .sec = @intCast(ms / 1000), .usec = @intCast((ms % 1000) * 1000) };
-    std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
+fn nowMs(io: Io) i64 {
+    return @intCast(@divTrunc(Io.Clock.awake.now(io).toNanoseconds(), std.time.ns_per_ms));
+}
+
+/// Restarts the client's time budget; 0 disables it.
+fn arm(io: Io, deadline: *std.atomic.Value(i64), timeout_ms: u32) void {
+    if (timeout_ms == 0) return;
+    deadline.store(nowMs(io) + timeout_ms, .monotonic);
+}
+
+// ponytail: one watchdog task per connection (a second thread under
+// Io.Threaded). A single reaper over all connections scales better if
+// thread count matters.
+/// Shuts the socket down once the deadline passes, which unblocks the
+/// connection's pending read or write. Socket-level timeouts don't work here:
+/// Io.Threaded treats the resulting EAGAIN as a bug and panics.
+fn watchdog(io: Io, stream: Io.net.Stream, deadline: *std.atomic.Value(i64)) Io.Cancelable!void {
+    while (true) {
+        const left = deadline.load(.monotonic) - nowMs(io);
+        if (left <= 0) {
+            stream.shutdown(io, .both) catch {};
+            return;
+        }
+        try io.sleep(.fromMilliseconds(@min(left, 1000)), .awake);
+    }
 }
 
 const testing = std.testing;
@@ -230,6 +267,10 @@ const TestApp = router.Router(&.{
 /// Starts a server on an ephemeral port, sends `raw`, returns everything the
 /// server wrote until it closed the connection.
 fn roundTrip(opts: Options, raw: []const u8) ![]u8 {
+    return roundTripOpts(opts, raw, false);
+}
+
+fn roundTripOpts(opts: Options, raw: []const u8, half_close: bool) ![]u8 {
     const io = testing.io;
     var o = opts;
     o.port = 0;
@@ -247,6 +288,7 @@ fn roundTrip(opts: Options, raw: []const u8) ![]u8 {
     try w.interface.flush();
     var rbuf: [1024]u8 = undefined;
     var r = stream.reader(io, &rbuf);
+    if (half_close) try stream.shutdown(io, .send);
     return r.interface.allocRemaining(testing.allocator, .limited(64 * 1024));
 }
 
@@ -290,4 +332,20 @@ test "oversized headers are 431" {
     const out = try roundTrip(.{ .max_header_bytes = 1024 }, "GET /hello HTTP/1.1\r\nx-big: " ++ comptime fill(2000, 'a') ++ "\r\n\r\n");
     defer testing.allocator.free(out);
     try testing.expect(std.mem.startsWith(u8, out, "HTTP/1.1 431 "));
+}
+
+test "POST without content-length has an empty body" {
+    // Half-close so a server that wrongly reads to EOF can't hang the test;
+    // it would swallow the GET as the POST's body and answer once.
+    const out = try roundTripOpts(.{}, "POST /echo HTTP/1.1\r\nhost: x\r\n\r\n" ++
+        "GET /hello HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n", true);
+    defer testing.allocator.free(out);
+    try testing.expectEqual(2, std.mem.count(u8, out, "HTTP/1.1 "));
+}
+
+test "idle connection is closed after read_timeout_ms" {
+    // A partial head that never completes (slowloris); the server must hang up.
+    const out = try roundTrip(.{ .read_timeout_ms = 100 }, "GET /hello HTTP/1.1\r\nhost: x\r\n");
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("", out);
 }
