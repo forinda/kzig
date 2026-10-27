@@ -3,6 +3,7 @@
 //! parameters and results, and the simple protocol for scripts. No TLS yet.
 const std = @import("std");
 const builtin = @import("builtin");
+const Timestamp = @import("timestamp.zig").Timestamp;
 
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -582,6 +583,8 @@ fn decodeValue(comptime F: type, a: Allocator, value: ?[]const u8) !F {
     }
     const v = value orelse return error.DbDecode;
     if (F == []const u8) return try a.dupe(u8, v);
+    if (F == std.json.Value) return std.json.parseFromSliceLeaky(std.json.Value, a, v, .{ .allocate = .alloc_always }) catch error.DbDecode;
+    if (@typeInfo(F) == .@"struct" and @hasDecl(F, "fromPg")) return F.fromPg(v);
     return switch (@typeInfo(F)) {
         .int => std.fmt.parseInt(F, v, 10) catch error.DbDecode,
         .float => std.fmt.parseFloat(F, v) catch error.DbDecode,
@@ -601,6 +604,8 @@ pub fn encodeArgs(a: Allocator, args: anytype) ![]const ?[]const u8 {
 
 fn encodeValue(a: Allocator, v: anytype) !?[]const u8 {
     const T = @TypeOf(v);
+    if (T == std.json.Value) return try std.json.Stringify.valueAlloc(a, v, .{});
+    if (@typeInfo(T) == .@"struct" and @hasDecl(T, "toPg")) return try v.toPg(a);
     switch (@typeInfo(T)) {
         .optional => return if (v) |x| try encodeValue(a, x) else null,
         .null => return null,
@@ -677,6 +682,21 @@ test "arguments encode as text" {
     try testing.expectEqual(null, p[4]);
     try testing.expectEqualStrings("admin", p[5].?);
     try testing.expectEqualStrings("y", p[6].?);
+}
+
+test "Timestamp and JSON columns read and write" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Row = struct { at: Timestamp, meta: std.json.Value, gone: ?Timestamp };
+    const r = try decodeRow(Row, a, &.{ "at", "meta", "gone" }, &.{ "2026-10-27 12:00:00+00", "{\"k\":[1,2]}", null });
+    try testing.expectEqual(1793102400000000, r.at.us);
+    try testing.expectEqual(2, r.meta.object.get("k").?.array.items.len);
+    try testing.expectEqual(null, r.gone);
+    try testing.expectError(error.DbDecode, decodeRow(Row, a, &.{ "at", "meta", "gone" }, &.{ "never", "{}", null }));
+    const args = try encodeArgs(a, .{ Timestamp{ .us = 0 }, std.json.Value{ .bool = true } });
+    try testing.expectEqualStrings("1970-01-01T00:00:00Z", args[0].?);
+    try testing.expectEqualStrings("true", args[1].?);
 }
 
 test "command tags give the affected rows" {

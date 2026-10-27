@@ -14,6 +14,7 @@
 const std = @import("std");
 pub const pg = @import("pg.zig");
 pub const migrate = @import("migrate.zig");
+pub const Timestamp = @import("timestamp.zig").Timestamp;
 
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -194,6 +195,7 @@ const testing = std.testing;
 
 test {
     _ = migrate;
+    _ = @import("timestamp.zig");
     _ = pg;
 }
 
@@ -340,6 +342,25 @@ test "committing after a failed statement is an error, not a silent rollback" {
     try testing.expectError(error.DbError, tx.exec("SELEC nonsense", .{}));
     try testing.expectError(error.TransactionAborted, tx.commit());
     try db.ping();
+}
+
+test "Timestamp round-trips through timestamptz and timestamp" {
+    var env: std.process.Environ.Map = undefined;
+    const url = testUrl(&env) catch |err| {
+        if (err == error.SkipZigTest) env.deinit();
+        return err;
+    };
+    defer env.deinit();
+    var db: Pool = try .init(testing.io, testing.allocator, .{ .url = url, .max_connections = 1 });
+    defer db.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const at: Timestamp = .{ .us = 1793091600500001 };
+    const R = struct { tz: Timestamp, plain: Timestamp, day: Timestamp };
+    const r = (try db.queryOne(arena.allocator(), R, "SELECT $1::timestamptz AS tz, $1::timestamptz AT TIME ZONE 'UTC' AS plain, '2026-10-27'::date AS day", .{at})).?;
+    try testing.expectEqual(at.us, r.tz.us);
+    try testing.expectEqual(at.us, r.plain.us);
+    try testing.expectEqual(1793059200000000, r.day.us);
 }
 
 test "the pool: more tasks than connections, all served" {

@@ -61,6 +61,12 @@ pub fn json(comptime T: type, arena: Allocator, value: std.json.Value, issues: *
 }
 
 fn fromJson(comptime T: type, arena: Allocator, v: std.json.Value, path: ?*const Path, issues: *Issues) !T {
+    if (T == std.json.Value) return v;
+    if (@typeInfo(T) == .@"struct" and @hasDecl(T, "fromJsonValue")) {
+        if (T.fromJsonValue(v)) |out| return out;
+        try issues.at(path, "expected " ++ T.json_expected);
+        return undefined;
+    }
     switch (@typeInfo(T)) {
         .optional => |o| return if (v == .null) null else try fromJson(o.child, arena, v, path, issues),
         .bool => if (v == .bool) return v.bool,
@@ -268,6 +274,29 @@ test "reports every issue with its path" {
         try testing.expectEqualStrings(w[0], got.field);
         try testing.expectEqualStrings(w[1], got.message);
     }
+}
+
+/// A type with its own JSON reading, as kzig.db.Timestamp has.
+const When = struct {
+    n: i64,
+    pub const json_expected = "date-time";
+    pub fn fromJsonValue(v: std.json.Value) ?When {
+        return if (v == .string and std.mem.eql(u8, v.string, "now")) .{ .n = 1 } else null;
+    }
+};
+
+test "types read themselves with fromJsonValue; std.json.Value is kept as is" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Body = struct { at: When, meta: std.json.Value };
+    var issues: Issues = .init(a);
+    const ok = (try json(Body, a, try parseJson(a, "{\"at\":\"now\",\"meta\":{\"k\":[1]}}"), &issues)).?;
+    try testing.expectEqual(1, ok.at.n);
+    try testing.expect(ok.meta == .object);
+    try testing.expectEqual(null, try json(Body, a, try parseJson(a, "{\"at\":5,\"meta\":null}"), &issues));
+    try testing.expectEqualStrings("at", issues.list.items[0].field);
+    try testing.expectEqualStrings("expected date-time", issues.list.items[0].message);
 }
 
 test "unknown fields are ignored" {

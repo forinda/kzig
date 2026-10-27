@@ -13,6 +13,8 @@ pub fn schema(comptime T: type) []const u8 {
 fn schemaIn(comptime T: type, comptime visiting: []const type) []const u8 {
     comptime {
         @setEvalBranchQuota(100_000);
+        if (T == std.json.Value) return "{}";
+        if (@typeInfo(T) == .@"struct" and @hasDecl(T, "openapi_schema")) return T.openapi_schema;
         const out = switch (@typeInfo(T)) {
             .bool => "{\"type\":\"boolean\"}",
             .int => |i| blk: {
@@ -307,6 +309,15 @@ test "scalars" {
     try expectSchema(f64, "{\"type\":\"number\",\"format\":\"double\"}");
     try expectSchema(bool, "{\"type\":\"boolean\"}");
     try expectSchema(Tag, "{\"type\":\"string\",\"enum\":[\"open\",\"done\"]}");
+}
+
+test "a type may give its own schema; std.json.Value is open" {
+    const When = struct {
+        n: i64,
+        pub const openapi_schema = "{\"type\":\"string\",\"format\":\"date-time\"}";
+    };
+    try expectSchema(When, "{\"type\":\"string\",\"format\":\"date-time\"}");
+    try expectSchema(std.json.Value, "{}");
 }
 
 test "optionals and slices" {
