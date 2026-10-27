@@ -9,6 +9,9 @@ pub const config = @import("config.zig");
 pub const decode = @import("decode.zig");
 pub const Issues = decode.Issues;
 pub const FieldError = decode.FieldError;
+const query = @import("query.zig");
+pub const ListQuery = query.ListQuery;
+pub const Paginated = query.Paginated;
 pub const middleware = @import("middleware.zig");
 pub const Next = middleware.Next;
 pub const contributor = @import("contributor.zig");
@@ -41,6 +44,7 @@ test {
     _ = testing;
     _ = config;
     _ = decode;
+    _ = query;
     _ = middleware;
     _ = runtime.std;
 }

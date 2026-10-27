@@ -282,11 +282,13 @@ fn decodeRequest(comptime P: type, ctx: *Ctx, store: *P.Store) !void {
         store.body = try decode.json(T, ctx.arena, try jsonBody(ctx), &issues) orelse
             return invalid(ctx, issues.list.items[0].message, issues);
     }
-    if (P.Query) |T| {
+    if (P.Query) |T| if (@hasDecl(T, "kzig_list_query")) {
+        store.query = try T.parse(ctx);
+    } else {
         var issues: decode.Issues = .init(ctx.arena);
         store.query = try decode.strings(T, ctx.arena, QuerySource{ .ctx = ctx }, &issues) orelse
             return invalid(ctx, "Invalid query parameters", issues);
-    }
+    };
     if (P.Params) |T| {
         var issues: decode.Issues = .init(ctx.arena);
         store.params = try decode.strings(T, ctx.arena, ParamSource{ .ctx = ctx }, &issues) orelse
