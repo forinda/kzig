@@ -431,6 +431,9 @@ fn thunk(comptime AppT: type, comptime C: type, comptime name: []const u8, compt
             var store: P.Store = .{};
             ctx.values = &store;
             defer ctx.values = null;
+            // KickJS request scope + @PreDestroy: whatever was produced is
+            // disposed after the response, in reverse, errors included.
+            defer contributor.disposeAll(P, app, &store);
             inline for (P.early_order) |K| {
                 try contributor.run(K, app.get(K), ctx, &store);
                 // A contributor that answered ends the request, as in KickJS.
@@ -1134,4 +1137,76 @@ test "only JSON media types are parsed as JSON" {
         defer a.deinit();
         try testing.expectEqual(std.http.Status.created, a.status);
     }
+}
+
+const DisposeLog = struct { buf: [64]u8 = undefined, len: usize = 0 };
+
+fn Session(comptime k: []const u8, comptime fail: bool) type {
+    return struct {
+        pub const key = k;
+        pub const optional = fail;
+        log: *DisposeLog,
+        pub fn resolve(_: *@This(), _: *Ctx) !u8 {
+            if (fail) return error.Nope;
+            return k[0];
+        }
+        pub fn dispose(self: *@This(), value: *u8) void {
+            self.log.buf[self.log.len] = value.*;
+            self.log.len += 1;
+        }
+    };
+}
+
+const SessionA = Session("a", false);
+const SessionB = struct {
+    pub const key = "b";
+    log: *DisposeLog,
+    pub fn resolve(_: *SessionB, _: *Ctx, got: struct { a: u8 }) u8 {
+        return got.a + 1;
+    }
+    pub fn dispose(self: *SessionB, value: *u8) void {
+        self.log.buf[self.log.len] = value.*;
+        self.log.len += 1;
+    }
+};
+
+const DisposeController = struct {
+    pub const contributors = .{ SessionB, SessionA, Session("x", true) };
+    pub const routes = .{
+        .{ .method = .GET, .path = "/ok", .handler = "ok" },
+        .{ .method = .GET, .path = "/fail", .handler = "fail" },
+    };
+    pub fn ok(_: *DisposeController, _: *Ctx, got: struct { b: u8 }) u8 {
+        return got.b;
+    }
+    pub fn fail(_: *DisposeController, _: *Ctx) !void {
+        return error.Conflict;
+    }
+};
+
+const DisposeApp = App(.{ .modules = &.{Module(.{ .name = "D", .controllers = &.{DisposeController}, .services = &.{DisposeLog} })}, .health = false });
+
+fn disposeRun(target: []const u8) ![]const u8 {
+    var env: std.process.Environ.Map = .init(testing.allocator);
+    defer env.deinit();
+    var app: DisposeApp = undefined;
+    try app.init(testing.io, testing.allocator, &env);
+    defer app.deinit();
+    var res = try testing_rt.request(testing.allocator, &app, .{ .target = target });
+    res.deinit();
+    const log = app.get(DisposeLog);
+    return try testing.allocator.dupe(u8, log.buf[0..log.len]);
+}
+
+test "dispose runs in reverse after the handler" {
+    const got = try disposeRun("/api/v1/ok");
+    defer testing.allocator.free(got);
+    // a ran before b; b ('a' + 1 = 'b') is disposed first. The failed optional x is skipped.
+    try testing.expectEqualStrings("ba", got);
+}
+
+test "dispose runs when the handler fails" {
+    const got = try disposeRun("/api/v1/fail");
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("ba", got);
 }

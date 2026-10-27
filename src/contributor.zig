@@ -223,3 +223,17 @@ pub fn run(comptime C: type, inst: *C, ctx: *Ctx, store: anytype) !void {
         (if (is_err) (r catch null) else r)
     else if (is_err) try r else r;
 }
+
+/// Calls `dispose(self, *V)` for every contributor that produced a value,
+/// in reverse run order.
+pub fn disposeAll(comptime P: type, app: anytype, store: *P.Store) void {
+    const ran = P.early_order ++ P.late_order;
+    comptime var k = ran.len;
+    inline while (k > 0) {
+        k -= 1;
+        const C = ran[k];
+        if (@hasDecl(C, "dispose")) {
+            if (@field(store, C.key)) |*v| C.dispose(app.get(C), v);
+        }
+    }
+}
