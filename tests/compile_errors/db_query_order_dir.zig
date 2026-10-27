@@ -10,5 +10,5 @@ const S = kzig.db.Schema(.{ .users = users, .posts = posts }, .{ .relations = .{
 } });
 export fn f() void {
     const c: kzig.db.Client(S) = .{ .conn = undefined };
-    _ = c.query(.users).toSql(undefined, .{ .orderBy = .{ .{ .id, .DESC } } }, false) catch {};
+    _ = c.query(.users).toSql(undefined, .{ .orderBy = .{.{ .id, .DESC }} }, false) catch {};
 }
