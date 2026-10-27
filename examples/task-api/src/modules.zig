@@ -1,7 +1,10 @@
-const HelloModule = @import("modules/hello/hello.module.zig").HelloModule;
-const ProjectModule = @import("modules/projects/project.module.zig").ProjectModule;
-const FeaturesModule = @import("modules/features/feature.module.zig").FeaturesModule;
-const ConfigReportModule = @import("modules/config-reports/config-report.module.zig").ConfigReportModule;
-
-/// Every module the app mounts.
-pub const modules: []const type = &.{ HelloModule, ProjectModule, FeaturesModule, ConfigReportModule };
+//! Every module the app mounts. `kzig g module <name>` adds a line here;
+//! `kzig rm module <name>` takes it out.
+pub const modules: []const type = &.{
+    @import("modules/hello/hello.module.zig").HelloModule,
+    @import("modules/projects/project.module.zig").ProjectModule,
+    @import("modules/features/feature.module.zig").FeaturesModule,
+    @import("modules/config-reports/config-report.module.zig").ConfigReportModule,
+    @import("modules/tasks/task.module.zig").TaskModule,
+    // kzig:modules
+};

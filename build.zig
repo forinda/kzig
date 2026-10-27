@@ -14,6 +14,12 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&b.addRunArtifact(tests).step);
 
+    // The `kzig` CLI (kzig new, kzig g module, …).
+    const cli_mod = b.createModule(.{ .root_source_file = b.path("src/cli/main.zig"), .target = target, .optimize = optimize });
+    const cli = b.addExecutable(.{ .name = "kzig", .root_module = cli_mod });
+    b.installArtifact(cli);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cli_mod })).step);
+
     // The http.zig runtime is its own module behind -Dhttpz, so std-runtime
     // users never fetch http.zig.
     const bench_step = b.step("bench", "Build the benchmark servers (bench-httpz needs -Dhttpz)");

@@ -5,8 +5,13 @@ const std = @import("std");
 
 /// `types` without repeats, first occurrence kept: a service listed by two
 /// modules is still one singleton.
+/// Comptime work grows with the number of services squared; the default
+/// quota of 1000 runs out around a dozen.
+const quota = 1_000_000;
+
 pub fn unique(comptime types: []const type) []const type {
     comptime {
+        @setEvalBranchQuota(quota);
         var out: []const type = &.{};
         for (types) |T| {
             if (indexOf(out, T) == null) out = out ++ .{T};
@@ -17,8 +22,11 @@ pub fn unique(comptime types: []const type) []const type {
 }
 
 fn indexOf(comptime types: []const type, comptime T: type) ?usize {
-    inline for (types, 0..) |U, i| if (U == T) return i;
-    return null;
+    comptime {
+        @setEvalBranchQuota(quota);
+        for (types, 0..) |U, i| if (U == T) return i;
+        return null;
+    }
 }
 
 /// The service a field is wired to, or null for a plain field. `*S`,
@@ -42,6 +50,7 @@ fn depOf(comptime services: []const type, comptime S: type, comptime name: []con
 /// Service indices with every service after its dependencies.
 fn initOrder(comptime services: []const type) [services.len]usize {
     comptime {
+        @setEvalBranchQuota(quota);
         const Walk = struct {
             state: [services.len]enum { new, active, done } = @splat(.new),
             order: [services.len]usize = undefined,
@@ -112,6 +121,7 @@ pub fn Container(comptime listed: []const type) type {
         /// they keep their field values and skip `init`/`deinit`, but their
         /// pointer fields are still wired.
         pub fn initWith(self: *Self, seeds: anytype) !void {
+            @setEvalBranchQuota(quota);
             const Seeds = @TypeOf(seeds);
             self.live = @splat(false);
             inline for (@typeInfo(Seeds).@"struct".field_names) |f| {
@@ -147,6 +157,7 @@ pub fn Container(comptime listed: []const type) type {
         /// `deinit` hooks in reverse dependency order, for services whose
         /// `init` finished.
         pub fn deinit(self: *Self) void {
+            @setEvalBranchQuota(quota);
             comptime var k = order.len;
             inline while (k > 0) {
                 k -= 1;
@@ -160,8 +171,11 @@ pub fn Container(comptime listed: []const type) type {
         }
 
         fn isSeed(comptime Seeds: type, comptime S: type) bool {
-            inline for (@typeInfo(Seeds).@"struct".field_types) |T| if (T == S) return true;
-            return false;
+            comptime {
+                @setEvalBranchQuota(quota);
+                for (@typeInfo(Seeds).@"struct".field_types) |T| if (T == S) return true;
+                return false;
+            }
         }
     };
 }
@@ -291,4 +305,29 @@ test "a defaulted pointer to a non-service is a plain field" {
     defer c.deinit();
     try testing.expectEqual(&noop, c.get(Cb).cb);
     try testing.expectEqualStrings("hi", c.get(Cb).name);
+}
+
+fn Numbered(comptime n: usize) type {
+    return struct {
+        pub const number = n;
+        value: usize = n,
+    };
+}
+
+fn manyServices(comptime count: usize) []const type {
+    comptime {
+        var out: []const type = &.{};
+        for (0..count) |i| out = out ++ .{Numbered(i)};
+        const result = out;
+        return result;
+    }
+}
+
+test "a large app stays within the compile-time branch quota" {
+    const Many = Container(manyServices(80));
+    var c: Many = undefined;
+    try c.initWith(.{Numbered(0){ .value = 42 }});
+    defer c.deinit();
+    try testing.expectEqual(42, c.get(Numbered(0)).value);
+    try testing.expectEqual(79, c.get(Numbered(79)).value);
 }
