@@ -11,6 +11,7 @@ const Names = @import("names.zig").Names;
 const render = @import("templates.zig").render;
 const registry = @import("registry.zig");
 const dev = @import("dev.zig");
+const db_cli = @import("db.zig");
 const build_options = @import("build_options");
 
 const Io = std.Io;
@@ -44,6 +45,9 @@ const usage =
     \\
     \\  kzig start [--port <n>] [--bin <name>] [-- <app args>]
     \\      Runs the built app (NODE_ENV=production unless set); --port sets PORT.
+    \\
+    \\  kzig db new <name> | migrate | rollback | status [--dir db/migrations]
+    \\      Migrations in kick/db's layout; migrate/rollback/status use DATABASE_URL.
     \\
     \\  kzig rm module <name> [--force]
     \\      Deletes the module's folder and unmounts it (asks first unless --force).
@@ -138,6 +142,7 @@ const Flags = struct {
     module: ?[]const u8 = null,
     bin: ?[]const u8 = null,
     port: ?[]const u8 = null,
+    dir: ?[]const u8 = null,
     /// After `--`: passed on by `kzig dev`, `build` and `start`.
     rest: []const []const u8 = &.{},
 };
@@ -159,13 +164,14 @@ fn parse(arena: Allocator, args: []const [:0]const u8) !Flags {
             flags.help = true;
         } else if (std.mem.eql(u8, a, "--no-fetch")) {
             flags.no_fetch = true;
-        } else if (std.mem.eql(u8, a, "--kzig") or std.mem.eql(u8, a, "--module") or std.mem.eql(u8, a, "--bin") or std.mem.eql(u8, a, "--port")) {
+        } else if (std.mem.eql(u8, a, "--kzig") or std.mem.eql(u8, a, "--module") or std.mem.eql(u8, a, "--bin") or std.mem.eql(u8, a, "--port") or std.mem.eql(u8, a, "--dir")) {
             i += 1;
             if (i == args.len) return error.MissingValue;
             switch (a[2]) {
                 'k' => flags.kzig = args[i],
                 'm' => flags.module = args[i],
                 'p' => flags.port = args[i],
+                'd' => flags.dir = args[i],
                 else => flags.bin = args[i],
             }
         } else if (std.mem.startsWith(u8, a, "--")) {
@@ -229,6 +235,13 @@ fn run(cli: Cli, flags: Flags) !void {
         if (p.len != 1) return error.Usage;
         try requireProject(cli);
         return dev.run(cli.io, cli.gpa, cli.arena, cli.environ, cli.out, .{ .bin = flags.bin, .args = flags.rest });
+    }
+    if (std.mem.eql(u8, cmd, "db")) {
+        return db_cli.run(cli.io, cli.gpa, cli.arena, cli.environ, .{ .out = cli.out, .err = cli.err }, p[1..], flags.dir orelse "db/migrations") catch |err| switch (err) {
+            // Said already.
+            error.Reported => error.Exists,
+            else => err,
+        };
     }
     if (std.mem.eql(u8, cmd, "add")) {
         if (p.len != 2) return error.Usage;
@@ -565,4 +578,5 @@ test {
     _ = @import("templates.zig");
     _ = @import("registry.zig");
     _ = @import("dev.zig");
+    _ = @import("db.zig");
 }

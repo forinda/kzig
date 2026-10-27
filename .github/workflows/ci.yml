@@ -22,9 +22,21 @@ jobs:
       - run: ./scripts/scaffold-check.sh
         if: matrix.optimize == 'Debug'
 
-  # The S3 driver against a real S3 API (SeaweedFS checks SigV4 like AWS).
-  s3:
+  # The S3 driver against a real S3 API (SeaweedFS checks SigV4 like AWS),
+  # and kzig.db against Postgres.
+  integration:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: kzig
+          POSTGRES_PASSWORD: kzigpass
+          POSTGRES_DB: kzig_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U kzig" --health-interval 2s --health-timeout 5s --health-retries 30
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
@@ -43,7 +55,11 @@ jobs:
           [ -n "$ok" ] || { docker logs s3; exit 1; }
       - run: zig build test --summary all
         env:
+          DATABASE_URL: postgres://kzig:kzigpass@localhost:5432/kzig_test
           S3_TEST_ENDPOINT: http://localhost:8333
           S3_TEST_BUCKET: kzig-test
           S3_TEST_ACCESS_KEY_ID: kzigtest
           S3_TEST_SECRET_ACCESS_KEY: kzigtestsecret
+      - run: ./scripts/scaffold-check.sh
+        env:
+          DATABASE_URL: postgres://kzig:kzigpass@localhost:5432/kzig_test

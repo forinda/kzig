@@ -110,6 +110,22 @@ kill -TERM $START
 wait $START
 grep -q "http.zig" start.log
 
+step "kzig db new writes a migration folder; db commands need DATABASE_URL"
+"$KZIG" db new create-users > out.txt
+dir=$(ls -d db/migrations/*_create_users)
+test -f "$dir/up.sql" && test -f "$dir/down.sql"
+case "$(basename "$dir")" in [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9]_create_users) ;; *) echo "bad migration id: $dir" >&2; exit 1 ;; esac
+code=0; env -u DATABASE_URL "$KZIG" db status > out.txt 2> err.txt || code=$?
+[ $code = 1 ] && grep -q "DATABASE_URL" err.txt
+if [ -n "${DATABASE_URL:-}" ]; then
+  echo "CREATE TABLE scaffold_users (id serial PRIMARY KEY);" > "$dir/up.sql"
+  echo "DROP TABLE scaffold_users;" > "$dir/down.sql"
+  "$KZIG" db migrate | grep -q "applied 1"
+  "$KZIG" db status | grep -q "applied.*create_users"
+  "$KZIG" db rollback | grep -q "rolled back 1"
+fi
+rm -rf db
+
 step "kzig g module note --minimal"
 "$KZIG" g module note --minimal
 zig build test

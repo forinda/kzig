@@ -20,6 +20,8 @@ pub fn build(b: *std.Build) void {
     const cli_options = b.addOptions();
     cli_options.addOption(?[]const u8, "version", b.option([]const u8, "version", "Release tag the CLI scaffolds against"));
     cli_mod.addOptions("build_options", cli_options);
+    // kzig db migrate runs the library's migrator.
+    cli_mod.addImport("kzig", mod);
     const cli = b.addExecutable(.{ .name = "kzig", .root_module = cli_mod });
     b.installArtifact(cli);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cli_mod })).step);
