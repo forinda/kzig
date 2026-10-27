@@ -70,7 +70,10 @@ pub fn run(io: Io, a: Allocator, dir_path: []const u8, target: Snapshot, o: Opti
     if (changes.len == 0) return .{ .id = null, .changes = changes };
     const up = try emit_pg.emit(a, changes);
     const down = try emit_pg.emit(a, try diff.invert(a, changes));
-    const id = try write(io, a, dir_path, target, prev.id, up, down, diff.hasAmbiguousReverse(changes), o);
+    // kick/db's relations aren't modelled yet: keep the ones on record.
+    var next = target;
+    if (next.relations == null) next.relations = prev.snapshot.relations;
+    const id = try write(io, a, dir_path, next, prev.id, up, down, diff.hasAmbiguousReverse(changes), o);
     return .{ .id = id, .changes = changes };
 }
 
@@ -128,6 +131,7 @@ fn write(io: Io, a: Allocator, dir_path: []const u8, target: Snapshot, previous:
         };
         break :blk std.json.parseFromSliceLeaky(std.json.Value, a, text, .{}) catch return error.InvalidJournal;
     };
+    if (journal != .object) return error.InvalidJournal;
     const entries = journal.object.getPtr("entries") orelse return error.InvalidJournal;
     if (entries.* != .array) return error.InvalidJournal;
     var entry: std.json.ObjectMap = .empty;
@@ -251,6 +255,24 @@ test "generate: a later migration diffs against the latest snapshot; drops make 
     const down = try dir.read(a, try std.fmt.allocPrint(a, "{s}/down.sql", .{back.id.?}));
     try testing.expect(std.mem.find(u8, down, "-- DRAFT: ambiguous reverses present (drop column / drop table / type change). Audit before applying.\n") != null);
     try testing.expectEqual(3, (try migrate.load(testing.io, a, dir.path)).len);
+}
+
+test "generate: relations in the latest snapshot are carried into the next; a broken journal is an error" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var dir = try TmpDir.init(a);
+    defer dir.tmp.cleanup();
+    var first = try users(a, &.{id_col});
+    var rel: std.json.ObjectMap = .empty;
+    try rel.put(a, "users", .{ .object = .empty });
+    first.relations = .{ .object = rel };
+    _ = try run(testing.io, a, dir.path, first, .{ .name = "init", .now = t0 });
+    const r = try run(testing.io, a, dir.path, try users(a, &.{ id_col, col("x", "text", true) }), .{ .name = "x", .now = .{ .us = t0.us + 1_000_000 } });
+    const written = try snap.parse(a, std.mem.trimEnd(u8, try dir.read(a, try std.fmt.allocPrint(a, "{s}/snapshot.json", .{r.id.?})), "\n"));
+    try testing.expect(written.relations != null);
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = try std.fs.path.join(a, &.{ dir.path, "_journal.json" }), .data = "[]" });
+    try testing.expectError(error.InvalidJournal, run(testing.io, a, dir.path, try users(a, &.{ id_col, col("y", "text", true) }), .{ .name = "y", .now = .{ .us = t0.us + 2_000_000 } }));
 }
 
 test "generate: --empty writes a shell carrying the latest snapshot" {

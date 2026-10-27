@@ -122,54 +122,75 @@ pub fn parseRename(raw: []const u8, column: bool) ![2][]const u8 {
 }
 
 /// kick/db's rename prompt: each drop that could be a rename lists what it
-/// could have become; Enter (or end of input) keeps it a drop.
-pub fn askRenames(a: Allocator, in: *Io.Reader, o: Out, prev: kzig.db.snapshot.Snapshot, next: kzig.db.snapshot.Snapshot) !kzig.db.diff.Hints {
+/// could have become (less what's been picked); Enter, 0 or end of input
+/// keeps it a drop. Renames already `given` stand and aren't asked about.
+pub fn askRenames(a: Allocator, in: *Io.Reader, o: Out, prev: kzig.db.snapshot.Snapshot, next: kzig.db.snapshot.Snapshot, given: kzig.db.diff.Hints) !kzig.db.diff.Hints {
     const d = kzig.db.diff;
     var tables: std.ArrayList([2][]const u8) = .empty;
+    try tables.appendSlice(a, given.tables);
     const c = try d.findRenameCandidates(a, prev, next);
-    for (c.tables) |t| if (try pick(in, o, try a.print("table {s}", .{t.from}), t.to)) |to| try tables.append(a, .{ t.from, to });
+    for (c.tables) |t| {
+        if (pairFrom(tables.items, t.from) != null) continue;
+        const left = try unpicked(a, t.to, tables.items, null);
+        if (left.len == 0) continue;
+        if (try pick(in, o, try a.print("table {s}", .{t.from}), left)) |to| try tables.append(a, .{ t.from, to });
+    }
     // Columns of renamed tables too: compare them under their new names.
     const renamed = try a.dupe(kzig.db.snapshot.Table, prev.tables);
-    for (renamed) |*t| for (tables.items) |r| if (std.mem.eql(u8, t.name, r[0])) {
-        t.name = r[1];
+    for (renamed) |*t| if (pairFrom(tables.items, t.name)) |to| {
+        t.name = to;
     };
     var shifted = prev;
     shifted.tables = renamed;
     var columns: std.ArrayList([2][]const u8) = .empty;
+    try columns.appendSlice(a, given.columns);
     const cc = try d.findRenameCandidates(a, shifted, next);
     for (cc.columns) |col| {
-        const taken = for (columns.items) |x| {
-            if (std.mem.startsWith(u8, x[0], col.table) and x[0].len > col.table.len and x[0][col.table.len] == '.') {
-                if (std.mem.eql(u8, x[0][col.table.len + 1 ..], col.from)) break true;
-            }
-        } else false;
-        if (taken) continue;
-        var left: std.ArrayList([]const u8) = .empty;
-        for (col.to) |to| {
-            const used = for (columns.items) |x| {
-                if (std.mem.eql(u8, x[1], to) and std.mem.startsWith(u8, x[0], col.table)) break true;
-            } else false;
-            if (!used) try left.append(a, to);
-        }
-        if (left.items.len == 0) continue;
-        if (try pick(in, o, try a.print("column {s}.{s}", .{ col.table, col.from }), left.items)) |to|
-            try columns.append(a, .{ try a.print("{s}.{s}", .{ col.table, col.from }), to });
+        const key = try a.print("{s}.{s}", .{ col.table, col.from });
+        if (pairFrom(columns.items, key) != null) continue;
+        const left = try unpicked(a, col.to, columns.items, try a.print("{s}.", .{col.table}));
+        if (left.len == 0) continue;
+        if (try pick(in, o, try a.print("column {s}", .{key}), left)) |to| try columns.append(a, .{ key, to });
     }
     return .{ .tables = tables.items, .columns = columns.items, .explicit = true };
+}
+
+fn pairFrom(pairs: []const [2][]const u8, from: []const u8) ?[]const u8 {
+    for (pairs) |p| if (std.mem.eql(u8, p[0], from)) return p[1];
+    return null;
+}
+
+/// `options` less the ones picked already (for columns: in the same table).
+fn unpicked(a: Allocator, options: []const []const u8, picked: []const [2][]const u8, table_prefix: ?[]const u8) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for (options) |x| {
+        const used = for (picked) |p| {
+            if (std.mem.eql(u8, p[1], x) and (table_prefix == null or std.mem.startsWith(u8, p[0], table_prefix.?))) break true;
+        } else false;
+        if (!used) try out.append(a, x);
+    }
+    return out.items;
 }
 
 fn pick(in: *Io.Reader, o: Out, what: []const u8, options: []const []const u8) !?[]const u8 {
     o.out.print("{s} is gone. Renamed to:\n", .{what}) catch {};
     for (options, 1..) |x, i| o.out.print("  [{d}] {s}\n", .{ i, x }) catch {};
-    o.say("  (Enter: dropped) > ", .{});
-    const line = in.takeDelimiterInclusive('\n') catch |err| switch (err) {
-        error.EndOfStream => return null,
-        else => return err,
-    };
-    const answer = std.mem.trim(u8, line, " \t\r\n");
-    const n = std.fmt.parseInt(usize, answer, 10) catch return null;
-    if (n == 0 or n > options.len) return null;
-    return options[n - 1];
+    while (true) {
+        o.say("  (Enter or 0: dropped) > ", .{});
+        const line = in.takeDelimiterInclusive('\n') catch |err| switch (err) {
+            error.EndOfStream => return null,
+            else => return err,
+        };
+        const answer = std.mem.trim(u8, line, " \t\r\n");
+        if (answer.len == 0) return null;
+        const n = std.fmt.parseInt(usize, answer, 10) catch {
+            o.say("  a number from the list, please\n", .{});
+            continue;
+        };
+        if (n == 0) return null;
+        if (n <= options.len) return options[n - 1];
+        o.say("  a number from the list, please\n", .{});
+    }
 }
 
 fn hintsOf(a: Allocator, o: Out, opts: Opts) !kzig.db.diff.Hints {
@@ -186,9 +207,8 @@ fn generate(io: Io, gpa: Allocator, a: Allocator, environ: *const std.process.En
     const target = if (opts.empty) kzig.db.snapshot.Snapshot{} else try appSnapshot(io, gpa, a, environ, o, opts);
     var hints = try hintsOf(a, o, opts);
     const prev = try g.latest(io, a, opts.dir);
-    const told = hints.tables.len > 0 or hints.columns.len > 0;
-    if (!told and !opts.empty) if (opts.stdin) |in| {
-        hints = try askRenames(a, in, o, prev.snapshot, target);
+    if (!opts.empty) if (opts.stdin) |in| {
+        hints = try askRenames(a, in, o, prev.snapshot, target, hints);
     };
     const r = g.run(io, a, opts.dir, target, .{ .name = n.snake, .now = kzig.db.Timestamp.now(io), .hints = hints, .empty = opts.empty, .version = opts.version }) catch |err| switch (err) {
         error.BadRename => return o.fail("a rename needs the schema to have lost the old name and gained the new one\n", .{}),
@@ -199,7 +219,7 @@ fn generate(io: Io, gpa: Allocator, a: Allocator, environ: *const std.process.En
         return;
     };
     // Unasked drops that could have been renames: say how to keep them.
-    if (!told and opts.stdin == null) {
+    if (opts.stdin == null) {
         const c = try kzig.db.diff.findRenameCandidates(a, prev.snapshot, target);
         for (r.changes) |ch| switch (ch) {
             .drop_table => |t| for (c.tables) |x| if (std.mem.eql(u8, x.from, t.name)) {
@@ -279,15 +299,31 @@ test "rename prompt: a number picks, Enter or end of input drops" {
     var err: Io.Writer = .fixed(&err_buf);
     // users → people; then people.email → [1] mail; nothing more to ask.
     var in: Io.Reader = .fixed("1\n1\n");
-    const h = try askRenames(a, &in, .{ .out = &out, .err = &err }, prev, next);
+    const h = try askRenames(a, &in, .{ .out = &out, .err = &err }, prev, next, .{});
     try testing.expectEqualStrings("people", h.tables[0][1]);
     try testing.expectEqualStrings("people.email", h.columns[0][0]);
     try testing.expectEqualStrings("mail", h.columns[0][1]);
     try testing.expect(h.explicit);
     try testing.expect(std.mem.find(u8, out.buffered(), "table users is gone") != null);
     var none: Io.Reader = .fixed("");
-    const dropped = try askRenames(a, &none, .{ .out = &out, .err = &err }, prev, next);
+    const dropped = try askRenames(a, &none, .{ .out = &out, .err = &err }, prev, next, .{});
     try testing.expectEqual(0, dropped.tables.len);
+    // A new table is offered once: the second gone table is asked nothing.
+    const two: S.Snapshot = .{ .tables = &.{ t("users", &.{col("id")}), t("orders", &.{col("id")}) } };
+    const one: S.Snapshot = .{ .tables = &.{t("people", &.{col("id")})} };
+    var ones: Io.Reader = .fixed("1\n1\n");
+    const once = try askRenames(a, &ones, .{ .out = &out, .err = &err }, two, one, .{});
+    try testing.expectEqual(1, once.tables.len);
+    // Not a choice: asked again; 0 or Enter drops.
+    var retry: Io.Reader = .fixed("y\n9\n1\n0\n");
+    const again = try askRenames(a, &retry, .{ .out = &out, .err = &err }, prev, next, .{});
+    try testing.expectEqualStrings("people", again.tables[0][1]);
+    try testing.expectEqual(0, again.columns.len);
+    // A rename given by flag stands; the rest is still asked.
+    var rest: Io.Reader = .fixed("2\n");
+    const flagged = try askRenames(a, &rest, .{ .out = &out, .err = &err }, prev, next, .{ .tables = &.{.{ "users", "people" }} });
+    try testing.expectEqualStrings("people", flagged.tables[0][1]);
+    try testing.expectEqualStrings("nick", flagged.columns[0][1]);
 }
 
 test "an app that never answers doesn't hang kzig db check" {

@@ -356,7 +356,12 @@ fn removeEnumValue(w: W, x: @FieldType(Change, "remove_enum_value")) !void {
             try alterTable(w, c.table);
             try w.writeAll(" ALTER COLUMN ");
             try ident(w, c.column);
-            try w.print(" SET DEFAULT {s}::", .{stripCast(d)});
+            try w.writeAll(" SET DEFAULT ");
+            // A bare default (`user`, as the schema writes it) is a value: quote
+            // it, or Postgres reads a keyword (`user` is CURRENT_USER).
+            const bare = stripCast(d);
+            if (isQuoted(bare)) try w.writeAll(bare) else try literal(w, bare);
+            try w.writeAll("::");
             try ident(w, x.@"enum");
             try w.writeByte(';');
         }
@@ -387,8 +392,14 @@ fn commentSafe(w: W, v: []const u8, how: enum { ident, literal, raw }) !void {
         .raw => try buf.writer.writeAll(v),
     }
     var prev_break = false;
-    for (buf.written()) |ch| {
-        if (ch == '\n' or ch == '\r') {
+    const text = buf.written();
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        const ch = text[i];
+        // \n, \r, U+2028 and U+2029 (E2 80 A8/A9) collapse to one space.
+        const sep = ch == 0xe2 and i + 2 < text.len and text[i + 1] == 0x80 and (text[i + 2] == 0xa8 or text[i + 2] == 0xa9);
+        if (ch == '\n' or ch == '\r' or sep) {
+            if (sep) i += 2;
             if (!prev_break) try w.writeByte(' ');
             prev_break = true;
             continue;
@@ -494,15 +505,32 @@ fn isQuoted(v: []const u8) bool {
     return true;
 }
 
+/// kick/db's `ARRAY[ (quoted | number) ,? ... ]`, read with quotes in mind.
 fn isArrayLiteral(v: []const u8) bool {
     if (v.len < 7 or !std.ascii.eqlIgnoreCase(v[0..6], "ARRAY[") or v[v.len - 1] != ']') return false;
-    var it = std.mem.splitScalar(u8, v[6 .. v.len - 1], ',');
-    while (it.next()) |raw| {
-        const x = std.mem.trim(u8, raw, " \t\n\r");
-        if (x.len == 0) continue;
-        if (!(isQuoted(x) or isNumber(x))) return false;
+    const body = v[6 .. v.len - 1];
+    var i: usize = 0;
+    while (true) {
+        while (i < body.len and std.ascii.isWhitespace(body[i])) i += 1;
+        if (i == body.len) return true;
+        const start = i;
+        if (body[i] == '\'') {
+            i += 1;
+            while (i < body.len) : (i += 1) {
+                if (body[i] == '\\') return false;
+                if (body[i] == '\'') {
+                    if (i + 1 < body.len and body[i + 1] == '\'') i += 1 else break;
+                }
+            }
+            if (i == body.len) return false;
+            i += 1;
+        } else {
+            while (i < body.len and (std.ascii.isDigit(body[i]) or body[i] == '-' or body[i] == '.')) i += 1;
+            if (!isNumber(body[start..i])) return false;
+        }
+        while (i < body.len and std.ascii.isWhitespace(body[i])) i += 1;
+        if (i < body.len and body[i] == ',') i += 1;
     }
-    return true;
 }
 
 /// A plain or quoted name, optionally schema-qualified, with `(n)` /
@@ -603,6 +631,31 @@ test "defaults: the column's type decides, as kick/db's formatDefault" {
     try testing.expect(std.mem.endsWith(u8, try addDefault("status", "'active'::\"status\""), "DEFAULT 'active'::\"status\";"));
     try testing.expect(std.mem.endsWith(u8, try addDefault("jsonb", "'[]'::jsonb"), "DEFAULT '[]'::jsonb;"));
     try testing.expect(std.mem.endsWith(u8, try addDefault("text", "it's"), "DEFAULT 'it''s';"));
+    try testing.expect(std.mem.endsWith(u8, try addDefault("uuid[]", "ARRAY['a,b']::uuid[]"), "DEFAULT ARRAY['a,b']::uuid[];"));
+    try testing.expect(std.mem.endsWith(u8, try addDefault("uuid[]", "ARRAY[,]::uuid[]"), "DEFAULT 'ARRAY[,]::uuid[]';"));
+}
+
+test "a removed enum value: a bare default is restored as a value of the new type; comments stay one line" {
+    try expectEmit(
+        \\-- KICK ENUM REMOVE
+        \\-- enum: "role"
+        \\-- removed: 'a b'
+        \\-- columns: users.r
+        \\--
+        \\-- This migration drops values from a PostgreSQL ENUM type. The
+        \\-- runner refuses to apply it without the --confirm-enum-drop flag
+        \\-- (or `confirmEnumDrop: true` in RunnerOptions). Inspect the
+        \\-- column USING clauses below to confirm rows holding a removed
+        \\-- value will fail loudly rather than silently coerce.
+        \\ALTER TYPE "role" RENAME TO "role__old";
+        \\CREATE TYPE "role" AS ENUM ('user');
+        \\ALTER TABLE "users" ALTER COLUMN "r" DROP DEFAULT;
+        \\ALTER TABLE "users"
+        \\  ALTER COLUMN "r" TYPE "role"
+        \\  USING "r"::text::"role";
+        \\ALTER TABLE "users" ALTER COLUMN "r" SET DEFAULT 'user'::"role";
+        \\DROP TYPE "role__old";
+    , &.{.{ .remove_enum_value = .{ .@"enum" = "role", .removed = &.{"a\u{2028}b"}, .values = &.{"user"}, .affected = &.{.{ .table = "users", .column = "r", .default = "user" }} } }});
 }
 
 test "indexes, keys, enums, checks, primary keys" {

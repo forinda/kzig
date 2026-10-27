@@ -143,7 +143,11 @@ fn applyTableRenames(a: Allocator, prev: Snapshot, next: Snapshot, renames: Pair
         if (findTable(next, r[0]) != null or findTable(next, r[1]) == null) return badRename();
         for (tables) |t| if (std.mem.eql(u8, t.name, r[1])) return badRename();
         try changes.append(a, .{ .rename_table = .{ .from = r[0], .to = r[1] } });
-        tables[at].name = r[1];
+        // kick/db deletes and re-adds the entry: the renamed table moves last.
+        var moved = tables[at];
+        moved.name = r[1];
+        std.mem.copyForwards(Table, tables[at .. tables.len - 1], tables[at + 1 ..]);
+        tables[tables.len - 1] = moved;
     }
     var out = prev;
     out.tables = tables;
@@ -171,7 +175,7 @@ fn enumsCreatePhase(a: Allocator, prev: Snapshot, next: Snapshot, changes: *std.
         for (next.tables) |t| for (t.columns) |c| if (std.mem.eql(u8, c.sql_type, e.name)) {
             // The default the column had before: restored after the swap.
             const default = if (findTable(prev, t.name)) |pt| (if (findColumn(pt, c.name)) |pc| pc.default else null) else null;
-            if (default) |d| if (literalOf(d)) |lit| if (contains(removed.items, lit)) {
+            if (default) |d| if (try literalOf(a, d)) |lit| if (contains(removed.items, lit)) {
                 if (!@import("builtin").is_test) std.log.err("{s}.{s}: its default '{s}' is a value removed from {s}; change the default first", .{ t.name, c.name, lit, e.name });
                 return error.RemovedValueAsDefault;
             };
@@ -181,25 +185,33 @@ fn enumsCreatePhase(a: Allocator, prev: Snapshot, next: Snapshot, changes: *std.
     }
 }
 
-/// `'x'` or `'x'::"type"` → `x`; null for anything else.
-fn literalOf(expr: []const u8) ?[]const u8 {
+/// The enum value a default holds: `user` (as the schema writes it), `'user'`
+/// or `'user'::"type"`, with `''` unescaped; null for anything else.
+/// kick/db only reads the quoted forms, so a bare default slipped past it.
+fn literalOf(a: Allocator, expr: []const u8) !?[]const u8 {
     var e = std.mem.trim(u8, expr, " ");
+    var cast = false;
     if (std.mem.findLast(u8, e, "::")) |i| {
-        const cast = std.mem.trim(u8, std.mem.trim(u8, e[i + 2 ..], " "), "\"");
-        const ident = cast.len > 0 and (std.ascii.isAlphabetic(cast[0]) or cast[0] == '_') and for (cast) |ch| {
+        const t = std.mem.trim(u8, std.mem.trim(u8, e[i + 2 ..], " "), "\"");
+        const ident = t.len > 0 and (std.ascii.isAlphabetic(t[0]) or t[0] == '_') and for (t) |ch| {
             if (!(std.ascii.isAlphanumeric(ch) or ch == '_')) break false;
         } else true;
-        if (ident) e = std.mem.trim(u8, e[0..i], " ");
+        if (ident) {
+            e = std.mem.trim(u8, e[0..i], " ");
+            cast = true;
+        }
     }
-    if (e.len < 2 or e[0] != '\'' or e[e.len - 1] != '\'') return null;
-    const body = e[1 .. e.len - 1];
-    // A lone quote inside would end the literal; '' is an escaped one.
-    var i: usize = 0;
-    while (i < body.len) : (i += 1) if (body[i] == '\'') {
-        if (i + 1 < body.len and body[i + 1] == '\'') i += 1 else return null;
-    };
-    if (std.mem.find(u8, body, "''") != null) return null; // ponytail: escaped quotes in enum values aren't compared
-    return body;
+    if (e.len == 0 or e[0] != '\'') return if (cast) null else e;
+    if (e.len < 2 or e[e.len - 1] != '\'') return null;
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 1;
+    while (i < e.len - 1) : (i += 1) {
+        if (e[i] == '\'') {
+            if (i + 1 < e.len - 1 and e[i + 1] == '\'') i += 1 else return null;
+        }
+        try out.append(a, e[i]);
+    }
+    return out.items;
 }
 
 /// Dropped tables ordered so a table goes before any table it references.
@@ -352,12 +364,6 @@ fn diffTable(a: Allocator, prev: Table, next: Table, changes: *std.ArrayList(Cha
         if (lookup(renames, c.name)) |to| x.name = to;
         try prev_cols.append(a, x);
     }
-    const before_t: Table = blk: {
-        var x = prev;
-        x.columns = prev_cols.items;
-        break :blk x;
-    };
-
     // Keys, indexes and checks that change or go are dropped before any column.
     for (prev.foreign_keys) |f| {
         if (contains(dropped, f.ref_table)) continue;
@@ -383,7 +389,9 @@ fn diffTable(a: Allocator, prev: Table, next: Table, changes: *std.ArrayList(Cha
 
     for (renames) |r| try changes.append(a, .{ .rename_column = .{ .table = t, .from = r[0], .to = r[1] } });
 
-    const kb = try keyOf(a, before_t);
+    // The key as it was, as kick/db compares it: renaming a key column
+    // drops and re-adds the key.
+    const kb = try keyOf(a, prev);
     const ka = try keyOf(a, next);
     const key_changed = !optEql(kb.name, ka.name) or !listEql(kb.columns, ka.columns);
     if (key_changed and kb.columns.len > 0) try changes.append(a, .{ .alter_primary_key = .{ .table = t, .before = kb, .after = .{} } });
@@ -605,6 +613,30 @@ test "diff: indexes and foreign keys; tables renamed by hint" {
     people.name = "people";
     try expectKinds("rename_table", try diff(a, .{ .tables = &.{users} }, .{ .tables = &.{people} }, .{ .tables = &.{.{ "users", "people" }} }));
     try expectKinds("drop_table create_table", try diff(a, .{ .tables = &.{users} }, .{ .tables = &.{people} }, .{}));
+}
+
+test "diff: enum defaults as the schema writes them (bare) and with escaped quotes" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const t = tbl("t", &.{ id_col, col("role", "role", false, "b") });
+    const v1: Snapshot = .{ .tables = &.{t}, .enums = &.{.{ .name = "role", .values = &.{ "a", "b" } }} };
+    const removed = try diff(a, v1, .{ .tables = &.{t}, .enums = &.{.{ .name = "role", .values = &.{"b"} }} }, .{});
+    try testing.expectEqualStrings("b", removed[0].remove_enum_value.affected[0].default.?);
+    try testing.expectError(error.RemovedValueAsDefault, diff(a, v1, .{ .tables = &.{t}, .enums = &.{.{ .name = "role", .values = &.{"a"} }} }, .{}));
+    const q = tbl("t", &.{ id_col, col("role", "role", false, "'it''s'") });
+    const w1: Snapshot = .{ .tables = &.{q}, .enums = &.{.{ .name = "role", .values = &.{ "it's", "x" } }} };
+    try testing.expectError(error.RemovedValueAsDefault, diff(a, w1, .{ .tables = &.{q}, .enums = &.{.{ .name = "role", .values = &.{"x"} }} }, .{}));
+}
+
+test "diff: a renamed key column changes the key too, as kick/db emits it" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var uid = id_col;
+    uid.name = "uid";
+    uid.key = "uid";
+    try expectKinds("rename_column alter_primary_key alter_primary_key", try diff(a, .{ .tables = &.{tbl("t", &.{id_col})} }, .{ .tables = &.{tbl("t", &.{uid})} }, .{}));
 }
 
 test "diff: enums created first, values added in place, removed by recreate, dropped last" {
