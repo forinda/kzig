@@ -92,7 +92,7 @@ fn match(ctx: *Ctx, comptime pattern: []const []const u8, segments: []const []co
 pub fn Router(comptime routes: []const Route) type {
     return struct {
         /// Never fails: every outcome, errors included, becomes a response.
-        pub fn handle(ctx: *Ctx) void {
+        pub fn handle(_: @This(), ctx: *Ctx) void {
             dispatch(ctx) catch |err| handleError(ctx, err);
             if (!ctx.res.sent) ctx.noContent();
         }
@@ -184,7 +184,7 @@ fn runTest(comptime R: type, method: std.http.Method, path: []const u8, headers:
     var out: TestResult = .{ .arena = .init(testing.allocator), .res = .{} };
     const req: context.Request = .{ .method = method, .path = path, .query = "", .headers = headers, .body = "" };
     var ctx: Ctx = .{ .arena = out.arena.allocator(), .req = &req, .res = &out.res };
-    R.handle(&ctx);
+    (R{}).handle(&ctx);
     return out;
 }
 

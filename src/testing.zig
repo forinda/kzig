@@ -36,8 +36,8 @@ pub const TestResponse = struct {
     }
 };
 
-/// Runs one request through `R.handle`. `R` is a `Router(...)` (an `App` from M2).
-pub fn request(gpa: std.mem.Allocator, comptime R: type, opts: RequestOptions) !TestResponse {
+/// Runs one request through `app.handle` — an `*App`, or a `Router(...)` value.
+pub fn request(gpa: std.mem.Allocator, app: anytype, opts: RequestOptions) !TestResponse {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena.deinit();
     const q = std.mem.indexOfScalar(u8, opts.target, '?');
@@ -50,7 +50,7 @@ pub fn request(gpa: std.mem.Allocator, comptime R: type, opts: RequestOptions) !
     };
     var res: context.Response = .{};
     var ctx: Ctx = .{ .arena = arena.allocator(), .req = &req, .res = &res };
-    R.handle(&ctx);
+    app.handle(&ctx);
     return .{ .arena = arena, .status = res.status, .headers = res.headers.items, .body = res.body };
 }
 
@@ -70,7 +70,7 @@ const App = router.Router(&.{
 });
 
 test "GET /api/v1/hello returns a greeting" {
-    var res = try request(std.testing.allocator, App, .{ .target = "/api/v1/hello" });
+    var res = try request(std.testing.allocator, App{}, .{ .target = "/api/v1/hello" });
     defer res.deinit();
     try std.testing.expectEqual(std.http.Status.ok, res.status);
     const body = try res.json(struct { message: []const u8 });
@@ -78,14 +78,14 @@ test "GET /api/v1/hello returns a greeting" {
 }
 
 test "GET /api/v1/hello/health reports ok" {
-    var res = try request(std.testing.allocator, App, .{ .target = "/api/v1/hello/health" });
+    var res = try request(std.testing.allocator, App{}, .{ .target = "/api/v1/hello/health" });
     defer res.deinit();
     try std.testing.expectEqual(std.http.Status.ok, res.status);
     try std.testing.expectEqualStrings("ok", (try res.json(struct { status: []const u8 })).status);
 }
 
 test "unknown route answers 404 problem details" {
-    var res = try request(std.testing.allocator, App, .{ .target = "/api/v1/nope" });
+    var res = try request(std.testing.allocator, App{}, .{ .target = "/api/v1/nope" });
     defer res.deinit();
     try std.testing.expectEqual(std.http.Status.not_found, res.status);
     try std.testing.expectEqual(404, (try res.json(struct { status: u16 })).status);
@@ -99,7 +99,7 @@ test "query string reaches the handler" {
         }
     };
     const R = router.Router(&.{router.route(.GET, "/echo", Echo.q)});
-    var res = try request(std.testing.allocator, R, .{ .target = "/echo?name=ada" });
+    var res = try request(std.testing.allocator, R{}, .{ .target = "/echo?name=ada" });
     defer res.deinit();
     try std.testing.expectEqualStrings("\"ada\"", res.body);
 }

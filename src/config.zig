@@ -30,7 +30,13 @@ pub fn parse(comptime T: type, arena: std.mem.Allocator, env: *const std.process
         const default = comptime attrs.defaultValue(F);
         if (env.get(key)) |raw| {
             if (parseValue(F, raw)) |v| {
-                @field(out, name) = v;
+                // `env` may be freed after boot; strings must outlive it.
+                @field(out, name) = if (F == []const u8)
+                    try arena.dupe(u8, v)
+                else if (F == ?[]const u8)
+                    try arena.dupe(u8, v.?)
+                else
+                    v;
             } else {
                 try issues.append(arena, .{ .key = key, .reason = "expected " ++ comptime typeLabel(F) });
             }
@@ -159,6 +165,18 @@ test "all bad keys are reported at once" {
     try testing.expectEqualStrings("PORT", issues.items[0].key);
     try testing.expectEqualStrings("DATABASE_URL", issues.items[1].key);
     try testing.expectEqualStrings("required", issues.items[1].reason);
+}
+
+test "string values outlive env" {
+    var env = try envOf(&.{.{ "NAME", "kzig" }});
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var issues: std.ArrayList(Issue) = .empty;
+    const c = try parse(struct { name: []const u8, alias: ?[]const u8 = null }, arena.allocator(), &env, &issues);
+    const name_ptr = env.get("NAME").?.ptr;
+    env.deinit();
+    try testing.expect(c.name.ptr != name_ptr);
+    try testing.expectEqualStrings("kzig", c.name);
 }
 
 test "empty value is invalid for numbers" {

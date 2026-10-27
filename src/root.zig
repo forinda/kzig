@@ -3,6 +3,7 @@ const context = @import("context.zig");
 const problem = @import("problem.zig");
 const router = @import("router.zig");
 const di = @import("di.zig");
+const app = @import("app.zig");
 pub const testing = @import("testing.zig");
 pub const config = @import("config.zig");
 pub const runtime = struct {
@@ -20,12 +21,17 @@ pub const route = router.route;
 pub const Router = router.Router;
 pub const normalizePath = router.normalizePath;
 pub const Container = di.Container;
+pub const Module = app.Module;
+pub const App = app.App;
+pub const Process = app.Process;
+pub const Version = app.Version;
 
 test {
     _ = context;
     _ = problem;
     _ = router;
     _ = di;
+    _ = app;
     _ = testing;
     _ = config;
     _ = runtime.std;

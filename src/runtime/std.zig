@@ -176,7 +176,7 @@ pub fn Server(comptime App: type) type {
             var ctx: Ctx = .{ .arena = arena, .req = &request, .res = &res };
             // The timeout bounds the client, not the handler.
             deadline.store(std.math.maxInt(i64), .monotonic);
-            App.handle(&ctx);
+            (App{}).handle(&ctx);
             arm(io, deadline, self.options.body_timeout_ms);
 
             var status = res.status;

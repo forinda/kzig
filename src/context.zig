@@ -37,6 +37,8 @@ pub const Ctx = struct {
     res: *Response,
     params: Params = .{},
     problem: ?Problem = null,
+    /// The app handling this request (`*App`), for route thunks.
+    app: ?*anyopaque = null,
 
     pub const Params = struct {
         pub const max = 16;
