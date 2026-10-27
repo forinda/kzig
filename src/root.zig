@@ -21,6 +21,8 @@ pub const openapi = @import("openapi.zig");
 pub const multipart = @import("multipart.zig");
 /// WebSocket gateways (KickJS `@forinda/kickjs-ws`).
 pub const ws = @import("ws.zig");
+/// Scheduled jobs (KickJS `@Cron`).
+pub const cron = @import("cron.zig");
 /// A WebSocket connection's loop, for runtimes (std, http.zig).
 pub const ws_serve = @import("ws/serve.zig");
 pub const Upload = multipart.Upload;
@@ -60,6 +62,7 @@ pub const HealthCheck = @import("health.zig").HealthCheck;
 pub const Version = app.Version;
 
 test {
+    _ = cron;
     _ = @import("ws/frame.zig");
     _ = @import("ws/serve.zig");
     _ = ws;
