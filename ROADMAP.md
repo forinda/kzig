@@ -74,7 +74,9 @@ after M6.
 | An insert's `{ age: null }` writes NULL | A null field is left out (the column's default) | `Insert` fields are optionals; null can't mean both |
 | `set({ x: null })` | `Update` fields are `??T`: null leaves a column, `@as(?T, null)` sets NULL | Same reason |
 | `executeTakeFirstOrThrow` without a row: a 500 | `error.NotFound`, a 404 | The usual meaning of "no such row" in a handler |
-| `pg` driver, TLS | A Postgres client in Zig, no TLS (`sslmode=require` is refused) | No dependency; reach the server over a private network or a local proxy for now |
+| `pg` driver | A Postgres client in Zig, TLS from `std.crypto.tls` | No dependency |
+| libpq sends a cleartext password when the server asks | Only over TLS (`error.InsecureAuth` otherwise); SCRAM must end with the server's proof | A downgrade can't read the password |
+| `sslmode=allow` tries plaintext first | Treated as `prefer` (TLS first) | Encrypt when possible |
 | A DB adapter always reports health | `onHealthCheck` may return null; no database configured, nothing on `/health/ready` | task-api runs without a database |
 
 Kept for parity even where Zig would allow otherwise: route middleware runs **after** validation.
@@ -386,7 +388,14 @@ after their exports.
 
 ### M17 — Postgres TLS
 
-- [ ] `sslmode` (prefer, require, verify-ca, verify-full), system CAs; SCRAM's server proof required
+- [x] `sslmode` (disable, prefer by default, require, verify-ca, verify-full) and `sslrootcert`,
+      or the system's CAs; close_notify on close
+- [x] SCRAM sign-in must end with a verified server signature; a cleartext password only over TLS
+- [x] CI runs every database test over TLS (a throwaway CA) and checks verify-full, a wrong host
+      and a wrong CA
+
+Not covered: SCRAM channel binding (`SCRAM-SHA-256-PLUS`), client certificates
+(`sslcert`/`sslkey`), `sslnegotiation=direct`.
 
 ### Later
 

@@ -274,7 +274,17 @@ try tx.commit();
 
 Arguments are ints, floats, bools, strings, enums (by name) and optionals (NULL). A unique
 violation is `error.Conflict` (409); a server that can't be reached is `error.ServiceUnavailable`
-(503). No TLS yet: `sslmode=require` is refused.
+(503).
+
+TLS follows libpq's `sslmode` in the URL: `prefer` (the default) encrypts when the server
+offers it, `require` insists, `verify-ca` also checks the certificate chain and `verify-full` the
+host name too, against `sslrootcert=/path/ca.pem` or the system's CAs; `disable` stays in the
+clear. A password is never sent in cleartext over an unencrypted connection, and SCRAM sign-in
+must end with the server proving it knows the password.
+
+```text
+postgres://app:secret@db.example.com/app?sslmode=verify-full&sslrootcert=/etc/ssl/db-ca.pem
+```
 
 ### Schema and queries
 
