@@ -7,6 +7,9 @@ const context = @import("../context.zig");
 const router = @import("../router.zig");
 const adapter = @import("../adapter.zig");
 const Options = @import("options.zig").Options;
+const app_mod = @import("../app.zig");
+const ws = @import("../ws.zig");
+const WsClient = @import("../testing.zig").WsClient;
 
 const Io = std.Io;
 const Ctx = context.Ctx;
@@ -329,6 +332,7 @@ pub fn run(comptime ServerFn: fn (type) type, comptime known: Known) !void {
         } else if (!expected_to_fail and !ok) failed += 1;
     }
     try lifecycle(ServerFn);
+    try webSockets(ServerFn);
     if (failed > 0) return error.ConformanceFailed;
 }
 
@@ -363,4 +367,187 @@ fn lifecycle(comptime ServerFn: fn (type) type) !void {
 fn fail(name: []const u8, out: []const u8) error{ConformanceFailed} {
     std.debug.print("conformance: {s} failed; the server wrote:\n{s}\n", .{ name, out });
     return error.ConformanceFailed;
+}
+
+/// A gateway exercising what every runtime must do with a WebSocket.
+const Echo = struct {
+    pub const path = "/echo";
+    pub const State = struct { name: []const u8 = "" };
+    const WsCtx = ws.Ctx(State);
+    pub const events = .{
+        .{ .event = "join", .handler = "join" },
+        .{ .event = "say", .handler = "say" },
+        .{ .event = "*", .handler = "unknown" },
+    };
+
+    pub fn connect(_: *Echo, ctx: *WsCtx) !void {
+        const name = try ctx.query("name") orelse return ctx.close(4401, "Unauthorized");
+        ctx.state.name = try ctx.conn_arena.dupe(u8, name);
+        try ctx.send("welcome", .{ .name = name });
+    }
+
+    pub fn join(_: *Echo, ctx: *WsCtx, data: struct { room: []const u8 }) !void {
+        try ctx.join(data.room);
+        try ctx.to(data.room).send("joined", .{ .room = data.room, .name = ctx.state.name });
+    }
+
+    pub fn say(_: *Echo, ctx: *WsCtx, data: struct { room: []const u8, text: []const u8 }) !void {
+        if (!ctx.inRoom(data.room)) return ctx.send("error", .{ .message = "join first" });
+        try ctx.to(data.room).send("said", .{ .from = ctx.state.name, .text = data.text });
+    }
+
+    pub fn unknown(_: *Echo, ctx: *WsCtx, _: std.json.Value) !void {
+        try ctx.send("error", .{ .message = try std.fmt.allocPrint(ctx.arena, "unknown event: {s}", .{ctx.event}) });
+    }
+
+    pub fn draining(_: *Echo, ctx: *WsCtx) !void {
+        try ctx.send("server:draining", .{});
+    }
+};
+
+pub const WsApp = app_mod.App(.{
+    .modules = &.{app_mod.Module(.{ .name = "Chat", .gateways = &.{Echo} })},
+    .ws = .{ .heartbeat_ms = 150, .max_payload = 1024 },
+});
+
+fn WsHarness(comptime ServerFn: fn (type) type) type {
+    const S = ServerFn(WsApp);
+    return struct {
+        const Self = @This();
+        app: WsApp = undefined,
+        srv: S = undefined,
+        fut: Io.Future(anyerror!void) = undefined,
+
+        fn start(self: *Self) !void {
+            var env: std.process.Environ.Map = .init(testing.allocator);
+            defer env.deinit();
+            try env.put("NODE_ENV", "test");
+            try self.app.init(testing.io, testing.allocator, &env);
+            self.srv = try .init(testing.io, testing.allocator, &self.app, .{ .port = 0 });
+            self.fut = try testing.io.concurrent(runErased, .{&self.srv});
+        }
+        fn runErased(srv: *S) anyerror!void {
+            return srv.run();
+        }
+        fn stop(self: *Self) void {
+            self.srv.shutdown();
+            self.fut.cancel(testing.io) catch {};
+            self.srv.deinit();
+            self.app.deinit();
+        }
+        fn client(self: *Self, target: []const u8) !*WsClient {
+            return WsClient.connect(testing.allocator, testing.io, self.srv.port(), target);
+        }
+    };
+}
+
+fn webSockets(comptime ServerFn: fn (type) type) !void {
+    const H = WsHarness(ServerFn);
+    {
+        var h: H = .{};
+        try h.start();
+        defer h.stop();
+        const a = try h.client("/ws/echo?name=ann");
+        defer a.deinit();
+        if (a.status != 101) return fail("ws: an upgrade to a gateway answers 101", "");
+        if (!has(try a.expect("welcome"), "\"name\":\"ann\"")) return fail("ws: connect runs and can send", "");
+        const nope = try h.client("/ws/nope");
+        defer nope.deinit();
+        if (nope.status != 404) return fail("ws: an upgrade to no gateway is 404", "");
+        const anon = try h.client("/ws/echo");
+        defer anon.deinit();
+        if (try anon.closeCode() != 4401) return fail("ws: connect can close the socket (4401)", "");
+    }
+    {
+        var h: H = .{};
+        try h.start();
+        defer h.stop();
+        const a = try h.client("/ws/echo?name=ann");
+        defer a.deinit();
+        const b = try h.client("/ws/echo?name=ben");
+        defer b.deinit();
+        const c = try h.client("/ws/echo?name=cy");
+        defer c.deinit();
+        try a.emit("join", .{ .room = "red" });
+        _ = try a.expect("joined");
+        try b.emit("join", .{ .room = "red" });
+        if (!has(try a.expect("joined"), "ben")) return fail("ws: a room hears who joins", "");
+        try c.emit("join", .{ .room = "blue" });
+        _ = try c.expect("joined");
+        try a.emit("say", .{ .room = "red", .text = "hi" });
+        if (!has(try b.expect("said"), "\"text\":\"hi\"")) return fail("ws: a room message reaches the room", "");
+        if (!has(try a.expect("said"), "\"from\":\"ann\"")) return fail("ws: a room message reaches the sender", "");
+        try c.emit("say", .{ .room = "red", .text = "sneaky" });
+        if (!has(try c.expect("error"), "join first")) return fail("ws: inRoom", "");
+        // c is in blue only: its next frame must not be red's.
+        try c.emit("say", .{ .room = "blue", .text = "own" });
+        if (!has(try c.expect("said"), "own")) return fail("ws: rooms are isolated", "");
+    }
+    {
+        var h: H = .{};
+        try h.start();
+        defer h.stop();
+        const a = try h.client("/ws/echo?name=ann");
+        defer a.deinit();
+        try a.send("not json");
+        if (!has(try a.expect("error"), "Invalid JSON")) return fail("ws: bad JSON is an error event", "");
+        try a.send("{\"data\":1}");
+        if (!has(try a.expect("error"), "missing \\\"event\\\"")) return fail("ws: a frame without event is an error event", "");
+        try a.emit("join", .{ .room = 5 });
+        if (!has(try a.expect("error"), "Invalid data")) return fail("ws: data that doesn't decode is an error event", "");
+        try a.emit("dance", .{});
+        if (!has(try a.expect("error"), "unknown event: dance")) return fail("ws: the catch-all gets unknown events", "");
+        try a.sendFrame(2, "\x00");
+        if (try a.closeCode() != 1003) return fail("ws: a binary frame closes 1003", "");
+    }
+    {
+        var h: H = .{};
+        try h.start();
+        defer h.stop();
+        const big = try h.client("/ws/echo?name=ann");
+        defer big.deinit();
+        try big.send(&@as([2000]u8, @splat('x')));
+        if (try big.closeCode() != 1009) return fail("ws: a message over max_payload closes 1009", "");
+        const polite = try h.client("/ws/echo?name=ann");
+        defer polite.deinit();
+        try polite.sendFrame(8, "\x03\xe8");
+        if (try polite.closeCode() != 1000) return fail("ws: a client's close is answered", "");
+    }
+    {
+        // Pings come every heartbeat; a socket that doesn't answer is dropped.
+        var h: H = .{};
+        try h.start();
+        defer h.stop();
+        const quiet = try h.client("/ws/echo?name=ann");
+        defer quiet.deinit();
+        _ = try quiet.next(); // welcome
+        if ((try quiet.next()).op != 9) return fail("ws: the heartbeat pings", "");
+        while (true) {
+            const f = quiet.next() catch break;
+            if (f.op != 9) return fail("ws: a socket that misses a pong is dropped", f.data);
+        }
+        const lively = try h.client("/ws/echo?name=bo");
+        defer lively.deinit();
+        var pings: usize = 0;
+        while (pings < 3) {
+            const f = try lively.next();
+            if (f.op == 9) {
+                pings += 1;
+                try lively.sendFrame(10, f.data);
+            }
+        }
+        try lively.emit("dance", .{});
+        // `expect` answers pings, so the socket is still open.
+        _ = lively.expect("error") catch return fail("ws: a socket that answers pings stays", "");
+    }
+    {
+        var h: H = .{};
+        try h.start();
+        const a = try h.client("/ws/echo?name=ann");
+        defer a.deinit();
+        _ = try a.expect("welcome");
+        h.stop();
+        _ = a.expect("server:draining") catch return fail("ws: shutdown runs draining first", "");
+        if (try a.closeCode() != 1001) return fail("ws: shutdown closes 1001", "");
+    }
 }

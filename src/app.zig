@@ -16,6 +16,7 @@ const contributor = @import("contributor.zig");
 const decode = @import("decode.zig");
 const adapter_mod = @import("adapter.zig");
 const openapi = @import("openapi.zig");
+const ws = @import("ws.zig");
 
 /// Injectable as `*const kzig.Process`.
 pub const Process = struct {
@@ -57,13 +58,15 @@ pub const Version = union(enum) {
 /// `.version` (a number, or `false` for none; the app default otherwise),
 /// `.prefix = true` (false drops the api prefix) — KickJS's `routes()` options.
 pub fn Module(comptime spec: anytype) type {
-    checkFields(spec, &.{ "name", "path", "controllers", "services", "version", "prefix", "contributors", "settings" }, "Module");
+    checkFields(spec, &.{ "name", "path", "controllers", "services", "version", "prefix", "contributors", "settings", "gateways" }, "Module");
     return struct {
         pub const kzig_module = true;
         pub const name: []const u8 = spec.name;
         pub const path: []const u8 = opt(spec, "path", @as([]const u8, ""));
         pub const controllers: []const type = opt(spec, "controllers", @as([]const type, &.{}));
         pub const services: []const type = opt(spec, "services", @as([]const type, &.{}));
+        /// WebSocket gateways (`kzig.ws`), mounted under the App's `.ws.path`.
+        pub const gateways: []const type = opt(spec, "gateways", @as([]const type, &.{}));
         pub const version: Version = if (@hasField(@TypeOf(spec), "version")) versionOf(spec.version) else .default;
         pub const prefix: bool = opt(spec, "prefix", true);
         /// Settings sections, read and validated only when this module is mounted.
@@ -94,7 +97,7 @@ pub fn Plugin(comptime spec: anytype) type {
 /// `.default_version = 1`, `.health = true` (mounts `/health/live` and
 /// `/health/ready`).
 pub fn App(comptime spec: anytype) type {
-    checkFields(spec, &.{ "modules", "config", "api_prefix", "default_version", "health", "middleware", "contributors", "settings", "adapters", "plugins" }, "App");
+    checkFields(spec, &.{ "modules", "config", "api_prefix", "default_version", "health", "middleware", "contributors", "settings", "adapters", "plugins", "ws" }, "App");
     const plugins: []const type = opt(spec, "plugins", @as([]const type, &.{}));
     comptime var plugin_modules: []const type = &.{};
     comptime var plugin_adapters: []const type = &.{};
@@ -137,7 +140,7 @@ pub fn App(comptime spec: anytype) type {
     listed = listed ++ mwTypes(app_mw) ++ global_contributors ++ adapter_contributors;
     inline for (modules) |M| {
         if (!@hasDecl(M, "kzig_module")) @compileError(@typeName(M) ++ " is not a kzig.Module");
-        listed = listed ++ M.services ++ M.controllers ++ M.contributors;
+        listed = listed ++ M.services ++ M.controllers ++ M.contributors ++ M.gateways;
         inline for (M.controllers) |C| {
             if (@hasDecl(C, "middleware")) listed = listed ++ mwTypes(C.middleware);
             if (@hasDecl(C, "contributors")) listed = listed ++ contributor.types(C.contributors, @typeName(C));
@@ -148,6 +151,10 @@ pub fn App(comptime spec: anytype) type {
         }
     }
     const Services = di.Container(listed);
+    comptime var gateway_list: []const type = &.{};
+    inline for (modules) |M| gateway_list = gateway_list ++ M.gateways;
+    const gateways = gateway_list;
+    const ws_opts = ws.options(if (@hasField(@TypeOf(spec), "ws")) spec.ws else .{});
 
     return struct {
         const Self = @This();
@@ -158,6 +165,12 @@ pub fn App(comptime spec: anytype) type {
         health_cache: HealthCache = .{},
         /// Adapters whose `beforeMount` ran; they get `shutdown`.
         mounted: usize = 0,
+        /// Open WebSockets; unused without gateways.
+        ws_hub: ws.Hub = undefined,
+
+        /// Each gateway's full path; runtimes upgrade requests to these.
+        pub const ws_paths: []const []const u8 = ws.paths(gateways, ws_opts);
+        pub const ws_max_payload = ws_opts.max_payload;
 
         pub const routes: []const router.Route = buildRoutes(Self, modules, api_prefix, default_version, .{ global_contributors, adapter_contributors });
         const Routes = router.Router(routes);
@@ -210,6 +223,7 @@ pub fn App(comptime spec: anytype) type {
             if (failed) return error.InvalidConfig;
 
             const process: Process = .{ .io = io, .gpa = gpa, .started_at = std.Io.Clock.awake.now(io), .dev_or_test = config.devOrTest(env) };
+            self.ws_hub = .{ .io = io, .gpa = gpa, .opts = ws_opts };
             const probe: health.Probe = .{ .app = self, .checks = healthChecks };
             try self.container.initWith(values ++ .{ process, ConfigReport{ .vars = origins.items }, probe } ++ overrides);
             errdefer self.container.deinit();
@@ -235,6 +249,7 @@ pub fn App(comptime spec: anytype) type {
         /// `deinit`. Not for an app whose `init` failed (that cleaned up).
         pub fn deinit(self: *Self) void {
             self.shutdownAdapters();
+            self.ws_hub.deinit();
             self.container.deinit();
             self.config_arena.deinit();
         }
@@ -242,6 +257,34 @@ pub fn App(comptime spec: anytype) type {
         /// Shutdown has begun: health answers `draining`.
         pub fn beginDrain(self: *Self) void {
             self.get(Process).draining.store(true, .release);
+            if (gateways.len == 0) return;
+            self.ws_hub.stopHeartbeat();
+            inline for (gateways, 0..) |G, i| ws.drain(G, self.get(G), &self.ws_hub, i);
+        }
+
+        /// The gateway for an upgrade request's path.
+        pub fn wsRoute(_: *Self, path: []const u8) ?usize {
+            return ws.route(ws_paths, path);
+        }
+
+        /// A runtime upgraded a request to gateway `index`; null when the
+        /// gateway's `connect` closed it.
+        pub fn wsOpen(self: *Self, index: usize, conn: ws.Conn, upgrade: ws.Upgrade) !?*ws.Session {
+            inline for (gateways, 0..) |G, i| if (i == index) return ws.open(G, self.get(G), &self.ws_hub, i, conn, upgrade);
+            unreachable;
+        }
+
+        pub fn wsMessage(self: *Self, s: *ws.Session, text: []const u8) void {
+            inline for (gateways, 0..) |G, i| if (i == s.gateway) return ws.message(G, self.get(G), &self.ws_hub, s, text);
+        }
+
+        pub fn wsPong(_: *Self, s: *ws.Session) void {
+            ws.pong(s);
+        }
+
+        /// The connection ended; `s` is freed.
+        pub fn wsClose(self: *Self, s: *ws.Session) void {
+            inline for (gateways, 0..) |G, i| if (i == s.gateway) return ws.close(G, self.get(G), &self.ws_hub, s);
         }
 
         const checked = blk: {
@@ -283,6 +326,7 @@ pub fn App(comptime spec: anytype) type {
 
         /// The server is listening: adapter `afterStart`.
         pub fn started(self: *Self, info: adapter_mod.StartInfo) void {
+            if (gateways.len > 0) self.ws_hub.startHeartbeat();
             inline for (adapters) |A| {
                 if (@hasDecl(A, "afterStart")) self.get(A).afterStart(info);
             }
