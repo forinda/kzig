@@ -10,6 +10,12 @@
             // Only fetched for the http.zig runtime (-Dhttpz).
             .lazy = true,
         },
+        .sqlite = .{
+            .url = "https://sqlite.org/2026/sqlite-amalgamation-3540100.zip",
+            .hash = "N-V-__8AAETTsABEodUZZFAyfdAm9hEyqBXuLw9pRSO0vFh9",
+            // Only fetched for local SQLite files (-Dsqlite).
+            .lazy = true,
+        },
     },
     .paths = .{
         "build.zig",

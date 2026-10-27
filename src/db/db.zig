@@ -262,6 +262,7 @@ test {
     _ = @import("tls/crl.zig");
     _ = @import("tls/Client.zig");
     _ = pg;
+    if (@import("kzig_options").sqlite) _ = @import("sqlite.zig");
 }
 
 /// `DATABASE_URL` for the tests that need a server; skipped without one.

@@ -10,6 +10,27 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Local SQLite files need SQLite's C library: fetched and compiled only
+    // with -Dsqlite, so the default build stays C-free. Turso and D1 don't.
+    const kzig_options = b.addOptions();
+    var sqlite = false;
+    if (b.option(bool, "sqlite", "Build SQLite's C library for local sqlite: databases") orelse false) {
+        if (b.lazyDependency("sqlite", .{})) |dep| {
+            const header = b.addTranslateC(.{ .root_source_file = dep.path("sqlite3.h"), .target = target, .optimize = optimize });
+            mod.addImport("sqlite3", header.createModule());
+            mod.addCSourceFile(.{ .file = dep.path("sqlite3.c"), .flags = &.{
+                "-DSQLITE_THREADSAFE=1",
+                "-DSQLITE_DQS=0",
+                "-DSQLITE_DEFAULT_FOREIGN_KEYS=1",
+                "-DSQLITE_OMIT_LOAD_EXTENSION",
+            } });
+            mod.link_libc = true;
+            sqlite = true;
+        }
+    }
+    kzig_options.addOption(bool, "sqlite", sqlite);
+    mod.addOptions("kzig_options", kzig_options);
+
     const tests = b.addTest(.{ .root_module = mod });
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(runTests(b, tests));
@@ -63,10 +84,14 @@ pub fn build(b: *std.Build) void {
 
     // Each fixture must fail to compile with its message: the "compile error,
     // not boot error" guarantees.
+    const no_sqlite = b.addOptions();
+    no_sqlite.addOption(bool, "sqlite", false);
     for (compile_errors) |case| {
         const run = b.addSystemCommand(&.{ b.graph.zig_exe, "build-obj", "-fno-emit-bin", "--dep", "kzig" });
         run.addPrefixedFileArg("-Mroot=", b.path(b.fmt("tests/compile_errors/{s}.zig", .{case[0]})));
+        run.addArgs(&.{ "--dep", "kzig_options" });
         run.addPrefixedFileArg("-Mkzig=", b.path("src/root.zig"));
+        run.addPrefixedFileArg("-Mkzig_options=", no_sqlite.getOutput());
         run.expectExitCode(1);
         run.expectStdErrMatch(case[1]);
         test_step.dependOn(&run.step);

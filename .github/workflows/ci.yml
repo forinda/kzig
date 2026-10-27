@@ -18,7 +18,7 @@ jobs:
         with:
           version: 0.17.0
       - run: zig fmt --check build.zig build.zig.zon src examples tests benchmarks
-      - run: zig build test -Dhttpz -Doptimize=${{ matrix.optimize }} --summary all
+      - run: zig build test -Dhttpz -Dsqlite -Doptimize=${{ matrix.optimize }} --summary all
       - run: ./scripts/scaffold-check.sh
         if: matrix.optimize == 'Debug'
 
