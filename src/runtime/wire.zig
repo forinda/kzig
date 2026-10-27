@@ -8,17 +8,24 @@ const context = @import("../context.zig");
 pub const Wire = struct {
     status: std.http.Status,
     body: []const u8,
+    /// The Content-Length to declare: the body's, or for HEAD the one a
+    /// GET would have sent (RFC 9110 §9.3.2).
+    length: usize,
 };
 
 /// A 1xx from a handler becomes 500 (a final response is required); 204,
 /// 304 and HEAD carry no body (one would be read as the next response).
 pub fn finish(method: std.http.Method, path: []const u8, res: *const context.Response) Wire {
-    var out: Wire = .{ .status = res.status, .body = res.body };
+    var out: Wire = .{ .status = res.status, .body = res.body, .length = res.body.len };
     if (@backingInt(out.status) < 200) {
         if (!builtin.is_test) std.log.err("{t} {s}: handler set status {d}", .{ method, path, @backingInt(out.status) });
-        out = .{ .status = .internal_server_error, .body = "" };
+        out = .{ .status = .internal_server_error, .body = "", .length = 0 };
     }
-    if (out.status == .no_content or out.status == .not_modified or method == .HEAD) out.body = "";
+    if (out.status == .no_content or out.status == .not_modified) {
+        out.body = "";
+        out.length = 0;
+    }
+    if (method == .HEAD) out.body = "";
     return out;
 }
 
@@ -37,6 +44,7 @@ test "finish" {
     try std.testing.expectEqual(std.http.Status.internal_server_error, finish(.GET, "/", &res).status);
     res = .{ .status = .ok, .body = "x" };
     try std.testing.expectEqualStrings("", finish(.HEAD, "/", &res).body);
+    try std.testing.expectEqual(1, finish(.HEAD, "/", &res).length);
     try std.testing.expectEqualStrings("x", finish(.GET, "/", &res).body);
 }
 

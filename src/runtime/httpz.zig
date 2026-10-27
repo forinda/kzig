@@ -201,6 +201,9 @@ pub fn Server(comptime App: type) type {
             res.status = @backingInt(w.status);
             for (response.headers.items) |h| if (kzig.runtime.wire.sendable(h)) res.header(h.name, h.value);
             res.body = w.body;
+            // http.zig writes what it's given; it declares a set Content-Length as is.
+            if (method == .HEAD and w.length > 0)
+                res.header("Content-Length", std.fmt.allocPrint(arena, "{d}", .{w.length}) catch return internalError(res));
             if (self.draining.load(.acquire)) req.conn.handover = .close;
         }
     };

@@ -211,7 +211,9 @@ pub fn Server(comptime App: type) type {
                 n += 1;
             };
             const keep_alive = client_keep_alive and !self.draining.load(.acquire);
-            try req.respond(w.body, .{ .status = w.status, .keep_alive = keep_alive, .extra_headers = out[0..n] });
+            // For HEAD, std declares the length and leaves the bytes out itself.
+            const content = if (method == .HEAD) res.body[0..w.length] else w.body;
+            try req.respond(content, .{ .status = w.status, .keep_alive = keep_alive, .extra_headers = out[0..n] });
             return if (keep_alive) .keep_alive else .close;
         }
 

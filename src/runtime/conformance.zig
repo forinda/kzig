@@ -285,6 +285,14 @@ const checks = [_]Check{
             return std.mem.startsWith(u8, o, "HTTP/1.1 200 ") and std.mem.endsWith(u8, o, "\r\n\r\n");
         }
     }.f },
+    // RFC 9110 §9.3.2: the Content-Length a GET would have sent ("hi").
+    .{ .name = "HEAD carries the GET's content-length", .request = "HEAD /hello HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n", .expect = struct {
+        fn f(o: []const u8) bool {
+            var lower: [512]u8 = undefined;
+            if (o.len > lower.len) return false;
+            return std.mem.find(u8, std.ascii.lowerString(&lower, o), "content-length: 2\r\n") != null and std.mem.endsWith(u8, o, "\r\n\r\n");
+        }
+    }.f },
     .{ .name = "framing headers from a handler are not sent", .request = "GET /framed HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n", .expect = struct {
         fn f(o: []const u8) bool {
             var lower: [512]u8 = undefined;
