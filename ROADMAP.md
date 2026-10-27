@@ -63,8 +63,8 @@ Each milestone ends with tests passing (`zig build test`, no leaks under
 - [x] `std` runtime: listener, one task per connection on `Io.Group` (`concurrent`, since
       `async` may run a connection inline and stall accepting), connection cap, keep-alive,
       one arena per connection reset per request
-- [x] Limits: max body (413), max header bytes (431), read/idle timeout (`SO_RCVTIMEO`;
-      blocking `Io` only — an evented `Io` needs a watchdog), connection cap
+- [x] Limits: max body (413), max header bytes (431), read/idle timeout (per-connection
+      watchdog), connection cap
 - [x] `kzig.testing`: an in-process runtime that drives the full pipeline without a socket
 
 ### M2 — Modules and comptime DI
