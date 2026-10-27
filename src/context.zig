@@ -39,6 +39,8 @@ pub const Ctx = struct {
     problem: ?Problem = null,
     /// The app handling this request (`*App`), for route thunks.
     app: ?*anyopaque = null,
+    /// The route's contributor store while its pipeline runs.
+    values: ?*anyopaque = null,
 
     pub const Params = struct {
         pub const max = 16;

@@ -8,6 +8,7 @@ pub const testing = @import("testing.zig");
 pub const config = @import("config.zig");
 pub const middleware = @import("middleware.zig");
 pub const Next = middleware.Next;
+pub const contributor = @import("contributor.zig");
 pub const runtime = struct {
     pub const std = @import("runtime/std.zig");
 };
