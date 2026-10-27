@@ -67,7 +67,8 @@ src/
   storage/             # storage.zig (interface, memory, disk), s3.zig (SigV4, std.http.Client)
   db/                  # db.zig (Pool, Tx), pg.zig (Postgres protocol, SCRAM), migrate.zig,
                        # schema.zig (tables), query.zig (builder), timestamp.zig,
-                       # snapshot.zig, diff.zig, emit_pg.zig, generate.zig (kzig db generate)
+                       # snapshot.zig, diff.zig, emit_pg.zig, generate.zig (kzig db generate),
+                       # relational.zig (query(.t).findMany with `with`)
   cli/                 # The `kzig` CLI: main.zig, dev.zig, names, templates/*.tpl, registry
 examples/task-api/     # The one example app; grows each milestone
 benchmarks/            # bench.zig servers + run.sh against KickJS
