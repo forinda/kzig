@@ -45,6 +45,8 @@ after M6.
 | Transient scope | Not ported | Construct a value |
 | Plugins with `register`/`onReady` | Plugins are bundles; hooks live on their adapters | One lifecycle mechanism |
 | Typegen, Vite HMR | None; `zig build --watch` | Zig types are already the source of truth |
+| Swagger from zod schemas + decorators | OpenAPI from the Zig types, at comptime | The schema can't drift from the code |
+| Swagger operations untagged without `@ApiTags` | Tagged with the module's name | Swagger UI groups by module |
 
 Kept for parity even where Zig would allow otherwise: route middleware runs **after** validation.
 
@@ -205,11 +207,30 @@ Follow-ups:
 - [ ] Benchmark with a load generator that isn't the bottleneck (wrk/oha, separate machine), and
       against Fastify, before choosing a default between std and http.zig
 
-### Later — decided after M6
+### M7 — OpenAPI and Swagger UI
 
-Radix-tree router, SSE, multipart uploads (`file-storage-api`), WebSockets (`ws-chat`), OpenAPI
-from comptime metadata (swagger), cron (`cron-jobs-api`), queues, a `kzig` CLI with
-`new` / `g module`, database layer, a third engine (`io_uring`, edge).
+- [x] JSON Schema from Zig types at comptime (`kzig.openapi.schema`)
+- [x] Every route's OpenAPI operation built at comptime from its path, `body` / `query` /
+      `params` types and return type; `RouteInfo.doc` for adapters
+- [x] Doc options as data — controller `pub const docs`, route `.docs` — for KickJS's
+      `@ApiTags`, `@ApiOperation`, `@ApiResponse`, `@ApiBearerAuth`, `@ApiExclude`
+- [x] `kzig.swagger.Plugin(.{ … })`: `/openapi.json`, `/docs` (Swagger UI), `/redoc`;
+      `disable_in_prod`; servers from the listening port
+- [x] **Acceptance:** task-api serves its spec; it passes structural checks (paths, parameters,
+      `$ref`s, operation ids, tags)
+
+Follow-ups:
+
+- [ ] Lint the spec in CI with an OpenAPI validator (Redocly)
+- [ ] Named component schemas (`$ref`) instead of inline ones; recursive types
+- [ ] `@ApiSecurity` / custom security schemes; a public flag
+- [ ] Local Swagger UI assets (KickJS serves `swagger-ui-dist` when installed)
+
+### Later
+
+Radix-tree router, SSE, multipart uploads (`file-storage-api`), WebSockets (`ws-chat`), cron
+(`cron-jobs-api`), queues, a `kzig` CLI with `new` / `g module`, database layer, a third engine
+(`io_uring`, edge).
 
 ## Open questions
 

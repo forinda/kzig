@@ -15,6 +15,8 @@ pub const FieldError = decode.FieldError;
 const query = @import("query.zig");
 pub const ListQuery = query.ListQuery;
 pub const Paginated = query.Paginated;
+pub const openapi = @import("openapi.zig");
+pub const swagger = @import("swagger.zig");
 pub const middleware = @import("middleware.zig");
 pub const Next = middleware.Next;
 pub const contributor = @import("contributor.zig");
@@ -59,6 +61,8 @@ test {
     _ = config;
     _ = decode;
     _ = query;
+    _ = openapi;
+    _ = swagger;
     _ = middleware;
     _ = runtime.std;
     _ = runtime.wire;

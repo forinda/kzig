@@ -7,8 +7,8 @@ built on `comptime` instead of decorators, so a missing service or an unknown ha
 
 > **Status: pre-alpha.** Modules, compile-time DI, config and settings sections, middleware,
 > context contributors, typed and validated request bodies, list queries, adapters, plugins,
-> health checks, graceful shutdown, two HTTP runtimes (`std.http`, and http.zig opt-in) and an
-> in-process test runtime work (M1–M6). APIs will change. See the [roadmap](./ROADMAP.md).
+> health checks, graceful shutdown, OpenAPI with Swagger UI, two HTTP runtimes (`std.http`, and
+> http.zig opt-in) and an in-process test runtime work (M1–M7). APIs will change. See the [roadmap](./ROADMAP.md).
 
 Requires **Zig 0.17.0**. No dependencies (the optional http.zig runtime fetches http.zig).
 
@@ -262,6 +262,33 @@ Paths are percent-decoded per segment; `.` / `..` (also behind an encoded `/`), 
 UTF-8 and malformed escapes answer 400. A request with both `content-length` and
 `transfer-encoding` is refused and the connection closed.
 
+## OpenAPI and Swagger UI
+
+The spec comes from the types: path params, `query` / `params` / `body` structs and handler
+return types become parameters, request bodies and response schemas, at compile time.
+
+```zig
+.plugins = &.{kzig.swagger.Plugin(.{
+    .info = .{ .title = "task-api", .version = "0.1.0" },
+    .disable_in_prod = true,
+})},
+
+pub const ProjectController = struct {
+    pub const docs = .{ .tags = &[_][]const u8{"Projects"}, .bearer_auth = true };
+    pub const routes = .{
+        .{ .method = .POST, .path = "/", .handler = "create", .docs = .{
+            .summary = "Create a project",
+            .responses = .{.{ .status = 201, .description = "Created", .body = Project }},
+        } },
+    };
+    …
+};
+```
+
+`/openapi.json` (OpenAPI 3.0.3), `/docs` (Swagger UI) and `/redoc`. Doc options are data on the
+controller (`pub const docs`) and the route (`.docs`): `tags`, `summary`, `description`,
+`operation_id`, `deprecated`, `responses`, `bearer_auth`, `exclude`.
+
 ## Runtimes
 
 `kzig.runtime.std` (no dependencies) is the default. [http.zig](https://github.com/karlseguin/http.zig)
@@ -304,6 +331,7 @@ stays the default. Against KickJS on Express, on one machine (see [benchmarks](.
 | `defineAdapter({ beforeMount, onHealthCheck, … })` | a struct with those decls in `.adapters` |
 | `definePlugin({ modules, adapters, … })` | `kzig.Plugin(.{ … })` in `.plugins` |
 | `app.shutdown()` on SIGTERM | `kzig.runtime.std.serve(…)` + `defer app.deinit()` |
+| `SwaggerAdapter({ info })`, `@ApiTags`, `@ApiOperation`, `@ApiResponse` | `kzig.swagger.Plugin(.{ … })`, `docs` / `.docs` data |
 | `bootstrap({ runtime: fastifyRuntime() })` | `@import("kzig_httpz").serve(…)` (`-Dhttpz`) |
 | `@Post('/', { body: zodSchema })` / `ctx.body` | `got: struct { body: CreateProject }` |
 | `ctx.qs(config)` / `ctx.paginate(…)` | `got.query: kzig.ListQuery(config)` / `query.paginate(…)` |

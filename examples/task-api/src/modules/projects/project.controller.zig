@@ -18,10 +18,24 @@ pub const ProjectController = struct {
     // LoadAuthUser runs first.
     pub const contributors = .{ tenant.LoadTenant, LoadAuthUser };
 
+    pub const docs = .{ .tags = &[_][]const u8{"Projects"}, .bearer_auth = true };
+
     pub const routes = .{
-        .{ .method = .GET, .path = "/", .handler = "list" },
-        .{ .method = .POST, .path = "/", .handler = "create" },
-        .{ .method = .POST, .path = "/import", .handler = "import" },
+        .{ .method = .GET, .path = "/", .handler = "list", .docs = .{
+            .summary = "List the tenant's projects",
+            .description = "The tenant comes from `x-tenant` or the host's subdomain.",
+        } },
+        .{ .method = .POST, .path = "/", .handler = "create", .docs = .{
+            .summary = "Create a project",
+            .responses = .{
+                .{ .status = 201, .description = "Created", .body = repo.Project },
+                .{ .status = 401, .description = "No or invalid token" },
+                .{ .status = 404, .description = "Unknown tenant" },
+            },
+        } },
+        .{ .method = .POST, .path = "/import", .handler = "import", .docs = .{
+            .summary = "Import projects; a title the workspace has is kept",
+        } },
     };
 
     pub fn list(self: *ProjectController, ctx: *kzig.Ctx, got: struct { tenant: tenant.Tenant }) !struct {

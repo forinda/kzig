@@ -15,6 +15,7 @@ const mw = @import("middleware.zig");
 const contributor = @import("contributor.zig");
 const decode = @import("decode.zig");
 const adapter_mod = @import("adapter.zig");
+const openapi = @import("openapi.zig");
 
 /// Injectable as `*const kzig.Process`.
 pub const Process = struct {
@@ -223,7 +224,7 @@ pub fn App(comptime spec: anytype) type {
                 self.mounted += 1;
             }
             inline for (routes) |r| inline for (adapters) |A| {
-                if (@hasDecl(A, "onRouteMount")) self.get(A).onRouteMount(.{ .method = r.method, .path = r.path, .handler = r.name });
+                if (@hasDecl(A, "onRouteMount")) self.get(A).onRouteMount(.{ .method = r.method, .path = r.path, .handler = r.name, .doc = r.doc });
             };
             inline for (adapters) |A| {
                 if (@hasDecl(A, "beforeStart")) try self.get(A).beforeStart();
@@ -356,7 +357,8 @@ fn buildRoutes(comptime AppT: type, comptime modules: []const type, comptime api
                         if (@hasDecl(C, "contributors")) contributor.types(C.contributors, where) else &.{},
                         if (@hasField(@TypeOf(r), "contributors")) contributor.types(r.contributors, where) else &.{},
                     }, contributor.GotOf(@field(C, handler)), where);
-                    list = list ++ .{router.Route{ .method = method, .path = full, .handler = thunk(AppT, C, handler, P, chain), .name = owner }};
+                    const doc = &openapi.routeDoc(method, full, M.name, C, handler, r, P);
+                    list = list ++ .{router.Route{ .method = method, .path = full, .handler = thunk(AppT, C, handler, P, chain), .name = owner, .doc = doc }};
                     owners = owners ++ .{owner};
                 }
             }
@@ -1245,4 +1247,56 @@ test "dispose runs when the handler fails" {
     const got = try disposeRun("/api/v1/fail");
     defer testing.allocator.free(got);
     try testing.expectEqualStrings("ba", got);
+}
+
+const DocItem = struct { id: u32, title: []const u8 };
+
+const DocsController = struct {
+    pub const docs = .{ .tags = &[_][]const u8{"Items"}, .bearer_auth = true };
+    pub const routes = .{
+        .{ .method = .GET, .path = "/:id", .handler = "show", .docs = .{ .summary = "Get an item" } },
+        .{ .method = .POST, .path = "/", .handler = "create", .docs = .{ .responses = .{.{ .status = 201, .description = "Created", .body = DocItem }} } },
+        .{ .method = .GET, .path = "/hidden", .handler = "hidden", .docs = .{ .exclude = true } },
+    };
+    pub fn show(_: *DocsController, _: *Ctx, got: struct { params: struct { id: u32 }, query: struct { verbose: bool = false } }) DocItem {
+        return .{ .id = got.params.id, .title = "x" };
+    }
+    pub fn create(_: *DocsController, ctx: *Ctx, got: struct { body: struct { title: []const u8 } }) !void {
+        try ctx.created(DocItem{ .id = 1, .title = got.body.title });
+    }
+    pub fn hidden(_: *DocsController, _: *Ctx) void {}
+};
+
+const DocsApp = App(.{ .modules = &.{Module(.{ .name = "ItemsModule", .path = "/items", .controllers = &.{DocsController} })}, .health = false });
+
+fn docOf(comptime path: []const u8, comptime method: std.http.Method) *const @import("openapi.zig").RouteDoc {
+    inline for (DocsApp.routes) |r| {
+        if (comptime std.mem.eql(u8, r.path, path) and r.method == method) return r.doc.?;
+    }
+    unreachable;
+}
+
+test "route docs from types" {
+    const show = docOf("/api/v1/items/:id", .GET);
+    try testing.expectEqualStrings("get", show.method);
+    try testing.expectEqualStrings("/api/v1/items/{id}", show.path);
+    try testing.expectEqualStrings("{\"tags\":[\"Items\"],\"summary\":\"Get an item\",\"operationId\":\"DocsController_show\"," ++
+        "\"parameters\":[{\"name\":\"id\",\"in\":\"path\",\"required\":true,\"schema\":{\"type\":\"integer\",\"format\":\"int32\",\"minimum\":0}}," ++
+        "{\"name\":\"verbose\",\"in\":\"query\",\"required\":false,\"schema\":{\"type\":\"boolean\"}}]," ++
+        "\"responses\":{\"200\":{\"description\":\"Successful operation\",\"content\":{\"application/json\":{\"schema\":" ++
+        "{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\",\"format\":\"int32\",\"minimum\":0},\"title\":{\"type\":\"string\"}},\"required\":[\"id\",\"title\"]}}}}," ++
+        "\"422\":{\"description\":\"Validation error\",\"content\":{\"application/problem+json\":{\"schema\":{\"$ref\":\"#/components/schemas/ProblemDetails\"}}}}}," ++
+        "\"security\":[{\"BearerAuth\":[]}]}", show.operation);
+}
+
+test "explicit responses replace the default" {
+    const create = docOf("/api/v1/items", .POST);
+    try testing.expect(std.mem.find(u8, create.operation, "\"requestBody\":{\"required\":true,\"content\":{\"application/json\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"string\"}},\"required\":[\"title\"]}}}}") != null);
+    try testing.expect(std.mem.find(u8, create.operation, "\"201\":{\"description\":\"Created\",\"content\"") != null);
+    try testing.expect(std.mem.find(u8, create.operation, "\"200\"") == null);
+    try testing.expect(std.mem.find(u8, create.operation, "\"400\":{\"description\":\"Malformed JSON\"") != null);
+}
+
+test "excluded routes are marked" {
+    try testing.expect(docOf("/api/v1/items/hidden", .GET).exclude);
 }

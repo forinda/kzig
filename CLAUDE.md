@@ -49,6 +49,8 @@ src/
   config.zig           # Config and settings sections from env
   decode.zig           # JSON/strings into types with field issues
   query.zig            # ListQuery (filter/sort/page) and Paginated
+  openapi.zig          # JSON Schema / OpenAPI operations from types, at comptime
+  swagger.zig          # Swagger plugin: /openapi.json, /docs, /redoc
   health.zig           # Built-in /health/live, /health/ready
   context.zig          # Ctx, Request/Response views, return-value send
   router.zig           # Route table, matching, 404/405

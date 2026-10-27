@@ -10,6 +10,11 @@ pub const App = kzig.App(.{
     .modules = modules,
     .config = Config,
     .settings = &.{AppSettings},
+    // /openapi.json, /docs (Swagger UI), /redoc — development and test only.
+    .plugins = &.{kzig.swagger.Plugin(.{
+        .info = .{ .title = "task-api", .version = "0.1.0", .description = "kzig's example app" },
+        .disable_in_prod = true,
+    })},
     .adapters = &.{
         MailAdapter("transactional", mail.TransactionalMail),
         MailAdapter("marketing", mail.MarketingMail),
