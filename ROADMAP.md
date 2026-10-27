@@ -60,11 +60,14 @@ after M6.
 | `S3Settings` requires `S3_BUCKET` | Every `S3_*` field optional; `S3.fromSettings` names the missing one when S3 is chosen | Settings are listed at comptime, and a disk app must boot without them |
 | Streams, ranges, multipart uploads, upload forms, `compose`, tus, credential providers | Not ported: whole bodies, fixed keys | file-storage-api needs none of them |
 | Disk `put` under a file (`a.txt/b`): ENOTDIR, a 500 | `error.InvalidKey` (400) | The key can't name a file there; a client can fix it |
-| kick/db's schema, query builder and generated migrations | SQL strings with `$1` arguments, rows decoded into structs; migrations written by hand | The layers above SQL come later (see Later) |
+| kick/db's generated migrations and relations | Migrations written by hand for now | M15 and M16 |
 | `uuid().primaryKey()` builder chains | `.{ .type = .uuid, .primary_key = true }` struct literals | Plain Zig; a misspelt option is a compile error |
 | `references(() => t.id)` | `.references = .{ .to = "t.id" }`, checked when the schema is assembled | A Zig table can't name itself in its own initializer |
 | `pgEnum('role', …)` | A Zig enum with `pub const pg_name` | The enum is the row field's type |
 | `and()` / `or()` | `db.all` / `db.any`; `where(col, op, v)` and `whereExpr(e)` | Keywords; no overloading |
+| `upsert` of many rows, `sql` updates, a partial-index `where` | One row; `.update` is `.all`, `.none` or columns | Not needed yet |
+| An insert's `{ age: null }` writes NULL | A null field is left out (the column's default) | `Insert` fields are optionals; null can't mean both |
+| `set({ x: null })` | `Update` fields are `??T`: null leaves a column, `@as(?T, null)` sets NULL | Same reason |
 | `executeTakeFirstOrThrow` without a row: a 500 | `error.NotFound`, a 404 | The usual meaning of "no such row" in a handler |
 | `pg` driver, TLS | A Postgres client in Zig, no TLS (`sslmode=require` is refused) | No dependency; reach the server over a private network or a local proxy for now |
 | A DB adapter always reports health | `onHealthCheck` may return null; no database configured, nothing on `/health/ready` | task-api runs without a database |
