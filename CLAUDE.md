@@ -43,7 +43,9 @@ src/
   app.zig              # App(.{ … }), Module(.{ … }), boot and shutdown
   di.zig               # Comptime container
   contributor.zig      # Context contributors: precedence, order, typed `got` values
-  config.zig           # Config struct from env
+  config.zig           # Config and settings sections from env
+  decode.zig           # JSON/strings into types with field issues
+  query.zig            # ListQuery (filter/sort/page) and Paginated
   health.zig           # Built-in /health/live, /health/ready
   context.zig          # Ctx, Request/Response views, return-value send
   router.zig           # Route table, matching, 404/405
@@ -53,7 +55,7 @@ src/
   runtime/std.zig      # std.http.Server engine
   runtime/httpz.zig    # http.zig engine (M6)
   testing.zig          # In-process runtime and assertions
-examples/              # Ported kickjs-examples-archive apps
+examples/task-api/     # The one example app; grows each milestone
 tests/compile_errors/  # Fixtures that must fail to compile (listed in build.zig)
 ```
 
@@ -179,5 +181,6 @@ Write rich bodies to a file and pass `--body-file`; never inline multi-line mark
   and are never referenced from tracked files. `ROADMAP.md` is the public plan.
 - Keep `ROADMAP.md` true: tick items as they land, move settled open questions into the
   relevant milestone.
-- Port examples by reading the KickJS example first; the ported tests assert the same paths and
+- There is one example app, `examples/task-api`. A milestone adds modules to it rather than a
+  new app; read the KickJS archive example first and port its tests with the same paths and
   status codes.

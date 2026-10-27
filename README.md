@@ -5,26 +5,30 @@ middleware, context contributors and adapters, with KickJS's boot order and requ
 built on `comptime` instead of decorators, so a missing service or an unknown handler fails
 `zig build`, not the first request.
 
-> **Status: pre-alpha.** Modules, compile-time DI, env config, middleware, context contributors,
-> the router, problem bodies, an HTTP server on `std.http` and an in-process test runtime work
-> (M1–M3). Validation and request bodies (M4) are next. APIs will change. See the
+> **Status: pre-alpha.** Modules, compile-time DI, config and settings sections, middleware,
+> context contributors, typed and validated request bodies, list queries, the router, problem
+> bodies, an HTTP server on `std.http` and an in-process test runtime work (M1–M4). Lifecycle —
+> adapters, plugins, graceful shutdown (M5) — is next. APIs will change. See the
 > [roadmap](./ROADMAP.md).
 
 Requires **Zig 0.17.0**. No dependencies.
 
 ## Example
 
-The [`minimal-api`](./examples/minimal-api) port of KickJS's smallest app, file for file:
+[`examples/task-api`](./examples/task-api) is one app that grows with each milestone. Its modules
+port the [KickJS example apps](https://github.com/forinda/kickjs-examples-archive) with their tests:
+`hello` (minimal-api), `projects` (multi-tenant-kickdb-api, in memory), `features` and
+`config-reports` (settings-api).
 
 ```zig
-// hello.service.zig
+// modules/hello/hello.service.zig
 pub const HelloService = struct {
     process: *const kzig.Process, // injected by type
 
     pub fn greet(self: *HelloService, arena: std.mem.Allocator, name: []const u8) !Greeting { … }
 };
 
-// hello.controller.zig
+// modules/hello/hello.controller.zig
 pub const HelloController = struct {
     hello: *HelloService, // a missing service is a compile error
 
@@ -39,7 +43,7 @@ pub const HelloController = struct {
     …
 };
 
-// hello.module.zig
+// modules/hello/hello.module.zig
 pub const HelloModule = kzig.Module(.{
     .name = "HelloModule",
     .path = "/hello",
@@ -47,15 +51,13 @@ pub const HelloModule = kzig.Module(.{
     .services = &.{HelloService},
 });
 
-// config.zig — each field reads its upper-cased env var (PORT, NODE_ENV, LOG_LEVEL)
-pub const Config = struct {
-    port: u16 = 3000,
-    node_env: enum { development, production, @"test" } = .development,
-    log_level: []const u8 = "info",
-};
-
 // main.zig
-pub const App = kzig.App(.{ .modules = &.{HelloModule}, .config = Config });
+pub const App = kzig.App(.{
+    .modules = &.{ HelloModule, ProjectModule, FeaturesModule, ConfigReportModule },
+    .config = Config, // PORT, NODE_ENV, LOG_LEVEL
+    .settings = &.{AppSettings}, // APP_NAME, APP_PUBLIC_URL
+    .middleware = .{ kzig.middleware.requestId(), kzig.middleware.requestLogger(.{}), kzig.middleware.helmet(.{}) },
+});
 
 pub fn main(init: std.process.Init) !void {
     var app: App = undefined;
@@ -69,15 +71,15 @@ pub fn main(init: std.process.Init) !void {
 ```
 
 ```console
-$ zig build examples && ./zig-out/bin/minimal-api
+$ zig build examples && NODE_ENV=development ./zig-out/bin/task-api
 $ curl localhost:3000/api/v1/hello
-{"message":"Hello World from kzig!","timestamp":"2026-10-27T04:39:51.658Z"}
-$ curl localhost:3000/health/ready
-{"status":"ready","checks":[]}
-$ curl localhost:3000/api/v1/nope
-{"type":"about:blank","title":"Not Found","status":404}
-$ PORT=abc ./zig-out/bin/minimal-api
-error: config: PORT: expected an integer
+{"message":"Hello World from kzig!","timestamp":"2026-10-27T05:22:26.756Z"}
+$ curl -H 'authorization: Bearer token-all' -H 'x-tenant: acme' -H 'content-type: application/json' \
+    -d '{"title":""}' localhost:3000/api/v1/projects
+{"type":"about:blank","title":"Unprocessable Entity","status":422,"detail":"must be 1 to 200 characters","errors":[{"field":"title","message":"must be 1 to 200 characters"}]}
+$ NODE_ENV=production ./zig-out/bin/task-api
+error: Settings 'APP' are invalid:
+error:   APP_PUBLIC_URL: required
 ```
 
 Routes mount at `/api/v{version}{module.path}{route.path}`; a module takes `.version = 2` or
@@ -89,24 +91,13 @@ to add details.
 
 These fail `zig build`, not the first request: a service field pointing at an unlisted service, a
 dependency cycle, a route naming a missing handler, two routes with the same method and path,
-a misspelt `Module`/`App` option.
+a misspelt `Module`/`App` option, a handler reading a value no contributor on its route provides.
 
 ## Middleware and contributors
 
-From [`multi-tenant-api`](./examples/multi-tenant-api), the in-memory port of KickJS's
-multi-tenant example:
+From the `projects` module:
 
 ```zig
-pub const App = kzig.App(.{
-    .modules = modules,
-    .config = Config,
-    .middleware = .{ // global: runs for every request, matched or not
-        kzig.middleware.requestId(),
-        kzig.middleware.requestLogger(.{ .skip = &.{"/health"} }),
-        kzig.middleware.helmet(.{}),
-    },
-});
-
 /// A context contributor: a service with a `key` and a `resolve`.
 pub const LoadTenant = struct {
     pub const key = "tenant";
@@ -119,10 +110,16 @@ pub const LoadTenant = struct {
 pub const ProjectController = struct {
     projects: *ProjectRepository,
     pub const contributors = .{ LoadTenant, LoadAuthUser };
-    pub const routes = .{.{ .method = .GET, .path = "/", .handler = "list" }};
+    pub const routes = .{
+        .{ .method = .GET, .path = "/", .handler = "list" },
+        .{ .method = .POST, .path = "/", .handler = "create" },
+    };
 
     // `got.tenant` is typed; drop LoadTenant above and this doesn't compile.
     pub fn list(self: *ProjectController, ctx: *kzig.Ctx, got: struct { tenant: Tenant }) !Projects { … }
+
+    // `body` is decoded from JSON and validated before the handler runs.
+    pub fn create(self: *ProjectController, ctx: *kzig.Ctx, got: struct { tenant: Tenant, body: CreateProject }) !void { … }
 };
 ```
 
@@ -130,12 +127,54 @@ Middleware is `fn (ctx: *kzig.Ctx, next: *kzig.Next) !void` (or a service struct
 `handle`), registered on the App, a controller (`pub const middleware`) or a route
 (`.middleware`). Code after `next.run()` sees the final response, errors included. Contributors
 register on the App, a module, a controller or a route; the more specific one wins for a key.
-On a matched route the order is: `before_validation` contributors, then controller and route
-middleware around the other contributors and the handler. A contributor or middleware that
-answers (or sets a status and returns) ends the request there.
+On a matched route the order is: `before_validation` contributors, request decoding, then
+controller and route middleware around the other contributors and the handler. A contributor or
+middleware that answers (or sets a status and returns) ends the request there.
 
 Services, middleware and contributors are app-wide singletons shared by concurrent requests:
 keep per-request data on `ctx`, and guard shared state with atomics or a lock.
+
+## Validation, list queries and settings
+
+The schema is the type. `body`, `query` and `params` in a `got` struct are decoded from the
+request; every problem is reported with its path, as a 422 problem body:
+
+```zig
+pub const CreateProject = struct {
+    title: []const u8,
+    description: ?[]const u8 = null,
+
+    pub fn validate(self: *const CreateProject, issues: *kzig.Issues) !void {
+        if (self.title.len < 1 or self.title.len > 200) try issues.add("title", "must be 1 to 200 characters");
+    }
+};
+
+// A list endpoint (sketch; tasks arrive in a later milestone):
+pub fn list(self: *TaskController, ctx: *kzig.Ctx, got: struct {
+    query: kzig.ListQuery(.{ .filterable = &.{"status"}, .sortable = &.{"created"} }),
+}) !kzig.Paginated(Task) {
+    // ?filter=status:eq:open&sort=-created&page=2&limit=20
+    const rows = try self.tasks.find(ctx.arena, got.query);
+    return got.query.paginate(ctx, Task, rows.items, rows.total);
+}
+```
+
+Settings sections are structs with a prefix, read and validated at boot when the module that
+declares them is mounted:
+
+```zig
+pub const FeatureSettings = struct {
+    pub const prefix = "FEATURES";
+    signups: bool = true, // FEATURES_SIGNUPS
+    beta_testers: []const []const u8 = &.{}, // FEATURES_BETA_TESTERS=a@x.io,b@x.io
+};
+
+pub const AppSettings = struct {
+    pub const prefix = "APP";
+    pub const dev_defaults = .{ .public_url = "http://localhost:3000" }; // only when NODE_ENV is development/test
+    public_url: []const u8, // APP_PUBLIC_URL, or APP_PUBLIC_URL_FILE=/run/secrets/…
+};
+```
 
 ## Testing
 
@@ -201,6 +240,9 @@ UTF-8 and malformed escapes answer 400. A request with both `content-length` and
 | `ctx.get('tenant')` | a `got: struct { tenant: Tenant }` handler parameter |
 | `@Middleware(fn)` / `bootstrap({ middlewares })` | `.middleware = .{fn}` on a route, controller or App |
 | `requestId()`, `requestLogger()`, `cors()`, `helmet()` | `kzig.middleware.requestId()`, … |
+| `@Post('/', { body: zodSchema })` / `ctx.body` | `got: struct { body: CreateProject }` |
+| `ctx.qs(config)` / `ctx.paginate(…)` | `got.query: kzig.ListQuery(config)` / `query.paginate(…)` |
+| `defineSettings('FEATURES', schema)` | a struct with `pub const prefix = "FEATURES"` |
 | `createTestApp` + supertest | `app.init` / `initWith` + `kzig.testing.request` |
 
 The full list of deliberate differences is in the [roadmap](./ROADMAP.md).

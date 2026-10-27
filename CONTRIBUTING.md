@@ -24,7 +24,7 @@ zig build test
 
 ```
 src/        the framework (root.zig is the public API)
-examples/   apps ported from kickjs-examples-archive
+examples/   task-api, the example app (ports kickjs-examples-archive behaviour)
 ROADMAP.md  milestones and deliberate differences from KickJS
 CLAUDE.md   detailed conventions, for people and AI agents
 ```

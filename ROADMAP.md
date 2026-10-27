@@ -5,8 +5,9 @@ services, middleware, context contributors, adapters, boot order and request pip
 `comptime` instead of decorators and runtime metadata. Requires **Zig 0.17.0**.
 
 The bar for "done" is the [examples archive](https://github.com/forinda/kickjs-examples-archive):
-each example ports file for file (`hello.module.zig`, `hello.controller.zig`, …), with the same
-routes, status codes and tests.
+its apps' behaviour and tests are ported, module by module, into one example app,
+[`examples/task-api`](./examples/task-api), which grows with each milestone. Files keep KickJS's
+layout (`hello.module.zig`, `hello.controller.zig`, …).
 
 Engines come in this order: the standard library (`std.http.Server` on `std.Io`) first,
 [http.zig](https://github.com/karlseguin/http.zig) second, anything else is decided after that.
@@ -78,7 +79,7 @@ Follow-ups:
 - [ ] Absolute-form request targets (`GET http://host/x`)
 - [ ] `Ctx.setHeader` rejects CR/LF and `:` instead of the runtime dropping them
 - [ ] Testing runtime matches the server for HEAD and body limits
-- [ ] Decide null optional fields in user JSON (KickJS emits `null`)
+- [x] Null optional fields in user JSON are sent (KickJS `res.json`); framework bodies omit them
 
 ### M2 — Modules and comptime DI
 
@@ -92,15 +93,16 @@ Follow-ups:
 - [x] Config: a struct with defaults, filled from env at boot, every bad key reported at once
 - [x] Built-in health module (`/health/live`, `/health/ready`)
 - [x] `examples` build step; example tests run under `zig build test`
-- [x] **Acceptance:** `examples/minimal-api` ported with its three tests
+- [x] **Acceptance:** `minimal-api` ported with its three tests (now the hello module of
+      `examples/task-api`)
 
 Follow-ups:
 
 - [ ] Clear compile errors for `pub const init: S = .{}`, non-function handlers, handlers
       without `self`, and non-`pub` handlers
 - [ ] `App.routes` usable outside `App.handle` (thunks assume `ctx.app`)
-- [ ] A `Config` override in tests skips reading env
-- [ ] Config parsing rejects `1_000`, `inf`, `nan`; bools case-insensitive
+- [x] A `Config` override in tests skips reading env
+- [x] Config parsing rejects `1_000`, `inf`, `nan`; bools case-insensitive
 - [ ] Document: don't call `deinit` after a failed `init`
 
 ### M3 — Middleware and contributors
@@ -112,7 +114,7 @@ Follow-ups:
       `got`; precedence (method > controller > module > global) and comptime topo sort
 - [x] Typed contributor values per route via the handler's `got` parameter
 - [x] Built-ins: `requestId`, `requestLogger`, `cors`, `helmet`
-- [x] **Acceptance:** `examples/multi-tenant-api` — `multi-tenant-kickdb-api`'s auth → tenant →
+- [x] **Acceptance:** `multi-tenant-kickdb-api`'s auth → tenant →
       handler flow, in memory
 
 Follow-ups:
@@ -125,11 +127,21 @@ Follow-ups:
 
 ### M4 — Validation and bodies
 
-- [ ] Route `.body`, `.query`, `.params` types parsed with `std.json` / field parsers
-- [ ] 422 problem body with field errors; validators declared on the type (`pub fn validate`)
-- [ ] Query helpers: filters, sort, pagination (`ctx.qs`, `ctx.paginate`)
-- [ ] Module settings (`defineSettings` equivalent)
-- [ ] **Acceptance:** `examples/settings-api` (minus DevTools)
+- [x] Typed `body`, `query` and `params`, read through `got` and decoded with every field error
+      (malformed JSON 400, the rest 422, KickJS's messages)
+- [x] 422 problem body with `errors: [{field, message}]`; validators declared on the type
+      (`pub fn validate(self, issues)`)
+- [x] Query helpers: `kzig.ListQuery(.{ .filterable, .sortable, .searchable })` (filters, sort,
+      search, pagination) and `paginate` → `{data, meta, links}`
+- [x] Settings sections (`defineSettings`): `pub const prefix`, comma lists, `<KEY>_FILE`,
+      dev-only defaults (fail closed), App and Module `.settings`, `kzig.ConfigReport` origins
+- [x] **Acceptance:** `examples/task-api` passes the archive's `minimal-api`, `multi-tenant-kickdb-api`
+      projects (incl. create and import) and `settings-api` features / config-report tests
+
+Follow-ups:
+
+- [ ] Mail adapter sections (`MailSettings.scoped(…)`) with adapters (M5)
+- [ ] A query string with bad escapes reads as absent in typed queries; answer 400 instead
 
 ### M5 — Lifecycle
 
