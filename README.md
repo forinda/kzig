@@ -85,10 +85,13 @@ exe.root_module.addImport("kzig", kzig.module("kzig"));
 | --- | --- | --- |
 | `max_body_bytes` | 1 MiB | larger → 413 |
 | `max_header_bytes` | 16 KiB | larger → 431 |
-| `read_timeout_ms` | 30 000 | idle or slow clients are disconnected |
+| `head_timeout_ms` | 60 000 | time to send a request head, keep-alive idle included |
+| `body_timeout_ms` | 300 000 | time to send the body, and again to read the response |
 | `max_connections` | 1024 | further clients wait in the kernel backlog |
 
-Paths are percent-decoded per segment; `.` / `..` segments and malformed escapes answer 400.
+Paths are percent-decoded per segment; `.` / `..` (also behind an encoded `/`), invalid
+UTF-8 and malformed escapes answer 400. A request with both `content-length` and
+`transfer-encoding` is refused and the connection closed.
 
 ## Coming from KickJS
 

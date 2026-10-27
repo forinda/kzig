@@ -177,7 +177,15 @@ fn hasSendResponse(comptime T: type) bool {
 }
 
 /// Strict percent-decoding: a malformed escape is `BadRequest`, not passed through.
+/// The result must be UTF-8: JSON-encoding anything else turns a string into
+/// an array of numbers, so the client would pick the JSON type of the field.
 pub fn percentDecode(arena: Allocator, s: []const u8, plus_as_space: bool) error{ BadRequest, OutOfMemory }![]const u8 {
+    const out = try percentDecodeBytes(arena, s, plus_as_space);
+    if (!std.unicode.utf8ValidateSlice(out)) return error.BadRequest;
+    return out;
+}
+
+fn percentDecodeBytes(arena: Allocator, s: []const u8, plus_as_space: bool) error{ BadRequest, OutOfMemory }![]const u8 {
     if (std.mem.indexOfAny(u8, s, if (plus_as_space) "%+" else "%") == null) return s;
     const out = try arena.alloc(u8, s.len);
     var i: usize = 0;
@@ -341,6 +349,13 @@ test "query decodes + and %20, first match wins" {
 test "query with a bad escape is BadRequest" {
     var f: Fixture = undefined;
     f.init(.{ .method = .GET, .path = "/", .query = "x=%zz", .headers = &.{}, .body = "" });
+    defer f.deinit();
+    try testing.expectError(error.BadRequest, f.ctx.query("x"));
+}
+
+test "query with invalid UTF-8 is BadRequest" {
+    var f: Fixture = undefined;
+    f.init(.{ .method = .GET, .path = "/", .query = "x=%FF", .headers = &.{}, .body = "" });
     defer f.deinit();
     try testing.expectError(error.BadRequest, f.ctx.query("x"));
 }

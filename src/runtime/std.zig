@@ -18,8 +18,11 @@ pub const Options = struct {
     max_body_bytes: usize = 1 << 20,
     /// The whole request head must fit; larger answers 431.
     max_header_bytes: usize = 16 * 1024,
-    /// Time a connection may sit between bytes before it is closed.
-    read_timeout_ms: u32 = 30_000,
+    /// Time from waiting for a request (keep-alive idle included) until its
+    /// head is complete; bounds slowloris clients. 0 disables.
+    head_timeout_ms: u32 = 60_000,
+    /// Time to receive the body, and again to write the response. 0 disables.
+    body_timeout_ms: u32 = 300_000,
 };
 
 pub fn Server(comptime App: type) type {
@@ -62,7 +65,12 @@ pub fn Server(comptime App: type) type {
                 try self.permits.wait(io);
                 const stream = self.listener.accept(io) catch |err| {
                     self.permits.post(io);
-                    return err;
+                    if (!acceptRetryable(err)) return err;
+                    if (!builtin.is_test) std.log.warn("accept: {t}", .{err});
+                    // Back off so fd exhaustion doesn't spin; draining
+                    // connections free fds meanwhile.
+                    try io.sleep(.fromMilliseconds(50), .awake);
+                    continue;
                 };
                 // `concurrent`, not `async`: `async` may run the connection
                 // inline and stop the accept loop.
@@ -80,12 +88,12 @@ pub fn Server(comptime App: type) type {
                 self.permits.post(io);
             }
             var deadline: std.atomic.Value(i64) = .init(std.math.maxInt(i64));
-            var dog = if (self.options.read_timeout_ms > 0)
+            var dog = if (self.options.head_timeout_ms > 0 or self.options.body_timeout_ms > 0)
                 io.concurrent(watchdog, .{ io, stream, &deadline }) catch null
             else
                 null;
             defer if (dog) |*d| d.cancel(io) catch {};
-            const timeout_ms = self.options.read_timeout_ms;
+            const timeout_ms = self.options.head_timeout_ms;
 
             const read_buf = self.gpa.alloc(u8, self.options.max_header_bytes) catch return;
             defer self.gpa.free(read_buf);
@@ -130,21 +138,29 @@ pub fn Server(comptime App: type) type {
             const keep_alive = req.head.keep_alive;
 
             const max = self.options.max_body_bytes;
-            if (req.head.content_length) |len| if (len > max) return tooLarge(req);
+            const content_length = req.head.content_length;
+            const transfer_encoding = req.head.transfer_encoding;
+            // RFC 9112 §6.1: both headers is a smuggling attempt; refuse and close.
+            if (content_length != null and transfer_encoding == .chunked) return reject(req, .bad_request);
+            if (content_length) |len| if (len > max) return reject(req, .payload_too_large);
             var body: []const u8 = "";
-            // RFC 9112 §6.3: a request with neither header has no body; reading
-            // to EOF would swallow the next request on the connection.
-            const has_body = req.head.content_length != null or req.head.transfer_encoding != .none;
-            if (method.requestHasBody() and has_body) {
+            // Framing comes from the headers, not the method: a GET body left
+            // unread would be parsed as the next request on the connection.
+            if (content_length != null or transfer_encoding != .none) {
+                arm(io, deadline, self.options.body_timeout_ms);
+                if (req.head.expect != null) {
+                    try req.writeExpectContinue();
+                    try req.server.out.flush();
+                }
                 var body_buf: [4096]u8 = undefined;
-                const r = try req.readerExpectContinue(&body_buf);
+                const r = req.server.reader.bodyReader(&body_buf, transfer_encoding, content_length);
                 body = r.allocRemaining(arena, .limited(max)) catch |err| switch (err) {
-                    error.StreamTooLong => return tooLarge(req),
+                    error.StreamTooLong => return reject(req, .payload_too_large),
                     else => return err,
                 };
-            } else if (method.requestHasBody()) {
-                // std.http asserts a body-carrying method has a length when it
-                // discards the body before responding; there is none to discard.
+            } else {
+                // No body (RFC 9112 §6.3). std.http asserts a body-carrying
+                // method has a length when it discards the body; mark it read.
                 req.server.reader.state = .ready;
             }
 
@@ -161,7 +177,18 @@ pub fn Server(comptime App: type) type {
             // The timeout bounds the client, not the handler.
             deadline.store(std.math.maxInt(i64), .monotonic);
             App.handle(&ctx);
-            arm(io, deadline, self.options.read_timeout_ms);
+            arm(io, deadline, self.options.body_timeout_ms);
+
+            var status = res.status;
+            var content = res.body;
+            // std.http asserts on 1xx, and a body on 204/304 would be read as
+            // the start of the next response.
+            if (@backingInt(status) < 200) {
+                if (!builtin.is_test) std.log.err("{t} {s}: handler set status {d}", .{ method, request.path, @backingInt(status) });
+                status = .internal_server_error;
+                content = "";
+            }
+            if (status == .no_content or status == .not_modified) content = "";
 
             const out = try arena.alloc(http.Header, res.headers.items.len);
             var n: usize = 0;
@@ -171,13 +198,19 @@ pub fn Server(comptime App: type) type {
                 out[n] = .{ .name = h.name, .value = h.value };
                 n += 1;
             }
-            try req.respond(res.body, .{ .status = res.status, .keep_alive = keep_alive, .extra_headers = out[0..n] });
+            try req.respond(content, .{ .status = status, .keep_alive = keep_alive, .extra_headers = out[0..n] });
             return if (keep_alive) .keep_alive else .close;
         }
 
-        fn tooLarge(req: *http.Server.Request) !Next {
-            try req.respond(problem_413, .{
-                .status = .payload_too_large,
+        /// Answers before the body was read, then lingers and closes.
+        fn reject(req: *http.Server.Request, status: http.Status) !Next {
+            // Otherwise `respond` sends `100 Continue` and invites the body.
+            req.head.expect = null;
+            try req.respond(switch (status) {
+                .payload_too_large => problem_413,
+                else => problem_400,
+            }, .{
+                .status = status,
                 .keep_alive = false,
                 .extra_headers = &.{.{ .name = "content-type", .value = "application/problem+json" }},
             });
@@ -207,6 +240,16 @@ fn lingerClose(io: Io, stream: Io.net.Stream, r: *Io.Reader) void {
     }
 }
 
+/// Out of fds or memory, or a client that hung up mid-handshake: the server
+/// itself is fine, so keep accepting.
+fn acceptRetryable(err: anyerror) bool {
+    return switch (err) {
+        error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded, error.SystemResources, error.ConnectionAborted, error.ProtocolFailure, error.BlockedByFirewall => true,
+        else => false,
+    };
+}
+
+const problem_400 = "{\"type\":\"about:blank\",\"title\":\"Bad Request\",\"status\":400}";
 const problem_413 = "{\"type\":\"about:blank\",\"title\":\"Payload Too Large\",\"status\":413}";
 
 /// For errors before there is a request to respond through; the connection closes after.
@@ -223,8 +266,7 @@ fn nowMs(io: Io) i64 {
 
 /// Restarts the client's time budget; 0 disables it.
 fn arm(io: Io, deadline: *std.atomic.Value(i64), timeout_ms: u32) void {
-    if (timeout_ms == 0) return;
-    deadline.store(nowMs(io) + timeout_ms, .monotonic);
+    deadline.store(if (timeout_ms == 0) std.math.maxInt(i64) else nowMs(io) + timeout_ms, .monotonic);
 }
 
 // ponytail: one watchdog task per connection (a second thread under
@@ -240,7 +282,7 @@ fn watchdog(io: Io, stream: Io.net.Stream, deadline: *std.atomic.Value(i64)) Io.
             stream.shutdown(io, .both) catch {};
             return;
         }
-        try io.sleep(.fromMilliseconds(@min(left, 1000)), .awake);
+        try io.sleep(.fromMilliseconds(@min(left, 250)), .awake);
     }
 }
 
@@ -257,6 +299,28 @@ const TestApp = router.Router(&.{
             return "hi";
         }
     }.f),
+    router.route(.GET, "/secret", struct {
+        fn f(_: *Ctx) []const u8 {
+            return "SECRET";
+        }
+    }.f),
+    router.route(.GET, "/empty", struct {
+        fn f(ctx: *Ctx) !void {
+            ctx.status(.no_content);
+            try ctx.text("body");
+        }
+    }.f),
+    router.route(.GET, "/early", struct {
+        fn f(ctx: *Ctx) void {
+            ctx.status(.early_hints);
+            ctx.res.sent = true;
+        }
+    }.f),
+    router.route(.DELETE, "/echo", struct {
+        fn f(ctx: *Ctx) []const u8 {
+            return ctx.req.body;
+        }
+    }.f),
     router.route(.POST, "/echo", struct {
         fn f(ctx: *Ctx) []const u8 {
             return ctx.req.body;
@@ -271,6 +335,11 @@ fn roundTrip(opts: Options, raw: []const u8) ![]u8 {
 }
 
 fn roundTripOpts(opts: Options, raw: []const u8, half_close: bool) ![]u8 {
+    return roundTripParts(opts, &.{raw}, 0, half_close);
+}
+
+/// Sends `parts` with `gap_ms` between them.
+fn roundTripParts(opts: Options, parts: []const []const u8, gap_ms: i64, half_close: bool) ![]u8 {
     const io = testing.io;
     var o = opts;
     o.port = 0;
@@ -284,8 +353,11 @@ fn roundTripOpts(opts: Options, raw: []const u8, half_close: bool) ![]u8 {
     defer stream.close(io);
     var wbuf: [256]u8 = undefined;
     var w = stream.writer(io, &wbuf);
-    try w.interface.writeAll(raw);
-    try w.interface.flush();
+    for (parts, 0..) |part, i| {
+        if (i > 0) try io.sleep(.fromMilliseconds(gap_ms), .awake);
+        try w.interface.writeAll(part);
+        try w.interface.flush();
+    }
     var rbuf: [1024]u8 = undefined;
     var r = stream.reader(io, &rbuf);
     if (half_close) try stream.shutdown(io, .send);
@@ -343,9 +415,70 @@ test "POST without content-length has an empty body" {
     try testing.expectEqual(2, std.mem.count(u8, out, "HTTP/1.1 "));
 }
 
-test "idle connection is closed after read_timeout_ms" {
+test "idle connection is closed after head_timeout_ms" {
     // A partial head that never completes (slowloris); the server must hang up.
-    const out = try roundTrip(.{ .read_timeout_ms = 100 }, "GET /hello HTTP/1.1\r\nhost: x\r\n");
+    const out = try roundTrip(.{ .head_timeout_ms = 100 }, "GET /hello HTTP/1.1\r\nhost: x\r\n");
     defer testing.allocator.free(out);
     try testing.expectEqualStrings("", out);
+}
+
+test "a body on GET is not parsed as the next request" {
+    const smuggled = "GET /secret HTTP/1.1\r\nhost: x\r\n\r\n";
+    const out = try roundTripOpts(.{}, std.fmt.comptimePrint("GET /hello HTTP/1.1\r\nhost: x\r\ncontent-length: {d}\r\n\r\n", .{smuggled.len}) ++ smuggled, true);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "SECRET") == null);
+    try testing.expectEqual(1, std.mem.count(u8, out, "HTTP/1.1 "));
+}
+
+test "DELETE body reaches the handler" {
+    const out = try roundTrip(.{}, "DELETE /echo HTTP/1.1\r\nhost: x\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok");
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.endsWith(u8, out, "\r\n\r\nok"));
+}
+
+test "a slow body within body_timeout_ms is served" {
+    const out = try roundTripParts(.{ .head_timeout_ms = 200, .body_timeout_ms = 5000 }, &.{
+        "POST /echo HTTP/1.1\r\nhost: x\r\ncontent-length: 2\r\nconnection: close\r\n\r\n",
+        "o",
+        "k",
+    }, 300, false);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.endsWith(u8, out, "\r\n\r\nok"));
+}
+
+test "content-length with transfer-encoding is 400 and closes" {
+    const out = try roundTripOpts(.{}, "POST /echo HTTP/1.1\r\nhost: x\r\ncontent-length: 4\r\ntransfer-encoding: chunked\r\n\r\n0\r\n\r\n" ++
+        "GET /hello HTTP/1.1\r\nhost: x\r\n\r\n", true);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.startsWith(u8, out, "HTTP/1.1 400 "));
+    try testing.expectEqual(1, std.mem.count(u8, out, "HTTP/1.1 "));
+}
+
+test "204 is sent without a body" {
+    const out = try roundTripOpts(.{}, "GET /empty HTTP/1.1\r\nhost: x\r\n\r\nGET /hello HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n", false);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.startsWith(u8, out, "HTTP/1.1 204 "));
+    try testing.expect(std.mem.indexOf(u8, out, "body") == null);
+    try testing.expectEqual(2, std.mem.count(u8, out, "HTTP/1.1 "));
+}
+
+test "a 1xx status from a handler becomes 500" {
+    const out = try roundTrip(.{}, "GET /early HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n");
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.startsWith(u8, out, "HTTP/1.1 500 "));
+}
+
+test "head_timeout_ms 0 disables only the head budget" {
+    const out = try roundTripParts(.{ .head_timeout_ms = 0, .body_timeout_ms = 5000 }, &.{
+        "POST /echo HTTP/1.1\r\nhost: x\r\ncontent-length: 2\r\nconnection: close\r\n\r\n", "o", "k",
+    }, 300, false);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.endsWith(u8, out, "\r\n\r\nok"));
+}
+
+test "transient accept errors are retried" {
+    try testing.expect(acceptRetryable(error.ProcessFdQuotaExceeded));
+    try testing.expect(acceptRetryable(error.ConnectionAborted));
+    try testing.expect(!acceptRetryable(error.Canceled));
+    try testing.expect(!acceptRetryable(error.SocketNotListening));
 }

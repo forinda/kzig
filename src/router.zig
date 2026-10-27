@@ -43,7 +43,10 @@ pub fn normalizePath(arena: std.mem.Allocator, raw: []const u8) error{ BadReques
     while (it.next()) |part| {
         if (part.len == 0) continue;
         const seg = try context.percentDecode(arena, part, false);
-        if (std.mem.eql(u8, seg, ".") or std.mem.eql(u8, seg, "..")) return error.BadRequest;
+        // Check every component a decoded `/` or `\\` could split off, so
+        // `..%2F..` can't reach a handler that joins params into a file path.
+        var parts = std.mem.splitAny(u8, seg, "/\\");
+        while (parts.next()) |c| if (std.mem.eql(u8, c, ".") or std.mem.eql(u8, c, "..")) return error.BadRequest;
         try segments.append(arena, seg);
     }
     return .{ .segments = segments.items };
@@ -154,7 +157,7 @@ fn internalError(ctx: *Ctx, err: anyerror) void {
     ctx.status(.internal_server_error);
     ctx.json(.{
         .message = "Internal Server Error",
-        .requestId = ctx.requestId(),
+        .requestId = if (ctx.requestId()) |id| (if (std.unicode.utf8ValidateSlice(id)) id else null) else null,
         .@"error" = @as(?[]const u8, if (builtin.mode == .debug) @errorName(err) else null),
     }) catch {
         ctx.res.body = "{\"message\":\"Internal Server Error\"}";
@@ -312,4 +315,24 @@ test "unknown error is 500 json with requestId" {
     else
         "{\"message\":\"Internal Server Error\",\"requestId\":\"r1\"}";
     try testing.expectEqualStrings(expected, a.res.body);
+}
+
+test "encoded slash cannot smuggle dot segments" {
+    for ([_][]const u8{ "/files/..%2F..%2Fetc%2Fpasswd", "/users/..%2F", "/users/a%2F.", "/users/..%5Cx" }) |p| {
+        var a = runTest(TestRouter, .GET, p, &.{});
+        defer a.deinit();
+        try testing.expectEqual(std.http.Status.bad_request, a.res.status);
+    }
+}
+
+test "invalid UTF-8 in the path is 400" {
+    var a = runTest(TestRouter, .GET, "/users/%FF%22x", &.{});
+    defer a.deinit();
+    try testing.expectEqual(std.http.Status.bad_request, a.res.status);
+}
+
+test "non-UTF-8 request id is left out of the 500 body" {
+    var a = runTest(TestRouter, .GET, "/crash", &.{.{ .name = "x-request-id", .value = "\xff\"}" }});
+    defer a.deinit();
+    try testing.expect(std.mem.indexOf(u8, a.res.body, "requestId") == null);
 }
