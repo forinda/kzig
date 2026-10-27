@@ -344,6 +344,8 @@ pub fn App(comptime spec: anytype) type {
             mutex: std.Io.Mutex = .init,
             at_ms: ?i64 = null,
             results: [checked.len]health.HealthCheck = undefined,
+            /// Checks that ran: an adapter with nothing to check is left out.
+            len: usize = 0,
         };
 
         fn healthChecks(ptr: *anyopaque, arena: std.mem.Allocator) anyerror![]const health.HealthCheck {
@@ -361,10 +363,18 @@ pub fn App(comptime spec: anytype) type {
                 }
                 health.waitAll(io, &slots, 2000);
                 group.cancel(io);
-                inline for (checked, 0..) |A, i| cache.results[i] = slots[i].get() orelse .{ .name = @typeName(A), .status = .down };
+                cache.len = 0;
+                inline for (checked, 0..) |A, i| {
+                    // Not finished within the time: down.
+                    const result: ?health.HealthCheck = if (slots[i].finished()) slots[i].value else .{ .name = @typeName(A), .status = .down };
+                    if (result) |r| {
+                        cache.results[cache.len] = r;
+                        cache.len += 1;
+                    }
+                }
                 cache.at_ms = nowMs(io);
             }
-            return arena.dupe(health.HealthCheck, &cache.results);
+            return arena.dupe(health.HealthCheck, cache.results[0..cache.len]);
         }
 
         /// The server is listening: adapter `afterStart`.

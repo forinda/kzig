@@ -13,15 +13,18 @@ pub const HealthCheck = struct {
 /// One check's result, written by the task running it.
 pub const Slot = struct {
     done: std.atomic.Value(bool) = .init(false),
-    value: HealthCheck = undefined,
+    /// Null: the adapter has nothing to check (`onHealthCheck` returned null).
+    value: ?HealthCheck = undefined,
 
-    pub fn store(self: *Slot, v: HealthCheck) void {
+    /// `v` is a `HealthCheck`, or `?HealthCheck` from an adapter that may
+    /// have nothing to check.
+    pub fn store(self: *Slot, v: anytype) void {
         self.value = v;
         self.done.store(true, .release);
     }
 
-    pub fn get(self: *const Slot) ?HealthCheck {
-        return if (self.done.load(.acquire)) self.value else null;
+    pub fn finished(self: *const Slot) bool {
+        return self.done.load(.acquire);
     }
 };
 
@@ -36,7 +39,7 @@ pub fn runCheck(comptime A: type) fn (*A, *Slot) void {
 /// Until every slot is done or `ms` passed.
 pub fn waitAll(io: std.Io, slots: []const Slot, ms: i64) void {
     const start = std.Io.Clock.awake.now(io);
-    for (slots) |*s| while (s.get() == null) {
+    for (slots) |*s| while (!s.finished()) {
         const elapsed = @divTrunc(start.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds(), std.time.ns_per_ms);
         if (elapsed >= ms) return;
         io.sleep(.fromMilliseconds(5), .awake) catch return;
@@ -106,7 +109,14 @@ const Toggle = struct {
     }
 };
 
-const ProbeApp = app.App(.{ .modules = &.{}, .adapters = &.{ Up, Toggle } });
+/// Nothing to check (a database that isn't configured, say).
+const NotConfigured = struct {
+    pub fn onHealthCheck(_: *NotConfigured) ?HealthCheck {
+        return null;
+    }
+};
+
+const ProbeApp = app.App(.{ .modules = &.{}, .adapters = &.{ Up, NotConfigured, Toggle } });
 
 fn boot(a: *ProbeApp) !void {
     var env: std.process.Environ.Map = .init(testing.allocator);
