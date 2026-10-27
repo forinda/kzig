@@ -23,6 +23,8 @@ pub const multipart = @import("multipart.zig");
 pub const ws = @import("ws.zig");
 /// Scheduled jobs (KickJS `@Cron`).
 pub const cron = @import("cron.zig");
+/// File storage: memory, disk and S3 (KickJS `@forinda/kickjs-storage`).
+pub const storage = @import("storage.zig");
 /// A WebSocket connection's loop, for runtimes (std, http.zig).
 pub const ws_serve = @import("ws/serve.zig");
 pub const Upload = multipart.Upload;
@@ -62,6 +64,7 @@ pub const HealthCheck = @import("health.zig").HealthCheck;
 pub const Version = app.Version;
 
 test {
+    _ = storage;
     _ = cron;
     _ = @import("ws/frame.zig");
     _ = @import("ws/serve.zig");
