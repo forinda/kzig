@@ -1097,13 +1097,13 @@ fn slowReader(server: *Io.net.Server) !void {
         if (line.len == 0) break;
         if (std.ascii.startsWithIgnoreCase(line, "content-length:")) length = try std.fmt.parseInt(usize, std.mem.trim(u8, line[15..], " "), 10);
     }
-    // 1 MiB every 20 ms: over the timeout in total, never silent for it
-    // (what the kernel buffers drains well within it).
+    // 1 MiB every 50 ms (1.6 s for 32 MiB): over the 600 ms timeout in total,
+    // never silent for anything near it, with room for a busy CI runner.
     while (length > 0) {
         const n = @min(length, 1024 * 1024);
         try r.interface.discardAll(n);
         length -= n;
-        try testing.io.sleep(.fromMilliseconds(20), .awake);
+        try testing.io.sleep(.fromMilliseconds(50), .awake);
     }
     var wbuf: [128]u8 = undefined;
     var w = conn.writer(testing.io, &wbuf);
@@ -1119,7 +1119,7 @@ test "a slow upload that keeps moving isn't cut" {
     defer _ = fut.await(testing.io) catch {};
     var buf: [64]u8 = undefined;
     const endpoint = try std.fmt.bufPrint(&buf, "http://127.0.0.1:{d}", .{server.socket.address.getPort()});
-    var s3: S3 = try .init(testing.io, testing.allocator, .{ .bucket = "b", .endpoint = endpoint, .credentials = example, .timeout_ms = 300 });
+    var s3: S3 = try .init(testing.io, testing.allocator, .{ .bucket = "b", .endpoint = endpoint, .credentials = example, .timeout_ms = 600 });
     defer s3.deinit();
     const big = try testing.allocator.alloc(u8, 32 * 1024 * 1024);
     defer testing.allocator.free(big);
