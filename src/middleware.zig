@@ -33,6 +33,18 @@ pub const Next = struct {
 const testing = std.testing;
 const testing_rt = @import("testing.zig");
 
+pub const requestId = @import("middleware/request_id.zig").requestId;
+pub const requestLogger = @import("middleware/request_logger.zig").requestLogger;
+pub const cors = @import("middleware/cors.zig").cors;
+pub const helmet = @import("middleware/helmet.zig").helmet;
+
+test {
+    _ = @import("middleware/request_id.zig");
+    _ = @import("middleware/request_logger.zig");
+    _ = @import("middleware/cors.zig");
+    _ = @import("middleware/helmet.zig");
+}
+
 fn trail(ctx: *Ctx, mark: []const u8) !void {
     for (ctx.res.headers.items) |*h| if (std.mem.eql(u8, h.name, "x-trail")) {
         h.value = try std.fmt.allocPrint(ctx.arena, "{s},{s}", .{ h.value, mark });

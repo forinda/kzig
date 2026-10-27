@@ -41,6 +41,10 @@ pub const Ctx = struct {
     app: ?*anyopaque = null,
     /// The route's contributor store while its pipeline runs.
     values: ?*anyopaque = null,
+    /// Set by `App.handle`; middleware uses it for clocks and randomness.
+    io: ?std.Io = null,
+    /// Set by the `requestId` middleware.
+    request_id: ?[]const u8 = null,
 
     pub const Params = struct {
         pub const max = 16;
@@ -75,9 +79,9 @@ pub const Ctx = struct {
         return null;
     }
 
-    /// The `x-request-id` header; the requestId middleware (M3) will own this.
+    /// The id from the `requestId` middleware, else the raw `x-request-id` header.
     pub fn requestId(ctx: *const Ctx) ?[]const u8 {
-        return ctx.header("x-request-id");
+        return ctx.request_id orelse ctx.header("x-request-id");
     }
 
     pub fn status(ctx: *Ctx, s: std.http.Status) void {

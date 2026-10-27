@@ -121,6 +121,7 @@ pub fn App(comptime spec: anytype) type {
 
         pub fn handle(self: *Self, ctx: *Ctx) void {
             ctx.app = self;
+            ctx.io = self.get(Process).io;
             Routes.handleWith(global, ctx);
         }
     };
