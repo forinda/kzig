@@ -129,6 +129,8 @@ pub const Error = error{
     DbError,
     /// More parameters than the database binds in one statement (D1: 100).
     TooManyParameters,
+    /// The transaction can't go on: a remote SQLite's stream for it broke.
+    TransactionAborted,
     /// SQLSTATE 23505: a unique constraint (409 through the framework).
     Conflict,
     /// The connection broke; it is not reused.

@@ -26,19 +26,34 @@ pub const Client = struct {
         c.* = .{ .gpa = gpa, .io = io, .http = .{ .allocator = gpa, .io = io }, .arena = .init(gpa), .endpoint = "", .authorization = null };
         errdefer c.arena.deinit();
         const a = c.arena.allocator();
-        const rest = if (std.mem.startsWith(u8, url, "libsql://")) try std.mem.concat(a, u8, &.{ "https://", url["libsql://".len..] }) else url;
+        var rest = url;
+        var scheme: []const u8 = "";
+        if (std.mem.startsWith(u8, url, "libsql://")) {
+            rest = url["libsql://".len..];
+            scheme = "https://";
+        }
         const q = std.mem.findScalar(u8, rest, '?');
-        const base = std.mem.trimEnd(u8, rest[0 .. q orelse rest.len], "/");
-        _ = std.Uri.parse(base) catch return error.InvalidDatabaseUrl;
-        c.endpoint = try std.mem.concat(a, u8, &.{ base, "/v2/pipeline" });
         if (q) |i| {
             var it = std.mem.splitScalar(u8, rest[i + 1 ..], '&');
             while (it.next()) |kv| {
-                const eq = std.mem.findScalar(u8, kv, '=') orelse continue;
-                if (!std.mem.eql(u8, kv[0..eq], "authToken")) return error.InvalidDatabaseUrl;
-                c.authorization = try std.mem.concat(a, u8, &.{ "Bearer ", kv[eq + 1 ..] });
+                const eq = std.mem.findScalar(u8, kv, '=') orelse return error.InvalidDatabaseUrl;
+                const key = kv[0..eq];
+                const value = kv[eq + 1 ..];
+                if (std.mem.eql(u8, key, "authToken")) {
+                    // Sent as a header: printable ASCII only (a JWT is).
+                    if (value.len == 0) return error.InvalidDatabaseUrl;
+                    for (value) |ch| if (ch < 0x21 or ch > 0x7e) return error.InvalidDatabaseUrl;
+                    c.authorization = try std.mem.concat(a, u8, &.{ "Bearer ", value });
+                } else if (std.mem.eql(u8, key, "tls") and scheme.len > 0) {
+                    // libsql clients' `tls=0`: plain HTTP (a local sqld).
+                    if (std.mem.eql(u8, value, "0")) scheme = "http://" else if (!std.mem.eql(u8, value, "1")) return error.InvalidDatabaseUrl;
+                } else return error.InvalidDatabaseUrl;
             }
         }
+        const base = std.mem.trimEnd(u8, rest[0 .. q orelse rest.len], "/");
+        const full = try std.mem.concat(a, u8, &.{ scheme, base });
+        _ = std.Uri.parse(full) catch return error.InvalidDatabaseUrl;
+        c.endpoint = try std.mem.concat(a, u8, &.{ full, "/v2/pipeline" });
         return c;
     }
 
@@ -54,6 +69,9 @@ pub const Client = struct {
 pub const Session = struct {
     client: *Client,
     baton: ?[]u8 = null,
+    /// A transaction's stream broke (HTTP error, network, decode, the server
+    /// ended it): what follows would run outside the transaction, so it fails.
+    dead: bool = false,
     /// The stream's later requests go here when the server names it
     /// (Hrana's `base_url`: the replica that holds the stream).
     endpoint: ?[]u8 = null,
@@ -68,25 +86,31 @@ pub const Session = struct {
     /// Closes the stream if one is open (a transaction left open is rolled
     /// back with it).
     pub fn close(s: *Session) void {
-        if (s.baton != null) {
+        if (s.baton != null and !s.dead) {
             s.keep = false;
             var arena: std.heap.ArenaAllocator = .init(s.client.gpa);
             defer arena.deinit();
             _ = s.pipeline(arena.allocator(), null) catch {};
         }
-        s.setBaton(null);
-        if (s.endpoint) |e| s.client.gpa.free(e);
+        s.setBaton(null) catch {};
         s.client.gpa.destroy(s);
     }
 
     /// Tests: the stream as if it had expired on the server.
     pub fn forgetBaton(s: *Session) void {
-        s.setBaton("expired");
+        s.setBaton("expired") catch unreachable;
     }
 
-    fn setBaton(s: *Session, b: ?[]const u8) void {
+    /// A stream that ends takes its replica (`base_url`) with it.
+    fn setBaton(s: *Session, b: ?[]const u8) !void {
         if (s.baton) |old| s.client.gpa.free(old);
-        s.baton = if (b) |x| s.client.gpa.dupe(u8, x) catch null else null;
+        s.baton = null;
+        if (b) |x| {
+            s.baton = try s.client.gpa.dupe(u8, x);
+        } else if (s.endpoint) |e| {
+            s.client.gpa.free(e);
+            s.endpoint = null;
+        }
     }
 
     pub fn run(s: *Session, sql: []const u8, params: []const ?[]const u8, ctx: anytype, comptime row: anytype) Error!u64 {
@@ -104,11 +128,15 @@ pub const Session = struct {
         }
         w.writeAll("]}}") catch return error.OutOfMemory;
         const result = try s.pipeline(a, req.written());
-        const cols = (field(result, "cols") orelse return error.DbDecode).array.items;
+        const cols_v = field(result, "cols") orelse return error.DbDecode;
+        if (cols_v != .array) return error.DbDecode;
+        const cols = cols_v.array.items;
         const names = try a.alloc([]const u8, cols.len);
         for (cols, names) |col, *n| n.* = if (field(col, "name")) |v| (if (v == .string) v.string else "") else "";
         const values = try a.alloc(?[]const u8, cols.len);
-        const rows = (field(result, "rows") orelse return error.DbDecode).array.items;
+        const rows_v = field(result, "rows") orelse return error.DbDecode;
+        if (rows_v != .array) return error.DbDecode;
+        const rows = rows_v.array.items;
         for (rows) |r| {
             if (r != .array or r.array.items.len != cols.len) return error.DbDecode;
             for (r.array.items, values) |v, *out| out.* = try cell(a, v);
@@ -135,10 +163,20 @@ pub const Session = struct {
         _ = try s.pipeline(a, req.written());
     }
 
-    /// One request (and a close, outside a transaction); its result.
+    /// One request (and a close, outside a transaction); its result. In a
+    /// transaction any failure of the stream itself kills it (`dead`).
+    fn pipeline(s: *Session, a: Allocator, request: ?[]const u8) Error!std.json.Value {
+        if (s.dead) return error.TransactionAborted;
+        return s.exchange(a, request) catch |err| {
+            if (s.keep and err != error.Conflict and err != error.DbError) s.dead = true;
+            return err;
+        };
+    }
+
+    /// One HTTP round.
     /// ponytail: no request timeout (std's fetch has none); add a watchdog
     /// like storage/s3.zig's if a stalled Turso connection bites.
-    fn pipeline(s: *Session, a: Allocator, request: ?[]const u8) Error!std.json.Value {
+    fn exchange(s: *Session, a: Allocator, request: ?[]const u8) Error!std.json.Value {
         var body: std.Io.Writer.Allocating = .init(a);
         const w = &body.writer;
         (blk: {
@@ -150,6 +188,7 @@ pub const Session = struct {
             w.writeAll("]}") catch |e| break :blk e;
         }) catch return error.OutOfMemory;
         var out: std.Io.Writer.Allocating = .init(a);
+        refreshTlsClock(&s.client.http, s.client.io);
         const res = s.client.http.fetch(.{
             .location = .{ .url = s.endpoint orelse s.client.endpoint },
             .method = .POST,
@@ -164,28 +203,34 @@ pub const Session = struct {
             .response_writer = &out.writer,
         }) catch |err| {
             if (!builtin.is_test) std.log.err("db: libsql {s}: {t}", .{ s.client.endpoint, err });
-            s.setBaton(null);
+            try s.setBaton(null);
             return error.ServiceUnavailable;
         };
-        // An HTTP error ends the stream (Hrana): its transaction is gone.
+        // An HTTP error ends the stream (Hrana): its transaction is gone. A
+        // 400 outside one is the request's fault.
         if (res.status != .ok) {
             if (!builtin.is_test) std.log.err("db: libsql: HTTP {d}: {s}", .{ @backingInt(res.status), out.written() });
-            s.setBaton(null);
-            return error.ServiceUnavailable;
+            const in_stream = s.baton != null;
+            try s.setBaton(null);
+            return if (res.status == .bad_request and !in_stream and !s.keep) error.DbError else error.ServiceUnavailable;
         }
         const v = std.json.parseFromSliceLeaky(std.json.Value, a, out.written(), .{ .parse_numbers = false }) catch return error.DbDecode;
         const baton = field(v, "baton");
-        s.setBaton(if (baton != null and baton.? == .string) baton.?.string else null);
+        try s.setBaton(if (baton != null and baton.? == .string) baton.?.string else null);
+        // The server ended a stream we meant to keep.
+        if (s.keep and s.baton == null) return error.ServiceUnavailable;
         if (field(v, "base_url")) |b| if (b == .string) {
             if (s.endpoint) |e| s.client.gpa.free(e);
-            s.endpoint = std.mem.concat(s.client.gpa, u8, &.{ std.mem.trimEnd(u8, b.string, "/"), "/v2/pipeline" }) catch null;
+            s.endpoint = null;
+            s.endpoint = try std.mem.concat(s.client.gpa, u8, &.{ std.mem.trimEnd(u8, b.string, "/"), "/v2/pipeline" });
         };
         if (request == null) return .null;
         const results = (field(v, "results") orelse return error.DbDecode);
         if (results != .array or results.array.items.len == 0) return error.DbDecode;
         const first = results.array.items[0];
-        const kind = (field(first, "type") orelse return error.DbDecode).string;
-        if (std.mem.eql(u8, kind, "error")) return fail(field(first, "error") orelse .null);
+        const kind = field(first, "type") orelse return error.DbDecode;
+        if (kind != .string) return error.DbDecode;
+        if (std.mem.eql(u8, kind.string, "error")) return fail(field(first, "error") orelse .null);
         const response = field(first, "response") orelse return error.DbDecode;
         return field(response, "result") orelse .null;
     }
@@ -202,7 +247,23 @@ fn fail(e: std.json.Value) Error {
     if (!builtin.is_test) std.log.err("db: libsql: {s} ({s})", .{ message, code });
     if (std.mem.find(u8, message, "UNIQUE constraint failed") != null or std.mem.eql(u8, code, "SQLITE_CONSTRAINT_UNIQUE") or std.mem.eql(u8, code, "SQLITE_CONSTRAINT_PRIMARYKEY"))
         return error.Conflict;
+    if (std.mem.startsWith(u8, code, "SQLITE_BUSY") or std.mem.startsWith(u8, code, "SQLITE_LOCKED")) return error.ServiceUnavailable;
     return error.DbError;
+}
+
+/// std's client checks certificates against the time of its first TLS
+/// request, for good: past an hour, a fresh time (certificates rotate).
+pub fn refreshTlsClock(h: *std.http.Client, io: std.Io) void {
+    const now = std.Io.Clock.real.now(io);
+    {
+        h.ca_bundle_lock.lockShared(io) catch return;
+        defer h.ca_bundle_lock.unlockShared(io);
+        const t = h.now orelse return;
+        if (now.nanoseconds - t.nanoseconds < std.time.ns_per_hour) return;
+    }
+    h.ca_bundle_lock.lock(io) catch return;
+    defer h.ca_bundle_lock.unlock(io);
+    if (h.now != null) h.now = now;
 }
 
 /// A text parameter as a Hrana value: a canonical integer as `integer`,
@@ -210,6 +271,12 @@ fn fail(e: std.json.Value) Error {
 fn writeValue(w: *std.Io.Writer, p: ?[]const u8) !void {
     const v = p orelse return w.writeAll("{\"type\":\"null\"}");
     if (@import("sqlite_int.zig").canonicalInt(v) != null) return w.print("{{\"type\":\"integer\",\"value\":\"{s}\"}}", .{v});
+    // JSON text must be UTF-8: other bytes go as a blob.
+    if (!std.unicode.utf8ValidateSlice(v)) {
+        try w.writeAll("{\"type\":\"blob\",\"base64\":\"");
+        try std.base64.standard.Encoder.encodeWriter(w, v);
+        return w.writeAll("\"}");
+    }
     try w.writeAll("{\"type\":\"text\",\"value\":");
     try std.json.Stringify.value(v, .{}, w);
     try w.writeByte('}');
@@ -221,7 +288,9 @@ fn cell(a: Allocator, v: std.json.Value) Error!?[]const u8 {
     if (kind != .string) return error.DbDecode;
     if (std.mem.eql(u8, kind.string, "null")) return null;
     if (std.mem.eql(u8, kind.string, "blob")) {
-        const b64 = (field(v, "base64") orelse return error.DbDecode).string;
+        const b64v = field(v, "base64") orelse return error.DbDecode;
+        if (b64v != .string) return error.DbDecode;
+        const b64 = b64v.string;
         const D = std.base64.standard_no_pad.Decoder;
         const trimmed = std.mem.trimEnd(u8, b64, "=");
         const out = try a.alloc(u8, D.calcSizeForSlice(trimmed) catch return error.DbDecode);
@@ -327,6 +396,8 @@ const FakeHrana = struct {
     fut: std.Io.Future(void) = undefined,
     log: [8][160]u8 = undefined,
     n: usize = 0,
+    /// Answer `results` as an object: not what Hrana sends.
+    malformed: bool = false,
 
     fn start(f: *FakeHrana) !void {
         const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
@@ -378,7 +449,7 @@ const FakeHrana = struct {
         f.n += 1;
         // A stream's first answer names a replica to keep it on.
         var reply: [512]u8 = undefined;
-        const text = try std.fmt.bufPrint(&reply,
+        const text = if (f.malformed) "{\"baton\":null,\"results\":{\"type\":7}}" else try std.fmt.bufPrint(&reply,
             \\{{"baton":"b{d}","base_url":"http://127.0.0.1:{d}/replica","results":[{{"type":"ok","response":{{"type":"execute","result":{{"cols":[],"rows":[],"affected_row_count":0,"last_insert_rowid":null}}}}}}]}}
         , .{ f.n, f.port() });
         try req.respond(text, .{ .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }} });
@@ -403,4 +474,67 @@ test "libsql: the token goes in Authorization; a stream follows the base_url its
     tx.deinit();
     try testing.expectEqualStrings("/v2/pipeline Bearer tok null", fake.entry(0));
     try testing.expectEqualStrings("/replica/v2/pipeline Bearer tok b1", fake.entry(1));
+}
+
+test "libsql: a transaction whose stream died never autocommits what comes after" {
+    var env: std.process.Environ.Map = undefined;
+    var pool = try testPool(&env);
+    defer env.deinit();
+    defer pool.deinit();
+    try pool.execScript("DROP TABLE IF EXISTS kzig_ld; CREATE TABLE kzig_ld (v integer)");
+    defer pool.execScript("DROP TABLE IF EXISTS kzig_ld") catch {};
+    {
+        var tx = try pool.begin();
+        defer tx.deinit();
+        _ = try tx.exec("INSERT INTO kzig_ld VALUES (?1)", .{1});
+        tx.conn.?.libsql.forgetBaton();
+        try testing.expectError(error.ServiceUnavailable, tx.exec("INSERT INTO kzig_ld VALUES (?1)", .{2}));
+        // A caller that shrugs and carries on writes nothing.
+        try testing.expectError(error.TransactionAborted, tx.exec("INSERT INTO kzig_ld VALUES (?1)", .{3}));
+        try testing.expectError(error.TransactionAborted, tx.commit());
+    }
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqual(0, (try pool.query(arena.allocator(), struct { v: i64 }, "SELECT v FROM kzig_ld", .{})).len);
+}
+
+test "libsql: bytes that aren't UTF-8 go as a blob" {
+    var env: std.process.Environ.Map = undefined;
+    var pool = try testPool(&env);
+    defer env.deinit();
+    defer pool.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const r = (try pool.queryOne(arena.allocator(), struct { t: []const u8, l: i64 }, "SELECT typeof(?1) AS t, length(?1) AS l", .{@as([]const u8, "a\x00\xffb")})).?;
+    try testing.expectEqualStrings("blob", r.t);
+    try testing.expectEqual(4, r.l);
+}
+
+test "libsql URLs: tls=0 is http; a token must be a header value" {
+    const c = try Client.init(testing.io, testing.allocator, "libsql://db.example.com:8080?tls=0&authToken=abc");
+    defer c.deinit();
+    try testing.expectEqualStrings("http://db.example.com:8080/v2/pipeline", c.endpoint);
+    try testing.expectEqualStrings("Bearer abc", c.authorization.?);
+    try testing.expectError(error.InvalidDatabaseUrl, Client.init(testing.io, testing.allocator, "libsql://h?authToken=a\r\nX-Evil: 1"));
+    try testing.expectError(error.InvalidDatabaseUrl, Client.init(testing.io, testing.allocator, "libsql://h?authToken"));
+}
+
+test "the HTTP client's TLS clock moves on: an hour-old one is replaced" {
+    var h: std.http.Client = .{ .allocator = testing.allocator, .io = testing.io };
+    defer h.deinit();
+    const now = std.Io.Clock.real.now(testing.io);
+    h.now = .{ .nanoseconds = now.nanoseconds - 2 * std.time.ns_per_hour };
+    refreshTlsClock(&h, testing.io);
+    try testing.expect(now.nanoseconds - h.now.?.nanoseconds < std.time.ns_per_min);
+}
+
+test "libsql: a malformed answer is DbDecode, not a crash" {
+    var fake: FakeHrana = undefined;
+    try fake.start();
+    defer fake.stop();
+    fake.malformed = true;
+    var buf: [128]u8 = undefined;
+    var pool: db.Pool = try .init(testing.io, testing.allocator, .{ .url = try std.fmt.bufPrint(&buf, "http://127.0.0.1:{d}", .{fake.port()}) });
+    defer pool.deinit();
+    try testing.expectError(error.DbDecode, pool.exec("SELECT 1", .{}));
 }
