@@ -7,8 +7,9 @@ built on `comptime` instead of decorators, so a missing service or an unknown ha
 
 > **Status: pre-alpha.** Modules, compile-time DI, config and settings sections, middleware,
 > context contributors, typed and validated request bodies, list queries, adapters, plugins,
-> health checks, graceful shutdown, OpenAPI with Swagger UI, two HTTP runtimes (`std.http`, and
-> http.zig opt-in), an in-process test runtime and a `kzig` CLI work (M1–M8). APIs will change. See the [roadmap](./ROADMAP.md).
+> health checks, graceful shutdown, OpenAPI with Swagger UI, file uploads, WebSockets, two HTTP
+> runtimes (`std.http`, and http.zig opt-in), an in-process test runtime and a `kzig` CLI work
+> (M1–M9). APIs will change. See the [roadmap](./ROADMAP.md).
 
 Requires **Zig 0.17.0**. No dependencies (the optional http.zig runtime fetches http.zig).
 
@@ -213,6 +214,63 @@ every adapter's check at once, counts one slower than 2 s as down, and shares a 
 probes within a second. A contributor's `dispose(self, *V)` runs when its handler returns,
 before the response is written — a response body must not borrow memory `dispose` frees.
 
+## File uploads
+
+KickJS's `@FileUpload`: read `upload` in `got`, and the multipart body is parsed for you.
+
+```zig
+const Avatar = kzig.Upload(.{ .field = "file", .max_size = 2 * 1024 * 1024, .allowed_types = &.{ "png", "jpg" } });
+
+pub fn upload(self: *FilesController, ctx: *kzig.Ctx, got: struct { upload: Avatar }) !void {
+    const file = got.upload.file() orelse return ctx.fail(.bad_request, "Send the file in the `file` form field");
+    // file.filename is a UUID plus the extension of its type, never the client's name.
+    try ctx.created(try self.files.save(ctx.arena, file.filename, file.data));
+}
+```
+
+A type outside `allowed_types` (extensions, MIME types, `image/*`) is 415, a file over
+`max_size` or more than `max_count` files is 413, a broken body 400; text fields are in
+`upload.fields`. The whole request is still bounded by the server's `max_body_bytes`. Send
+bytes back with `ctx.bytes(content_type, data)`. task-api's `files` module is
+[file-storage-api](https://github.com/forinda/kickjs-examples-archive) on disk: API key, signed
+download links.
+
+## WebSockets
+
+KickJS's `@forinda/kickjs-ws`: a gateway in a module's `.gateways`, at `/ws` + its `path`.
+Frames are JSON `{ "event": …, "data": … }`; a handler's `data` is decoded like a request body.
+
+```zig
+pub const ChatGateway = struct {
+    presence: *Presence, // injected like any service
+
+    pub const path = "/chat"; // ws://host/ws/chat
+    pub const State = struct { name: []const u8 = "" }; // per socket
+    const Ctx = kzig.ws.Ctx(State);
+    pub const events = .{
+        .{ .event = "message:send", .handler = "send" },
+        .{ .event = "*", .handler = "unknown" },
+    };
+
+    pub fn connect(self: *ChatGateway, ctx: *Ctx) !void {
+        const user = try self.verify(try ctx.query("token")) orelse return ctx.close(4401, "Unauthorized");
+        ctx.state.name = try ctx.conn_arena.dupe(u8, user.name);
+    }
+
+    pub fn send(_: *ChatGateway, ctx: *Ctx, data: struct { room: []const u8, text: []const u8 }) !void {
+        if (!ctx.inRoom(data.room)) return ctx.send("error", .{ .message = "join it first" });
+        try ctx.to(data.room).send("message", .{ .from = ctx.state.name, .text = data.text });
+    }
+};
+```
+
+`ws.Ctx` has `send`, `close`, `join`, `leave`, `rooms`, `to(room).send`, `broadcast`,
+`broadcastAll`, and the upgrade request's `header` and `query`. Optional hooks: `connect`,
+`disconnect`, `draining` (on shutdown, before every socket closes with 1001). The App's
+`.ws = .{ .path, .heartbeat_ms, .max_payload }` sets the mount, the ping interval (a socket that
+misses a pong is dropped) and the message limit (1009 over it). Both runtimes serve gateways.
+task-api's `chat` module is the archive's ws-chat without Redis.
+
 ## CLI
 
 Prebuilt `kzig` binaries for Linux and macOS are attached to each
@@ -368,6 +426,9 @@ stays the default. Against KickJS on Express, on one machine (see [benchmarks](.
 | `ctx.qs(config)` / `ctx.paginate(…)` | `got.query: kzig.ListQuery(config)` / `query.paginate(…)` |
 | `defineSettings('FEATURES', schema)` | a struct with `pub const prefix = "FEATURES"` |
 | `createTestApp` + supertest | `app.init` / `initWith` + `kzig.testing.request` |
+| `@FileUpload({ maxSize, allowedTypes })` / `ctx.file` | `got: struct { upload: kzig.Upload(.{ … }) }` / `got.upload.file()` |
+| `@WsController('/chat')`, `@OnConnect`, `@OnMessage('e')` | a struct in `.gateways` with `path`, `connect`, `events` |
+| `ws` in tests | `kzig.testing.WsClient` |
 
 The full list of deliberate differences is in the [roadmap](./ROADMAP.md).
 

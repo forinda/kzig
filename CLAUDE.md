@@ -58,6 +58,9 @@ src/
   problem.zig          # RFC 9457 problem bodies, error-set → status
   middleware.zig       # Next chain; re-exports the built-ins
   middleware/          # requestId, requestLogger, cors, helmet
+  multipart.zig        # kzig.Upload: multipart/form-data, 413/415
+  ws.zig               # WebSocket gateways: hub, rooms, heartbeat, ws.Ctx
+  ws/frame.zig         # RFC 6455 framing (std runtime; http.zig frames itself)
   runtime/std.zig      # std.http.Server engine
   runtime/httpz.zig    # http.zig engine (module kzig_httpz, -Dhttpz)
   runtime/conformance.zig # Socket behaviour every runtime must pass
