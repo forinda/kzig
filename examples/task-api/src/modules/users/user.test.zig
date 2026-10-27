@@ -27,6 +27,21 @@ test "users: without a database the routes are unavailable (503) and ready leave
     try testing.expect(std.mem.find(u8, ready.body, "postgres") == null);
 }
 
+test "users: a password hash longer than its column is 422, not a database error" {
+    var env: std.process.Environ.Map = undefined;
+    defer env.deinit();
+    const url = databaseUrl(&env);
+    const t = try test_app.boot(if (url) |u| &.{ .{ "DATABASE_URL", u }, migrations } else &.{});
+    defer t.deinit();
+    const hash: [256]u8 = @splat('h');
+    const body = try std.fmt.allocPrint(testing.allocator, "{{\"email\":\"long@example.com\",\"passwordHash\":\"{s}\",\"firstName\":\"Ada\",\"lastName\":\"Lovelace\"}}", .{&hash});
+    defer testing.allocator.free(body);
+    var res = try t.request(.{ .method = .POST, .target = "/api/v1/users", .headers = &.{json}, .body = body });
+    defer res.deinit();
+    try testing.expectEqual(.unprocessable_entity, res.status);
+    try testing.expect(std.mem.find(u8, res.body, "passwordHash") != null);
+}
+
 test "users: creates a user and reads it back" {
     var env: std.process.Environ.Map = undefined;
     defer env.deinit();

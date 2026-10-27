@@ -29,6 +29,7 @@ pub const NewUser = struct {
         if (std.mem.findScalar(u8, self.email, '@') == null or self.email.len > 255) try issues.add("email", "must be an email address");
         if (self.firstName.len == 0 or self.firstName.len > 100) try issues.add("firstName", "must be 1 to 100 characters");
         if (self.lastName.len == 0 or self.lastName.len > 100) try issues.add("lastName", "must be 1 to 100 characters");
+        if (self.passwordHash.len == 0 or self.passwordHash.len > 255) try issues.add("passwordHash", "must be 1 to 255 characters");
     }
 };
 
