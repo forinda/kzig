@@ -75,10 +75,13 @@ fn fromJson(comptime T: type, arena: Allocator, v: std.json.Value, path: ?*const
             },
             else => {},
         },
+        // Non-finite values (1e400, 1e300 into f32) can't be sent back as JSON.
         .float => switch (v) {
             .integer => |i| return @floatFromInt(i),
-            .float => |f| return @floatCast(f),
-            .number_string => |n| if (std.fmt.parseFloat(T, n)) |f| return f else |_| {},
+            .float => |f| if (std.math.isFinite(@as(T, @floatCast(f)))) return @floatCast(f),
+            .number_string => |n| if (std.fmt.parseFloat(T, n)) |f| {
+                if (std.math.isFinite(f)) return f;
+            } else |_| {},
             else => {},
         },
         .@"enum" => if (v == .string) if (std.meta.stringToEnum(T, v.string)) |e| return e,
@@ -334,4 +337,15 @@ test "scalar is strict" {
     try testing.expectEqual(true, scalar(bool, "TRUE").?);
     try testing.expectEqual(false, scalar(bool, "0").?);
     try testing.expectEqual(-4, scalar(i8, "-4").?);
+}
+
+test "non-finite JSON numbers are rejected" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var issues: Issues = .init(a);
+    const v = try parseJson(a, "{\"x\":1e400,\"y\":1e300}");
+    try testing.expectEqual(null, try json(struct { x: f64, y: f32 }, a, v, &issues));
+    try testing.expectEqual(2, issues.list.items.len);
+    try testing.expectEqualStrings("expected number", issues.list.items[0].message);
 }

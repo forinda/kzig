@@ -20,6 +20,9 @@ pub const Process = struct {
     io: std.Io,
     gpa: std.mem.Allocator,
     started_at: std.Io.Timestamp,
+    /// `NODE_ENV` is `development` or `test` — read raw, so an unset
+    /// `NODE_ENV` counts as production (the archive apps' `isDevOrTest()`).
+    dev_or_test: bool = false,
 
     /// Seconds since the app started, like Node's `process.uptime()`.
     pub fn uptime(self: *const Process) f64 {
@@ -146,7 +149,7 @@ pub fn App(comptime spec: anytype) type {
             }
             if (failed) return error.InvalidConfig;
 
-            const process: Process = .{ .io = io, .gpa = gpa, .started_at = std.Io.Clock.awake.now(io) };
+            const process: Process = .{ .io = io, .gpa = gpa, .started_at = std.Io.Clock.awake.now(io), .dev_or_test = config.devOrTest(env) };
             try self.container.initWith(values ++ .{ process, ConfigReport{ .vars = origins.items } } ++ overrides);
         }
 
@@ -343,13 +346,22 @@ fn invalid(ctx: *Ctx, detail: []const u8, issues: decode.Issues) error{HttpProbl
 /// A JSON content type parses (malformed → 400); anything else, or nothing,
 /// is `{}`, as `express.json()` leaves it for the schema to reject.
 fn jsonBody(ctx: *Ctx) !std.json.Value {
-    const ct = ctx.header("content-type") orelse "";
-    const is_json = std.ascii.startsWithIgnoreCase(ct, "application/json") or std.mem.indexOf(u8, ct, "+json") != null;
-    if (!is_json or ctx.req.body.len == 0) return .{ .object = .empty };
+    if (!isJsonMediaType(ctx.header("content-type") orelse "") or ctx.req.body.len == 0) return .{ .object = .empty };
     return std.json.parseFromSliceLeaky(std.json.Value, ctx.arena, ctx.req.body, .{}) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => ctx.fail(.bad_request, "Malformed JSON"),
     };
+}
+
+/// `application/json` or `application/<x>+json`, parameters ignored —
+/// never `text/*`: a `text/plain` POST needs no CORS preflight, so parsing it
+/// would let any site send JSON cross-origin (KickJS `isJsonMediaType`).
+fn isJsonMediaType(content_type: []const u8) bool {
+    const media = std.mem.trim(u8, content_type[0 .. std.mem.indexOfScalar(u8, content_type, ';') orelse content_type.len], " \t");
+    if (std.ascii.eqlIgnoreCase(media, "application/json")) return true;
+    const sub = if (std.ascii.startsWithIgnoreCase(media, "application/")) media["application/".len..] else return false;
+    return sub.len > "+json".len and std.ascii.endsWithIgnoreCase(sub, "+json") and
+        std.mem.indexOfAny(u8, sub, "/ \t") == null;
 }
 
 const QuerySource = struct {
@@ -963,4 +975,19 @@ test "an overridden section or Config skips env" {
     defer app.deinit();
     try testing.expectEqualStrings("fake", app.get(MailSettings).password);
     try testing.expectEqual(config.Origin.Kind.provided, app.get(ConfigReport).vars[0].origin);
+}
+
+test "only JSON media types are parsed as JSON" {
+    // text/plain is a CORS simple request (no preflight); parsing it would
+    // let any site post JSON cross-origin.
+    for ([_][]const u8{ "text/plain; x=+json", "application/jsonp", "application/json-seq", "text/plain" }) |ct| {
+        var a = try bodyReq(.POST, "/api/v1/things", ct, "{\"title\":\"x\"}");
+        defer a.deinit();
+        try testing.expectEqual(std.http.Status.unprocessable_entity, a.status);
+    }
+    for ([_][]const u8{ "application/json", "Application/JSON ; charset=utf-8", "application/problem+json", "application/vnd.api+json" }) |ct| {
+        var a = try bodyReq(.POST, "/api/v1/things", ct, "{\"title\":\"x\"}");
+        defer a.deinit();
+        try testing.expectEqual(std.http.Status.created, a.status);
+    }
 }

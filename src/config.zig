@@ -117,7 +117,7 @@ pub fn providedOrigins(comptime T: type, arena: std.mem.Allocator, origins: *std
         try origins.append(arena, .{ .name = comptime envKey(sectionName(T), name), .section = sectionName(T), .origin = .provided, .required = false });
 }
 
-fn devOrTest(env: *const std.process.Environ.Map) bool {
+pub fn devOrTest(env: *const std.process.Environ.Map) bool {
     const e = env.get("NODE_ENV") orelse return false;
     return std.mem.eql(u8, e, "development") or std.mem.eql(u8, e, "test");
 }

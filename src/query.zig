@@ -50,6 +50,8 @@ pub fn Paginated(comptime T: type) type {
 
 /// Read as `got: struct { query: kzig.ListQuery(.{ … }) }`.
 pub fn ListQuery(comptime cfg: Config) type {
+    if (cfg.default_limit < 1 or cfg.max_limit < 1 or cfg.default_limit > cfg.max_limit)
+        @compileError("ListQuery: limits must be at least 1 and default_limit <= max_limit");
     return struct {
         const Self = @This();
         pub const kzig_list_query = true;

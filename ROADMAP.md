@@ -142,6 +142,12 @@ Follow-ups:
 
 - [ ] Mail adapter sections (`MailSettings.scoped(…)`) with adapters (M5)
 - [ ] A query string with bad escapes reads as absent in typed queries; answer 400 instead
+- [ ] Form bodies (`application/x-www-form-urlencoded`) and 415 for unsupported body types;
+      duplicate JSON keys use the last value instead of 400
+- [ ] A JSON `1.0` decodes into integer fields (zod `.int()` accepts it)
+- [ ] A `_FILE` that can't be read is reported once (not also as `required`)
+- [ ] A misspelt `dev_defaults` field is a compile error
+- [ ] Length checks count characters, not bytes (the example's 200-character title)
 
 ### M5 — Lifecycle
 

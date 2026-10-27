@@ -58,5 +58,6 @@ const compile_errors = [_][2][]const u8{
     .{ "contributor_duplicate", "GET /api/v1/x: contributor key 'a' registered twice" },
     .{ "contributor_optional_as_required", "'a' is optional; the handler must declare it as ?u32" },
     .{ "contributor_wrong_type", "'a' is u32, not []const u8 (in the handler)" },
+    .{ "list_query_zero_limit", "ListQuery: limits must be at least 1 and default_limit <= max_limit" },
     .{ "bad_middleware", "GET /api/v1/x: middleware must be fn (*Ctx, *Next) !void or a type with handle" },
 };

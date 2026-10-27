@@ -1,6 +1,5 @@
 const std = @import("std");
 const test_app = @import("../../test_app.zig");
-const Config = @import("../../config/config.zig").Config;
 
 const testing = std.testing;
 
@@ -27,9 +26,31 @@ test "lists every section with its origins" {
 }
 
 test "is not served in production" {
-    const t = try test_app.bootWith(&.{}, .{Config{ .node_env = .production }});
-    defer t.deinit();
+    var env: std.process.Environ.Map = .init(testing.allocator);
+    defer env.deinit();
+    try env.put("NODE_ENV", "production");
+    try env.put("APP_PUBLIC_URL", "https://api.example.com");
+    const App = @import("../../main.zig").App;
+    const app = try testing.allocator.create(App);
+    defer testing.allocator.destroy(app);
+    try app.init(testing.io, testing.allocator, &env);
+    defer app.deinit();
+    const t: test_app.TestApp = .{ .app = app };
     var res = try t.get("/api/v1/config");
+    defer res.deinit();
+    try testing.expectEqual(.not_found, res.status);
+}
+
+test "is not served when NODE_ENV is unset" {
+    var env: std.process.Environ.Map = .init(testing.allocator);
+    defer env.deinit();
+    try env.put("APP_PUBLIC_URL", "https://api.example.com");
+    const App = @import("../../main.zig").App;
+    const app = try testing.allocator.create(App);
+    defer testing.allocator.destroy(app);
+    try app.init(testing.io, testing.allocator, &env);
+    defer app.deinit();
+    var res = try @import("kzig").testing.request(testing.allocator, app, .{ .target = "/api/v1/config" });
     defer res.deinit();
     try testing.expectEqual(.not_found, res.status);
 }
