@@ -31,15 +31,18 @@ pub fn Server(comptime App: type) type {
 
         io: Io,
         gpa: std.mem.Allocator,
+        app: *App,
         options: Options,
         listener: Io.net.Server,
         permits: Io.Semaphore,
 
-        pub fn init(io: Io, gpa: std.mem.Allocator, options: Options) !Self {
+        /// `app` is an `*App` (or a `Router(...)` value) and must outlive the server.
+        pub fn init(io: Io, gpa: std.mem.Allocator, app: *App, options: Options) !Self {
             const address = try Io.net.IpAddress.parse(options.host, options.port);
             return .{
                 .io = io,
                 .gpa = gpa,
+                .app = app,
                 .options = options,
                 .listener = try address.listen(io, .{ .reuse_address = true }),
                 .permits = .{ .permits = options.max_connections },
@@ -176,7 +179,7 @@ pub fn Server(comptime App: type) type {
             var ctx: Ctx = .{ .arena = arena, .req = &request, .res = &res };
             // The timeout bounds the client, not the handler.
             deadline.store(std.math.maxInt(i64), .monotonic);
-            (App{}).handle(&ctx);
+            self.app.handle(&ctx);
             arm(io, deadline, self.options.body_timeout_ms);
 
             var status = res.status;
@@ -343,7 +346,8 @@ fn roundTripParts(opts: Options, parts: []const []const u8, gap_ms: i64, half_cl
     const io = testing.io;
     var o = opts;
     o.port = 0;
-    var srv: Server(TestApp) = try .init(io, testing.allocator, o);
+    var app: TestApp = .{};
+    var srv: Server(TestApp) = try .init(io, testing.allocator, &app, o);
     defer srv.deinit();
     var fut = try io.concurrent(Server(TestApp).run, .{&srv});
     defer fut.cancel(io) catch {};
@@ -481,4 +485,38 @@ test "transient accept errors are retried" {
     try testing.expect(acceptRetryable(error.ConnectionAborted));
     try testing.expect(!acceptRetryable(error.Canceled));
     try testing.expect(!acceptRetryable(error.SocketNotListening));
+}
+
+test "serves an App with modules" {
+    const kapp = @import("../app.zig");
+    const Hello = struct {
+        pub const routes = .{.{ .method = .GET, .path = "/", .handler = "index" }};
+        pub fn index(_: *@This(), _: *Ctx) struct { message: []const u8 } {
+            return .{ .message = "hi" };
+        }
+    };
+    const A = kapp.App(.{ .modules = &.{kapp.Module(.{ .name = "Hello", .path = "/hello", .controllers = &.{Hello} })} });
+    const io = testing.io;
+    var env: std.process.Environ.Map = .init(testing.allocator);
+    defer env.deinit();
+    var app: A = undefined;
+    try app.init(io, testing.allocator, &env);
+    defer app.deinit();
+    var srv: Server(A) = try .init(io, testing.allocator, &app, .{ .port = 0 });
+    defer srv.deinit();
+    var fut = try io.concurrent(Server(A).run, .{&srv});
+    defer fut.cancel(io) catch {};
+
+    const addr = try Io.net.IpAddress.parse("127.0.0.1", srv.port());
+    const stream = try addr.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var wbuf: [256]u8 = undefined;
+    var w = stream.writer(io, &wbuf);
+    try w.interface.writeAll("GET /api/v1/hello HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n");
+    try w.interface.flush();
+    var rbuf: [1024]u8 = undefined;
+    var r = stream.reader(io, &rbuf);
+    const out = try r.interface.allocRemaining(testing.allocator, .limited(64 * 1024));
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.endsWith(u8, out, "{\"message\":\"hi\"}"));
 }
