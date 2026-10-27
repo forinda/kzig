@@ -508,6 +508,10 @@ test "TLS: a client certificate signs in (EC and RSA keys); without one the serv
     var locked: Pool = try .init(testing.io, testing.allocator, .{ .url = try std.fmt.allocPrint(a, "{s}kzig-test", .{enc}), .max_connections = 1 });
     defer locked.deinit();
     try locked.ping();
+    // scrypt (OpenSSL's N=16384, r=8: more memory than the key's scratch).
+    var scrypt: Pool = try .init(testing.io, testing.allocator, .{ .url = try std.fmt.allocPrint(a, "postgres://certuser@localhost:{d}/{s}?sslmode=verify-full&sslrootcert={s}&sslcert={s}/certuser-ec.pem&sslkey={s}/certuser-ec-scrypt.key&sslpassword=kzig-test", .{ cfg.port, cfg.database, ca, dir, dir }), .max_connections = 1 });
+    defer scrypt.deinit();
+    try scrypt.ping();
     var wrong: Pool = try .init(testing.io, testing.allocator, .{ .url = try std.fmt.allocPrint(a, "{s}nope", .{enc}), .max_connections = 1 });
     defer wrong.deinit();
     try testing.expectError(error.TlsConfig, wrong.ping());

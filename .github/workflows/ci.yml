@@ -52,6 +52,7 @@ jobs:
             openssl x509 -req -in certuser-$kind.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 2 -out certuser-$kind.pem
           done
           openssl pkcs8 -topk8 -in certuser-rsa.key -v2 aes-256-cbc -v2prf hmacWithSHA256 -passout pass:kzig-test -out certuser-rsa-enc.key
+          openssl pkcs8 -topk8 -in certuser-ec.key -scrypt -passout pass:kzig-test -out certuser-ec-scrypt.key
           # CRLs from the CA: none revoked, and one revoking the server's certificate.
           mkdir crldb; touch crldb/index.txt; echo 1000 > crldb/crlnumber
           printf '[ ca ]\ndefault_ca = ca\n[ ca ]\ndatabase = %s/crldb/index.txt\ncrlnumber = %s/crldb/crlnumber\ndefault_md = sha256\ndefault_crl_days = 2\ncertificate = %s/ca.pem\nprivate_key = %s/ca.key\n' "$d" "$d" "$d" "$d" > crldb/ca.cnf

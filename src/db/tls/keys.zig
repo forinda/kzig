@@ -37,7 +37,7 @@ pub const PrivateKey = union(enum) {
     pub fn parsePem(a: Allocator, text: []const u8, password: ?[]const u8) !PrivateKey {
         if (try pemBlock(a, text, "ENCRYPTED PRIVATE KEY")) |block| {
             const pw = password orelse return error.PasswordRequired;
-            const der = try pbes2(a, block.der, pw);
+            const der = try pbes2(block.der, pw);
             // Garbage from a wrong password rarely parses; when it does, it's no key.
             return pkcs8(a, der) catch error.BadPassword;
         }
@@ -250,6 +250,8 @@ fn rsaPrivate(io: std.Io, r: Rsa, em: []const u8, out: *[max_signature_len]u8) !
     const s_masked = try n.powWithEncodedExponent(masked, r.d, .big);
     const r_inv = try n.powWithEncodedExponent(blind_r, r.phi_minus_1, .big);
     const sig = n.mul(s_masked, r_inv);
+    // A key whose p and q aren't n's unblinds wrongly: check s^e = em.
+    if (!(try n.powWithEncodedPublicExponent(sig, r.e, .big)).eql(x)) return error.InvalidKey;
     try sig.toBytes(out[0..k], .big);
     return out[0..k];
 }
@@ -473,7 +475,7 @@ const oid_scrypt = [_]u8{ 0x2B, 0x06, 0x01, 0x04, 0x01, 0xDA, 0x47, 0x04, 0x0B }
 /// PKCS#8 `EncryptedPrivateKeyInfo` with PBES2 (RFC 8018): PBKDF2 (an
 /// HMAC-SHA PRF) or scrypt (RFC 7914), then AES-CBC or DES-EDE3-CBC.
 /// Decrypted in place.
-fn pbes2(a: Allocator, der: []u8, password: []const u8) ![]const u8 {
+fn pbes2(der: []u8, password: []const u8) ![]const u8 {
     var top: Der = .{ .buf = der };
     var info: Der = .{ .buf = try top.next(0x30) };
     var alg: Der = .{ .buf = try info.next(0x30) };
@@ -518,13 +520,21 @@ fn pbes2(a: Allocator, der: []u8, password: []const u8) ![]const u8 {
             try std.crypto.pwhash.pbkdf2(key, password, salt, iterations, hmac.sha2.HmacSha512);
         } else return error.UnsupportedKey;
     } else if (std.mem.eql(u8, kdf_oid, &oid_scrypt)) {
-        // RFC 7914 §7.1: salt, N, r, p. Bounded: 128·r·N bytes each connect
-        // (OpenSSL writes N=16384, r=8: 16 MiB).
+        // RFC 7914 §7.1: salt, N, r, p. Bounded: 128·r·N bytes each connect,
+        // at most 32 MiB (OpenSSL writes N=16384, r=8, p=1: 16 MiB).
         const n = try smallInt(&kdf_params);
         const r = try smallInt(&kdf_params);
         const p = try smallInt(&kdf_params);
-        if (n < 2 or !std.math.isPowerOfTwo(n) or n > 1 << 17 or r == 0 or r > 16 or p == 0 or p > 16) return error.UnsupportedKey;
-        try std.crypto.pwhash.scrypt.kdf(a, key, password, salt, .{ .ln = @intCast(std.math.log2_int(u32, n)), .r = @intCast(r), .p = @intCast(p) });
+        if (n < 2 or !std.math.isPowerOfTwo(n) or r == 0 or r > 32 or p == 0 or p > 4 or @as(u64, 128) * r * n > 32 << 20) return error.UnsupportedKey;
+        // Too big for the caller's scratch: its own pages, zeroed after
+        // (std's scrypt doesn't wipe what it derived from the password).
+        const work = try std.heap.page_allocator.alloc(u8, 128 * r * (n + p + 2) + 64);
+        defer {
+            std.crypto.secureZero(u8, work);
+            std.heap.page_allocator.free(work);
+        }
+        var work_fba: std.heap.FixedBufferAllocator = .init(work);
+        try std.crypto.pwhash.scrypt.kdf(work_fba.allocator(), key, password, salt, .{ .ln = @intCast(std.math.log2_int(u32, n)), .r = @intCast(r), .p = @intCast(p) });
     } else return error.UnsupportedKey;
     return cbcDecrypt(data, cipher, key, iv);
 }
@@ -574,6 +584,7 @@ pub const Der = struct {
     /// An INTEGER's magnitude without leading zero bytes.
     pub fn int(d: *Der) ![]const u8 {
         var v = try d.next(0x02);
+        if (v.len == 0) return error.InvalidKey; // DER has no empty INTEGER
         while (v.len > 1 and v[0] == 0) v = v[1..];
         return v;
     }
@@ -803,4 +814,30 @@ test "RSA signing is blinded and still gives the plain signature" {
     var want: [256]u8 = undefined;
     try plain.toBytes(&want, .big);
     try testing.expectEqualSlices(u8, &want, got);
+}
+
+test "an empty INTEGER in a key is InvalidKey, not a crash" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    // RSAPrivateKey with p = `02 00`.
+    const der = [_]u8{ 0x30, 0x11, 0x02, 0x01, 0x00, 0x02, 0x01, 0x0F, 0x02, 0x01, 0x03, 0x02, 0x01, 0x05, 0x02, 0x00, 0x02, 0x01, 0x03 };
+    try testing.expectError(error.InvalidKey, pkcs1(arena.allocator(), &der));
+}
+
+test "a scrypt key with OpenSSL's parameters unlocks inside a connection's scratch buffer" {
+    var scratch: [256 * 1024]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&scratch);
+    const key = try PrivateKey.parsePem(fba.allocator(), @embedFile("../testdata/ec256-pbes2-scrypt.pem"), "kzig-test");
+    try testing.expect(key == .ec256);
+}
+
+test "an RSA key whose primes don't fit it signs nothing" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var r = (try PrivateKey.parsePem(arena.allocator(), @embedFile("../testdata/rsa2048-pkcs8.pem"), null)).rsa;
+    r.phi_minus_1 = r.d; // not φ(n) − 1: the unblinding is wrong
+    var em: [256]u8 = @splat(1);
+    em[0] = 0;
+    var out: [max_signature_len]u8 = undefined;
+    try testing.expectError(error.InvalidKey, rsaPrivate(testing.io, r, &em, &out));
 }
