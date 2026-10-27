@@ -53,17 +53,19 @@ Each milestone ends with tests passing (`zig build test`, no leaks under
 
 ### M1 — Core runtime on `std`
 
-- [ ] Engine-neutral `Request` / `Response` views; `Ctx` with `params`, `query`, `header`,
+- [x] Engine-neutral `Request` / `Response` views; `Ctx` with `params`, `query`, `header`,
       `json`, `text`, `status`, `setHeader`, `noContent`, `created`
-- [ ] Return-value handlers: a value is 200 JSON, `void` is 204, a type with `sendResponse`
+- [x] Return-value handlers: a value is 200 JSON, `void` is 204, a type with `sendResponse`
       sends itself
-- [ ] Router: `:params`, trailing `*`, percent-decoded and normalised paths, 404, 405 with `Allow`
-- [ ] Problem bodies (`application/problem+json`): error-set → status mapping, `ctx.fail`,
+- [x] Router: `:params`, trailing `*`, percent-decoded and normalised paths, 404, 405 with `Allow`
+- [x] Problem bodies (`application/problem+json`): error-set → status mapping, `ctx.fail`,
       request id on a 500, details hidden in release builds
-- [ ] `std` runtime: listener, one task per connection on `Io.Group`, connection cap, keep-alive,
+- [x] `std` runtime: listener, one task per connection on `Io.Group` (`concurrent`, since
+      `async` may run a connection inline and stall accepting), connection cap, keep-alive,
       one arena per connection reset per request
-- [ ] Limits: max body, max header bytes, read/idle timeouts
-- [ ] `kzig.testing`: an in-process runtime that drives the full pipeline without a socket
+- [x] Limits: max body (413), max header bytes (431), read/idle timeout (`SO_RCVTIMEO`;
+      blocking `Io` only — an evented `Io` needs a watchdog), connection cap
+- [x] `kzig.testing`: an in-process runtime that drives the full pipeline without a socket
 
 ### M2 — Modules and comptime DI
 
@@ -125,7 +127,6 @@ from comptime metadata (swagger), cron (`cron-jobs-api`), queues, a `kzig` CLI w
 
 Settled in the milestone that first needs them:
 
-- `Io.Group.async` or `.concurrent` per connection, under `Io.Threaded` and `Io.Uring` (M1)
 - Cancelling the accept loop and signal handling under `std.Io` (M5)
 - How a route's context type is spelled in handler signatures (M3)
 - Dispatch by `*anyopaque` thunk or by a comptime `switch`, measured on compile time (M2)
