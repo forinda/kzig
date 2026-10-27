@@ -9,7 +9,7 @@ pub const HelloService = struct {
 
     pub fn greet(self: *HelloService, arena: std.mem.Allocator, name: []const u8) !Greeting {
         return .{
-            .message = try std.fmt.allocPrint(arena, "Hello {s} from kzig!", .{name}),
+            .message = try arena.print("Hello {s} from kzig!", .{name}),
             .timestamp = try isoNow(arena, self.process.io),
         };
     }
@@ -26,7 +26,7 @@ fn isoNow(arena: std.mem.Allocator, io: std.Io) ![]const u8 {
     const day = secs.getEpochDay().calculateYearDay();
     const md = day.calculateMonthDay();
     const t = secs.getDaySeconds();
-    return std.fmt.allocPrint(arena, "{d}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}Z", .{
+    return arena.print("{d}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}Z", .{
         day.year,            md.month.numeric(),     md.day_index + 1,
         t.getHoursIntoDay(), t.getMinutesIntoHour(), t.getSecondsIntoMinute(),
         ms % 1000,

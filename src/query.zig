@@ -110,8 +110,8 @@ pub fn ListQuery(comptime cfg: Config) type {
         }
 
         fn parseFilter(item: []const u8) ?Filter {
-            const a = std.mem.indexOfScalar(u8, item, ':') orelse return null;
-            const b = std.mem.indexOfScalarPos(u8, item, a + 1, ':') orelse return null;
+            const a = std.mem.findScalar(u8, item, ':') orelse return null;
+            const b = std.mem.findScalarPos(u8, item, a + 1, ':') orelse return null;
             const field = item[0..a];
             const value = item[b + 1 ..];
             if (field.len == 0 or value.len == 0) return null;
@@ -124,7 +124,7 @@ pub fn ListQuery(comptime cfg: Config) type {
             if (item.len == 0) return null;
             var field = item;
             var dir: Direction = .asc;
-            if (std.mem.lastIndexOfScalar(u8, item, ':')) |c| {
+            if (std.mem.findScalarLast(u8, item, ':')) |c| {
                 field = item[0..c];
                 dir = if (std.ascii.eqlIgnoreCase(item[c + 1 ..], "asc")) .asc else if (std.ascii.eqlIgnoreCase(item[c + 1 ..], "desc")) .desc else return null;
             } else if (item[0] == '-') {
@@ -166,7 +166,7 @@ fn pageLink(ctx: *Ctx, page: ?u32) ![]const u8 {
         if (pair.len == 0) continue;
         try out.append(ctx.arena, if (first) '?' else '&');
         first = false;
-        const key = pair[0 .. std.mem.indexOfScalar(u8, pair, '=') orelse pair.len];
+        const key = pair[0 .. std.mem.findScalar(u8, pair, '=') orelse pair.len];
         if (page != null and std.mem.eql(u8, key, "page")) {
             try out.print(ctx.arena, "page={d}", .{page.?});
             replaced = true;

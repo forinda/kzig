@@ -17,7 +17,7 @@ pub const FeaturesService = struct {
         const f = self.features;
         return .{
             .app = self.app.name,
-            .signupUrl = if (f.signups) try std.fmt.allocPrint(arena, "{s}/signup", .{std.mem.trimEnd(u8, self.app.public_url, "/")}) else null,
+            .signupUrl = if (f.signups) try arena.print("{s}/signup", .{std.mem.trimEnd(u8, self.app.public_url, "/")}) else null,
             .betaBanner = f.beta_banner,
             .maxUploadBytes = @as(u64, f.max_upload_mb) * 1024 * 1024,
         };

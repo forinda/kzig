@@ -68,7 +68,7 @@ pub const ProjectRepository = struct {
     fn insert(self: *ProjectRepository, workspace_id: []const u8, input: CreateProject) !Project {
         const a = self.strings.allocator();
         const p: Project = .{
-            .id = try std.fmt.allocPrint(a, "p-{d}", .{self.rows.items.len + 1}),
+            .id = try a.print("p-{d}", .{self.rows.items.len + 1}),
             .workspaceId = try a.dupe(u8, workspace_id),
             .title = try a.dupe(u8, input.title),
             .description = if (input.description) |d| try a.dupe(u8, d) else null,

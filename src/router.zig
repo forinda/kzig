@@ -368,5 +368,5 @@ test "invalid UTF-8 in the path is 400" {
 test "non-UTF-8 request id is left out of the 500 body" {
     var a = runTest(TestRouter, .GET, "/crash", &.{.{ .name = "x-request-id", .value = "\xff\"}" }});
     defer a.deinit();
-    try testing.expect(std.mem.indexOf(u8, a.res.body, "requestId") == null);
+    try testing.expect(std.mem.find(u8, a.res.body, "requestId") == null);
 }

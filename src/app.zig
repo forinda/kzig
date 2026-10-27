@@ -536,11 +536,11 @@ fn jsonBody(ctx: *Ctx) !std.json.Value {
 /// never `text/*`: a `text/plain` POST needs no CORS preflight, so parsing it
 /// would let any site send JSON cross-origin (KickJS `isJsonMediaType`).
 fn isJsonMediaType(content_type: []const u8) bool {
-    const media = std.mem.trim(u8, content_type[0 .. std.mem.indexOfScalar(u8, content_type, ';') orelse content_type.len], " \t");
+    const media = std.mem.trim(u8, content_type[0 .. std.mem.findScalar(u8, content_type, ';') orelse content_type.len], " \t");
     if (std.ascii.eqlIgnoreCase(media, "application/json")) return true;
     const sub = if (std.ascii.startsWithIgnoreCase(media, "application/")) media["application/".len..] else return false;
     return sub.len > "+json".len and std.ascii.endsWithIgnoreCase(sub, "+json") and
-        std.mem.indexOfAny(u8, sub, "/ \t") == null;
+        std.mem.findAny(u8, sub, "/ \t") == null;
 }
 
 const QuerySource = struct {
@@ -614,10 +614,10 @@ const HelloController = struct {
     };
 
     pub fn index(self: *HelloController, ctx: *Ctx) !struct { message: []const u8 } {
-        return .{ .message = try std.fmt.allocPrint(ctx.arena, "{s} world", .{self.greeter.word}) };
+        return .{ .message = try ctx.arena.print("{s} world", .{self.greeter.word}) };
     }
     pub fn named(self: *HelloController, ctx: *Ctx) !struct { message: []const u8 } {
-        return .{ .message = try std.fmt.allocPrint(ctx.arena, "{s} {s}", .{ self.greeter.word, ctx.param("name").? }) };
+        return .{ .message = try ctx.arena.print("{s} {s}", .{ self.greeter.word, ctx.param("name").? }) };
     }
 };
 
@@ -733,7 +733,7 @@ fn mark(ctx: *Ctx, m: []const u8) !void {
     const prev = for (ctx.res.headers.items) |h| {
         if (std.mem.eql(u8, h.name, "x-trail")) break h.value;
     } else null;
-    try ctx.setHeader("x-trail", if (prev) |p| try std.fmt.allocPrint(ctx.arena, "{s},{s}", .{ p, m }) else m);
+    try ctx.setHeader("x-trail", if (prev) |p| try ctx.arena.print("{s},{s}", .{ p, m }) else m);
 }
 
 const Mw = struct {
@@ -759,7 +759,7 @@ const CountHits = struct {
     counter: *Counter,
     pub fn handle(self: *CountHits, ctx: *Ctx, next: *kzig_mw.Next) !void {
         const n = self.counter.hits.fetchAdd(1, .monotonic) + 1;
-        try ctx.setHeader("x-hits", try std.fmt.allocPrint(ctx.arena, "{d}", .{n}));
+        try ctx.setHeader("x-hits", try ctx.arena.print("{d}", .{n}));
         next.run();
     }
 };
@@ -827,7 +827,7 @@ const LoadTenant = struct {
 const LoadProject = struct {
     pub const key = "project";
     pub fn resolve(_: *LoadProject, ctx: *Ctx, got: struct { tenant: Tenant }) ![]const u8 {
-        return std.fmt.allocPrint(ctx.arena, "{s}/{s}", .{ got.tenant.id, ctx.param("id").? });
+        return ctx.arena.print("{s}/{s}", .{ got.tenant.id, ctx.param("id").? });
     }
 };
 
@@ -899,7 +899,7 @@ const ContribController = struct {
         return got.label;
     }
     pub fn levels(_: *ContribController, ctx: *Ctx, got: struct { module_v: []const u8, global_v: []const u8 }) ![]const u8 {
-        return std.fmt.allocPrint(ctx.arena, "{s},{s}", .{ got.module_v, got.global_v });
+        return ctx.arena.print("{s},{s}", .{ got.module_v, got.global_v });
     }
     pub fn flag(_: *ContribController, _: *Ctx, got: struct { flag: ?bool }) []const u8 {
         return if (got.flag != null) "on" else "off";
@@ -948,7 +948,7 @@ test "contributor error becomes the response" {
     var a = try contribGet("/api/v1/c/projects/7", &.{.{ .name = "x-tenant", .value = "nope" }});
     defer a.deinit();
     try testing.expectEqual(std.http.Status.not_found, a.status);
-    try testing.expect(std.mem.indexOf(u8, a.body, "Unknown tenant") != null);
+    try testing.expect(std.mem.find(u8, a.body, "Unknown tenant") != null);
 }
 
 test "method contributor shadows controller one" {
@@ -1014,7 +1014,7 @@ const BodyController = struct {
         try ctx.created(.{ .title = got.body.title, .tags = got.body.tags.len });
     }
     pub fn show(_: *BodyController, ctx: *Ctx, got: struct { params: struct { id: u32 }, query: struct { verbose: bool = false } }) ![]const u8 {
-        return std.fmt.allocPrint(ctx.arena, "{d}:{}", .{ got.params.id, got.query.verbose });
+        return ctx.arena.print("{d}:{}", .{ got.params.id, got.query.verbose });
     }
     pub fn owned(_: *BodyController, _: *Ctx, got: struct { owner: []const u8 }) []const u8 {
         return got.owner;
@@ -1056,7 +1056,7 @@ test "custom validation is 422" {
     var a = try bodyReq(.POST, "/api/v1/things", "application/json", "{\"title\":\"\"}");
     defer a.deinit();
     try testing.expectEqual(std.http.Status.unprocessable_entity, a.status);
-    try testing.expect(std.mem.indexOf(u8, a.body, "must not be empty") != null);
+    try testing.expect(std.mem.find(u8, a.body, "must not be empty") != null);
 }
 
 test "malformed JSON is 400" {
@@ -1069,7 +1069,7 @@ test "non-JSON body decodes as {}" {
     var a = try bodyReq(.POST, "/api/v1/things", "text/plain", "title=x");
     defer a.deinit();
     try testing.expectEqual(std.http.Status.unprocessable_entity, a.status);
-    try testing.expect(std.mem.indexOf(u8, a.body, "{\"field\":\"title\",\"message\":\"required\"}") != null);
+    try testing.expect(std.mem.find(u8, a.body, "{\"field\":\"title\",\"message\":\"required\"}") != null);
 }
 
 test "typed query and params" {
@@ -1082,10 +1082,10 @@ test "bad query or params is 422" {
     var a = try bodyReq(.GET, "/api/v1/things/7?verbose=maybe", null, "");
     defer a.deinit();
     try testing.expectEqual(std.http.Status.unprocessable_entity, a.status);
-    try testing.expect(std.mem.indexOf(u8, a.body, "\"detail\":\"Invalid query parameters\"") != null);
+    try testing.expect(std.mem.find(u8, a.body, "\"detail\":\"Invalid query parameters\"") != null);
     var b = try bodyReq(.GET, "/api/v1/things/x", null, "");
     defer b.deinit();
-    try testing.expect(std.mem.indexOf(u8, b.body, "\"detail\":\"Invalid path parameters\"") != null);
+    try testing.expect(std.mem.find(u8, b.body, "\"detail\":\"Invalid path parameters\"") != null);
 }
 
 test "a late contributor reads the body" {
@@ -1111,7 +1111,7 @@ const MailController = struct {
     report: *const ConfigReport,
     pub const routes = .{.{ .method = .GET, .path = "/", .handler = "show" }};
     pub fn show(self: *MailController, ctx: *Ctx) ![]const u8 {
-        return std.fmt.allocPrint(ctx.arena, "{s}@{s}/{s}/{d}", .{ self.mail.password, self.mail.host, self.app.name, self.report.vars.len });
+        return ctx.arena.print("{s}@{s}/{s}/{d}", .{ self.mail.password, self.mail.host, self.app.name, self.report.vars.len });
     }
 };
 

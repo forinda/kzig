@@ -191,8 +191,8 @@ test "a check slower than the timeout is down" {
     var res = try testing_rt.request(testing.allocator, &a, .{ .target = "/health/ready" });
     defer res.deinit();
     try testing.expectEqual(std.http.Status.service_unavailable, res.status);
-    try testing.expect(std.mem.indexOf(u8, res.body, "{\"name\":\"slow\",\"status\":\"down\"}") != null);
-    try testing.expect(std.mem.indexOf(u8, res.body, "{\"name\":\"fast\",\"status\":\"up\"}") != null);
+    try testing.expect(std.mem.find(u8, res.body, "{\"name\":\"slow\",\"status\":\"down\"}") != null);
+    try testing.expect(std.mem.find(u8, res.body, "{\"name\":\"fast\",\"status\":\"up\"}") != null);
     try testing.expect(elapsedMs(testing.io, t0) < 2600);
 }
 

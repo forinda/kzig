@@ -26,7 +26,7 @@ pub const Issues = struct {
         else if (field.len == 0)
             self.prefix
         else
-            try std.fmt.allocPrint(self.arena, "{s}.{s}", .{ self.prefix, field });
+            try self.arena.print("{s}.{s}", .{ self.prefix, field });
         try self.list.append(self.arena, .{ .field = full, .message = message });
     }
 
@@ -47,7 +47,7 @@ fn render(arena: Allocator, path: ?*const Path) ![]const u8 {
     var p = path;
     while (p) |node| : (p = node.parent) try segs.append(arena, switch (node.seg) {
         .field => |f| f,
-        .index => |i| try std.fmt.allocPrint(arena, "{d}", .{i}),
+        .index => |i| try arena.print("{d}", .{i}),
     });
     std.mem.reverse([]const u8, segs.items);
     return std.mem.join(arena, ".", segs.items);
@@ -168,7 +168,7 @@ pub fn strings(comptime T: type, arena: Allocator, src: anytype, issues: *Issues
 /// are `true/false/1/0` in any case.
 pub fn scalar(comptime F: type, raw: []const u8) ?F {
     return switch (@typeInfo(F)) {
-        .int => if (raw.len == 0 or std.mem.indexOfScalar(u8, raw, '_') != null) null else std.fmt.parseInt(F, raw, 10) catch null,
+        .int => if (raw.len == 0 or std.mem.findScalar(u8, raw, '_') != null) null else std.fmt.parseInt(F, raw, 10) catch null,
         .float => blk: {
             const f = std.fmt.parseFloat(F, raw) catch break :blk null;
             break :blk if (std.math.isFinite(f)) f else null;

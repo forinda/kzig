@@ -197,7 +197,7 @@ pub fn Server(comptime App: type) type {
                 req.server.reader.state = .ready;
             }
 
-            const q = std.mem.indexOfScalar(u8, target, '?');
+            const q = std.mem.findScalar(u8, target, '?');
             const request: context.Request = .{
                 .method = method,
                 .path = if (q) |i| target[0..i] else target,
@@ -227,7 +227,7 @@ pub fn Server(comptime App: type) type {
             var n: usize = 0;
             for (res.headers.items) |h| {
                 // std asserts on these; drop the header rather than crash.
-                if (h.name.len == 0 or std.mem.indexOfAny(u8, h.name, ":\r\n") != null or std.mem.indexOfAny(u8, h.value, "\r\n") != null) continue;
+                if (h.name.len == 0 or std.mem.findAny(u8, h.name, ":\r\n") != null or std.mem.findAny(u8, h.value, "\r\n") != null) continue;
                 // std writes the framing itself; a second, different length
                 // would desync the client.
                 if (std.ascii.eqlIgnoreCase(h.name, "content-length") or std.ascii.eqlIgnoreCase(h.name, "transfer-encoding")) continue;
@@ -578,7 +578,7 @@ test "a body on GET is not parsed as the next request" {
     const smuggled = "GET /secret HTTP/1.1\r\nhost: x\r\n\r\n";
     const out = try roundTripOpts(.{}, std.fmt.comptimePrint("GET /hello HTTP/1.1\r\nhost: x\r\ncontent-length: {d}\r\n\r\n", .{smuggled.len}) ++ smuggled, true);
     defer testing.allocator.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, "SECRET") == null);
+    try testing.expect(std.mem.find(u8, out, "SECRET") == null);
     try testing.expectEqual(1, std.mem.count(u8, out, "HTTP/1.1 "));
 }
 
@@ -610,7 +610,7 @@ test "204 is sent without a body" {
     const out = try roundTripOpts(.{}, "GET /empty HTTP/1.1\r\nhost: x\r\n\r\nGET /hello HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n", false);
     defer testing.allocator.free(out);
     try testing.expect(std.mem.startsWith(u8, out, "HTTP/1.1 204 "));
-    try testing.expect(std.mem.indexOf(u8, out, "body") == null);
+    try testing.expect(std.mem.find(u8, out, "body") == null);
     try testing.expectEqual(2, std.mem.count(u8, out, "HTTP/1.1 "));
 }
 
@@ -673,8 +673,8 @@ test "framing headers from a handler are not sent" {
     const out = try roundTrip(.{}, "GET /framed HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n");
     defer testing.allocator.free(out);
     try testing.expectEqual(1, std.mem.count(u8, out, "content-length"));
-    try testing.expect(std.mem.indexOf(u8, out, "content-length: 2\r\n") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "transfer-encoding") == null);
+    try testing.expect(std.mem.find(u8, out, "content-length: 2\r\n") != null);
+    try testing.expect(std.mem.find(u8, out, "transfer-encoding") == null);
 }
 
 const LifecycleApp = struct {
@@ -785,7 +785,7 @@ test "shutdown lets an in-flight request finish" {
     const out = try readAll(s);
     defer testing.allocator.free(out);
     try testing.expect(std.mem.endsWith(u8, out, "\r\n\r\ndone"));
-    try testing.expect(std.mem.indexOf(u8, out, "connection: close") != null);
+    try testing.expect(std.mem.find(u8, out, "connection: close") != null);
     try testing.expect(r.app.drained);
     try r.finish();
 }

@@ -73,7 +73,7 @@ pub const Ctx = struct {
     pub fn query(ctx: *const Ctx, name: []const u8) error{ BadRequest, OutOfMemory }!?[]const u8 {
         var it = std.mem.splitScalar(u8, ctx.req.query, '&');
         while (it.next()) |pair| {
-            const eq = std.mem.indexOfScalar(u8, pair, '=');
+            const eq = std.mem.findScalar(u8, pair, '=');
             const key = try percentDecode(ctx.arena, if (eq) |i| pair[0..i] else pair, true);
             if (!std.mem.eql(u8, key, name)) continue;
             return if (eq) |i| try percentDecode(ctx.arena, pair[i + 1 ..], true) else "";
@@ -86,7 +86,7 @@ pub const Ctx = struct {
         var out: std.ArrayList([]const u8) = .empty;
         var it = std.mem.splitScalar(u8, ctx.req.query, '&');
         while (it.next()) |pair| {
-            const eq = std.mem.indexOfScalar(u8, pair, '=');
+            const eq = std.mem.findScalar(u8, pair, '=');
             const key = try percentDecode(ctx.arena, if (eq) |i| pair[0..i] else pair, true);
             if (!std.mem.eql(u8, key, name)) continue;
             try out.append(ctx.arena, if (eq) |i| try percentDecode(ctx.arena, pair[i + 1 ..], true) else "");
@@ -242,7 +242,7 @@ pub fn percentDecode(arena: Allocator, s: []const u8, plus_as_space: bool) error
 }
 
 fn percentDecodeBytes(arena: Allocator, s: []const u8, plus_as_space: bool) error{ BadRequest, OutOfMemory }![]const u8 {
-    if (std.mem.indexOfAny(u8, s, if (plus_as_space) "%+" else "%") == null) return s;
+    if (std.mem.findAny(u8, s, if (plus_as_space) "%+" else "%") == null) return s;
     const out = try arena.alloc(u8, s.len);
     var i: usize = 0;
     var n: usize = 0;

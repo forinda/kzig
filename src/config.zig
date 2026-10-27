@@ -78,7 +78,7 @@ pub fn parseSection(
             if (readSecret(arena, io, path)) |v| {
                 raw = v;
                 origin = .file;
-            } else try issues.append(arena, .{ .key = key, .reason = try std.fmt.allocPrint(arena, "cannot read {s}", .{path}) });
+            } else try issues.append(arena, .{ .key = key, .reason = try arena.print("cannot read {s}", .{path}) });
         }
         if (raw) |r| {
             if (parseField(F, arena, r)) |v| {
@@ -113,7 +113,7 @@ pub fn parseSection(
         var found: decode.Issues = .init(arena);
         out.validate(&found) catch return error.OutOfMemory;
         for (found.list.items) |f| {
-            const key = if (sectionName(T).len > 0) try std.fmt.allocPrint(arena, "{s}_{s}", .{ sectionName(T), f.field }) else try arena.dupe(u8, f.field);
+            const key = if (sectionName(T).len > 0) try arena.print("{s}_{s}", .{ sectionName(T), f.field }) else try arena.dupe(u8, f.field);
             for (key) |*c| c.* = std.ascii.toUpper(c.*);
             try issues.append(arena, .{ .key = key, .reason = f.message });
         }

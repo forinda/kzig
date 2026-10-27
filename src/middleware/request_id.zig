@@ -29,7 +29,7 @@ fn uuid(ctx: *Ctx) ![]const u8 {
     b[6] = (b[6] & 0x0f) | 0x40;
     b[8] = (b[8] & 0x3f) | 0x80;
     const hex = std.fmt.bytesToHex(b, .lower);
-    return std.fmt.allocPrint(ctx.arena, "{s}-{s}-{s}-{s}-{s}", .{ hex[0..8], hex[8..12], hex[12..16], hex[16..20], hex[20..32] });
+    return ctx.arena.print("{s}-{s}-{s}-{s}-{s}", .{ hex[0..8], hex[8..12], hex[12..16], hex[16..20], hex[20..32] });
 }
 
 const testing = std.testing;
@@ -55,7 +55,7 @@ test "requestId generates a UUID" {
     const id = a.header("x-request-id").?;
     try testing.expectEqual(36, id.len);
     try testing.expectEqual('4', id[14]);
-    try testing.expect(std.mem.indexOfScalar(u8, "89ab", id[19]) != null);
+    try testing.expect(std.mem.findScalar(u8, "89ab", id[19]) != null);
 }
 
 test "requestId reaches the 500 body" {

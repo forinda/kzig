@@ -40,7 +40,7 @@ pub const TestResponse = struct {
 pub fn request(gpa: std.mem.Allocator, app: anytype, opts: RequestOptions) !TestResponse {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena.deinit();
-    const q = std.mem.indexOfScalar(u8, opts.target, '?');
+    const q = std.mem.findScalar(u8, opts.target, '?');
     const req: context.Request = .{
         .method = opts.method,
         .path = if (q) |i| opts.target[0..i] else opts.target,

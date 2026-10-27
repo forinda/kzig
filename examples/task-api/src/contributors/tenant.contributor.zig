@@ -33,5 +33,5 @@ pub const LoadTenant = struct {
 };
 
 fn subdomain(host: []const u8) []const u8 {
-    return host[0 .. std.mem.indexOfScalar(u8, host, '.') orelse host.len];
+    return host[0 .. std.mem.findScalar(u8, host, '.') orelse host.len];
 }

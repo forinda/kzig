@@ -22,7 +22,7 @@ test "lists every section with its origins" {
     try testing.expectEqualStrings("dev_default", originOf(vars, "APP_PUBLIC_URL"));
     try testing.expectEqualStrings("default", originOf(vars, "PORT"));
     // Names and origins only: no value is in the report.
-    try testing.expect(std.mem.indexOf(u8, res.body, "localhost:3000") == null);
+    try testing.expect(std.mem.find(u8, res.body, "localhost:3000") == null);
 }
 
 test "is not served in production" {
@@ -32,8 +32,8 @@ test "is not served in production" {
     try env.put("NODE_ENV", "production");
     try env.put("APP_PUBLIC_URL", "https://api.example.com");
     for ([_][]const u8{ "TRANSACTIONAL_MAIL", "MARKETING_MAIL" }) |m| {
-        try env.put(try std.fmt.bufPrint(&key_buf, "{s}_PASSWORD", .{m}), "a-long-password");
-        try env.put(try std.fmt.bufPrint(&key_buf, "{s}_FROM", .{m}), "noreply@example.com");
+        try env.put(try std.mem.print(&key_buf, "{s}_PASSWORD", .{m}), "a-long-password");
+        try env.put(try std.mem.print(&key_buf, "{s}_FROM", .{m}), "noreply@example.com");
     }
     const App = @import("../../main.zig").App;
     const app = try testing.allocator.create(App);
@@ -52,8 +52,8 @@ test "is not served when NODE_ENV is unset" {
     defer env.deinit();
     try env.put("APP_PUBLIC_URL", "https://api.example.com");
     for ([_][]const u8{ "TRANSACTIONAL_MAIL", "MARKETING_MAIL" }) |m| {
-        try env.put(try std.fmt.bufPrint(&key_buf, "{s}_PASSWORD", .{m}), "a-long-password");
-        try env.put(try std.fmt.bufPrint(&key_buf, "{s}_FROM", .{m}), "noreply@example.com");
+        try env.put(try std.mem.print(&key_buf, "{s}_PASSWORD", .{m}), "a-long-password");
+        try env.put(try std.mem.print(&key_buf, "{s}_FROM", .{m}), "noreply@example.com");
     }
     const App = @import("../../main.zig").App;
     const app = try testing.allocator.create(App);

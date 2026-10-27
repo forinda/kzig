@@ -77,6 +77,9 @@ The API moved a lot; these bite first:
   `request.respond(body, .{ .status, .extra_headers })`.
 - Concurrency: `Io.Group` with `.async` / `.concurrent` / `.await` / `.cancel`.
 - Slices joined with `++` must be comptime-known, so route prefixes are comptime.
+- `std.mem.indexOf*` are deprecated aliases: use `find`, `findScalar`, `findAny`, `findScalarLast`,
+  `findScalarPos`. `std.fmt.allocPrint` / `bufPrint` → `allocator.print(…)` / `std.mem.print(buf, …)`.
+- `**` (array repetition) is gone; `@splat` a fixed array instead.
 
 Verify std API against the installed source (`zig env` → `lib_dir`) rather than memory.
 

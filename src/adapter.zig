@@ -71,7 +71,7 @@ const Trail = struct {
     fn add(self: *Trail, comptime fmt: []const u8, args: anytype) void {
         if (self.len > 0) self.append(", ");
         var tmp: [128]u8 = undefined;
-        self.append(std.fmt.bufPrint(&tmp, fmt, args) catch unreachable);
+        self.append(std.mem.print(&tmp, fmt, args) catch unreachable);
     }
     fn append(self: *Trail, s: []const u8) void {
         @memcpy(self.buf[self.len..][0..s.len], s);
@@ -174,7 +174,7 @@ fn mark(ctx: *Ctx, m: []const u8) !void {
     const prev = for (ctx.res.headers.items) |h| {
         if (std.mem.eql(u8, h.name, "x-trail")) break h.value;
     } else null;
-    try ctx.setHeader("x-trail", if (prev) |p| try std.fmt.allocPrint(ctx.arena, "{s},{s}", .{ p, m }) else m);
+    try ctx.setHeader("x-trail", if (prev) |p| try ctx.arena.print("{s},{s}", .{ p, m }) else m);
 }
 
 fn Marker(comptime m: []const u8) fn (*Ctx, *Next) anyerror!void {

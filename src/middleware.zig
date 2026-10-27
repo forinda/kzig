@@ -54,7 +54,7 @@ test {
 
 fn trail(ctx: *Ctx, mark: []const u8) !void {
     for (ctx.res.headers.items) |*h| if (std.mem.eql(u8, h.name, "x-trail")) {
-        h.value = try std.fmt.allocPrint(ctx.arena, "{s},{s}", .{ h.value, mark });
+        h.value = try ctx.arena.print("{s},{s}", .{ h.value, mark });
         return;
     };
     try ctx.res.headers.append(ctx.arena, .{ .name = "x-trail", .value = mark });
@@ -64,7 +64,7 @@ const M = struct {
     fn global(ctx: *Ctx, next: *Next) !void {
         try trail(ctx, "g");
         next.run();
-        try ctx.setHeader("x-seen-status", try std.fmt.allocPrint(ctx.arena, "{d}", .{@backingInt(ctx.res.status)}));
+        try ctx.setHeader("x-seen-status", try ctx.arena.print("{d}", .{@backingInt(ctx.res.status)}));
     }
     fn route(ctx: *Ctx, next: *Next) !void {
         try trail(ctx, "r");
@@ -166,7 +166,7 @@ test "error after next.run replaces the response" {
     defer a.deinit();
     try testing.expectEqual(std.http.Status.conflict, a.status);
     try testing.expectEqualStrings("application/problem+json", a.header("content-type").?);
-    try testing.expect(std.mem.indexOf(u8, a.body, "\"status\":409") != null);
+    try testing.expect(std.mem.find(u8, a.body, "\"status\":409") != null);
 }
 
 test "no next and no response is 204" {

@@ -20,7 +20,7 @@ pub fn MailSettings(comptime section: []const u8) type {
 
         pub fn validate(self: *const @This(), issues: *kzig.Issues) !void {
             if (self.password.len < 8) try issues.add("password", "must be at least 8 characters");
-            if (std.mem.indexOfScalar(u8, self.from, '@') == null) try issues.add("from", "must be an email address");
+            if (std.mem.findScalar(u8, self.from, '@') == null) try issues.add("from", "must be an email address");
         }
     };
 }
