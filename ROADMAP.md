@@ -249,9 +249,9 @@ Follow-ups:
 - [x] `kzig dev`: rebuild and restart on change; a failed build keeps the running app
 - [x] `kzig build` (ReleaseSafe) / `kzig start` (execs the app, `NODE_ENV=production`)
 - [x] `kzig g dto|guard|test`; `kzig add swagger|httpz`
-- [ ] Prebuilt `kzig` binaries in releases
+- [x] Prebuilt `kzig` binaries in releases (a `v*` tag; Linux and macOS)
 - [x] Errors to stderr; `kzig --help` / `kzig help` exit 0
-- [x] Generated list endpoint: 400 for filter operators it doesn't support (today they match all)
+- [x] Generated list endpoint: 400 for filter operators it doesn't support
 - [x] Plurals for irregular words (`person`, `data`, `quiz`) and acronyms (`HTTPClient`)
 - [x] Generated tests: a search test with more than one row; 404 documented on `/:id` routes
 

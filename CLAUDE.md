@@ -63,7 +63,7 @@ src/
   runtime/conformance.zig # Socket behaviour every runtime must pass
   runtime/wire.zig     # Response rules every runtime applies
   testing.zig          # In-process runtime and assertions
-  cli/                 # The `kzig` CLI: main.zig, names, templates/*.tpl, registry
+  cli/                 # The `kzig` CLI: main.zig, dev.zig, names, templates/*.tpl, registry
 examples/task-api/     # The one example app; grows each milestone
 benchmarks/            # bench.zig servers + run.sh against KickJS
 tests/compile_errors/  # Fixtures that must fail to compile (listed in build.zig)
