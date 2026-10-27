@@ -20,6 +20,9 @@ pub const Next = middleware.Next;
 pub const contributor = @import("contributor.zig");
 pub const runtime = struct {
     pub const std = @import("runtime/std.zig");
+    pub const Options = @import("runtime/options.zig").Options;
+    /// The socket-level behaviour every runtime shares; for runtime tests.
+    pub const conformance = @import("runtime/conformance.zig");
 };
 
 pub const Ctx = context.Ctx;

@@ -9,24 +9,7 @@ const Io = std.Io;
 const Ctx = context.Ctx;
 const http = std.http;
 
-pub const Options = struct {
-    host: []const u8 = "127.0.0.1",
-    /// 0 picks an ephemeral port; read it back with `Server.port`.
-    port: u16 = 3000,
-    max_connections: u32 = 1024,
-    /// KickJS's default `jsonLimit` is 1mb.
-    max_body_bytes: usize = 1 << 20,
-    /// The whole request head must fit; larger answers 431.
-    max_header_bytes: usize = 16 * 1024,
-    /// Time from waiting for a request (keep-alive idle included) until its
-    /// head is complete; bounds slowloris clients. 0 disables.
-    head_timeout_ms: u32 = 60_000,
-    /// Time to receive the body, and again to write the response. 0 disables.
-    body_timeout_ms: u32 = 300_000,
-    /// After `shutdown`, how long in-flight requests may take before their
-    /// sockets are shut down.
-    shutdown_timeout_ms: u32 = 30_000,
-};
+pub const Options = @import("options.zig").Options;
 
 pub fn Server(comptime App: type) type {
     return struct {
@@ -516,33 +499,8 @@ fn roundTripParts(opts: Options, parts: []const []const u8, gap_ms: i64, half_cl
     return r.interface.allocRemaining(testing.allocator, .limited(64 * 1024));
 }
 
-test "serves a route" {
-    const out = try roundTrip(.{}, "GET /hello HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n");
-    defer testing.allocator.free(out);
-    try testing.expect(std.mem.startsWith(u8, out, "HTTP/1.1 200 OK\r\n"));
-    try testing.expect(std.mem.endsWith(u8, out, "\r\n\r\nhi"));
-}
-
-test "keep-alive serves two requests on one connection" {
-    const out = try roundTrip(.{},
-        \\GET /hello HTTP/1.1
-    ++ "\r\nhost: x\r\n\r\n" ++
-        \\GET /hello HTTP/1.1
-    ++ "\r\nhost: x\r\nconnection: close\r\n\r\n");
-    defer testing.allocator.free(out);
-    try testing.expectEqual(2, std.mem.count(u8, out, "HTTP/1.1 200 OK"));
-}
-
-test "request body reaches the handler" {
-    const out = try roundTrip(.{}, "POST /echo HTTP/1.1\r\nhost: x\r\ncontent-length: 5\r\nconnection: close\r\n\r\nhello");
-    defer testing.allocator.free(out);
-    try testing.expect(std.mem.endsWith(u8, out, "\r\n\r\nhello"));
-}
-
-test "content-length over limit is 413" {
-    const out = try roundTrip(.{ .max_body_bytes = 16 }, "POST /echo HTTP/1.1\r\nhost: x\r\ncontent-length: 100\r\n\r\n" ++ comptime fill(100, 'a'));
-    defer testing.allocator.free(out);
-    try testing.expect(std.mem.startsWith(u8, out, "HTTP/1.1 413 "));
+test "std runtime conformance" {
+    try @import("conformance.zig").run(Server);
 }
 
 test "chunked body over limit is 413" {
@@ -552,40 +510,11 @@ test "chunked body over limit is 413" {
     try testing.expect(std.mem.startsWith(u8, out, "HTTP/1.1 413 "));
 }
 
-test "oversized headers are 431" {
-    const out = try roundTrip(.{ .max_header_bytes = 1024 }, "GET /hello HTTP/1.1\r\nx-big: " ++ comptime fill(2000, 'a') ++ "\r\n\r\n");
-    defer testing.allocator.free(out);
-    try testing.expect(std.mem.startsWith(u8, out, "HTTP/1.1 431 "));
-}
-
-test "POST without content-length has an empty body" {
-    // Half-close so a server that wrongly reads to EOF can't hang the test;
-    // it would swallow the GET as the POST's body and answer once.
-    const out = try roundTripOpts(.{}, "POST /echo HTTP/1.1\r\nhost: x\r\n\r\n" ++
-        "GET /hello HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n", true);
-    defer testing.allocator.free(out);
-    try testing.expectEqual(2, std.mem.count(u8, out, "HTTP/1.1 "));
-}
-
 test "idle connection is closed after head_timeout_ms" {
     // A partial head that never completes (slowloris); the server must hang up.
     const out = try roundTrip(.{ .head_timeout_ms = 100 }, "GET /hello HTTP/1.1\r\nhost: x\r\n");
     defer testing.allocator.free(out);
     try testing.expectEqualStrings("", out);
-}
-
-test "a body on GET is not parsed as the next request" {
-    const smuggled = "GET /secret HTTP/1.1\r\nhost: x\r\n\r\n";
-    const out = try roundTripOpts(.{}, std.fmt.comptimePrint("GET /hello HTTP/1.1\r\nhost: x\r\ncontent-length: {d}\r\n\r\n", .{smuggled.len}) ++ smuggled, true);
-    defer testing.allocator.free(out);
-    try testing.expect(std.mem.find(u8, out, "SECRET") == null);
-    try testing.expectEqual(1, std.mem.count(u8, out, "HTTP/1.1 "));
-}
-
-test "DELETE body reaches the handler" {
-    const out = try roundTrip(.{}, "DELETE /echo HTTP/1.1\r\nhost: x\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok");
-    defer testing.allocator.free(out);
-    try testing.expect(std.mem.endsWith(u8, out, "\r\n\r\nok"));
 }
 
 test "a slow body within body_timeout_ms is served" {
@@ -596,22 +525,6 @@ test "a slow body within body_timeout_ms is served" {
     }, 300, false);
     defer testing.allocator.free(out);
     try testing.expect(std.mem.endsWith(u8, out, "\r\n\r\nok"));
-}
-
-test "content-length with transfer-encoding is 400 and closes" {
-    const out = try roundTripOpts(.{}, "POST /echo HTTP/1.1\r\nhost: x\r\ncontent-length: 4\r\ntransfer-encoding: chunked\r\n\r\n0\r\n\r\n" ++
-        "GET /hello HTTP/1.1\r\nhost: x\r\n\r\n", true);
-    defer testing.allocator.free(out);
-    try testing.expect(std.mem.startsWith(u8, out, "HTTP/1.1 400 "));
-    try testing.expectEqual(1, std.mem.count(u8, out, "HTTP/1.1 "));
-}
-
-test "204 is sent without a body" {
-    const out = try roundTripOpts(.{}, "GET /empty HTTP/1.1\r\nhost: x\r\n\r\nGET /hello HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n", false);
-    defer testing.allocator.free(out);
-    try testing.expect(std.mem.startsWith(u8, out, "HTTP/1.1 204 "));
-    try testing.expect(std.mem.find(u8, out, "body") == null);
-    try testing.expectEqual(2, std.mem.count(u8, out, "HTTP/1.1 "));
 }
 
 test "a 1xx status from a handler becomes 500" {
@@ -667,14 +580,6 @@ test "serves an App with modules" {
     const out = try r.interface.allocRemaining(testing.allocator, .limited(64 * 1024));
     defer testing.allocator.free(out);
     try testing.expect(std.mem.endsWith(u8, out, "{\"message\":\"hi\"}"));
-}
-
-test "framing headers from a handler are not sent" {
-    const out = try roundTrip(.{}, "GET /framed HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n");
-    defer testing.allocator.free(out);
-    try testing.expectEqual(1, std.mem.count(u8, out, "content-length"));
-    try testing.expect(std.mem.find(u8, out, "content-length: 2\r\n") != null);
-    try testing.expect(std.mem.find(u8, out, "transfer-encoding") == null);
 }
 
 const LifecycleApp = struct {
@@ -760,36 +665,6 @@ fn elapsedMs(since: Io.Timestamp) i64 {
     return @intCast(@divTrunc(since.durationTo(Io.Clock.awake.now(testing.io)).toNanoseconds(), std.time.ns_per_ms));
 }
 
-test "started is called with the port" {
-    var r: Running = .{};
-    try r.start(.{});
-    // run calls started before accepting; a request proves it got there.
-    const s = try r.connect();
-    try send(s, "GET /hello HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n");
-    const out = try readAll(s);
-    testing.allocator.free(out);
-    s.close(testing.io);
-    try testing.expectEqual(r.srv.port(), r.app.port);
-    r.srv.shutdown();
-    try r.finish();
-}
-
-test "shutdown lets an in-flight request finish" {
-    var r: Running = .{};
-    try r.start(.{});
-    const s = try r.connect();
-    defer s.close(testing.io);
-    try send(s, "GET /slow HTTP/1.1\r\nhost: x\r\n\r\n");
-    try testing.io.sleep(.fromMilliseconds(50), .awake);
-    r.srv.shutdown();
-    const out = try readAll(s);
-    defer testing.allocator.free(out);
-    try testing.expect(std.mem.endsWith(u8, out, "\r\n\r\ndone"));
-    try testing.expect(std.mem.find(u8, out, "connection: close") != null);
-    try testing.expect(r.app.drained);
-    try r.finish();
-}
-
 test "idle keep-alive connections close on shutdown" {
     var r: Running = .{};
     try r.start(.{});
@@ -818,16 +693,6 @@ test "a stuck request is cut at shutdown_timeout_ms" {
     r.srv.shutdown();
     try r.finish();
     try testing.expect(elapsedMs(t0) < 1500);
-}
-
-test "new connections are refused after shutdown" {
-    var r: Running = .{};
-    try r.start(.{});
-    const port = r.srv.port();
-    r.srv.shutdown();
-    try r.finish();
-    const addr = try Io.net.IpAddress.parse("127.0.0.1", port);
-    try testing.expectError(error.ConnectionRefused, addr.connect(testing.io, .{ .mode = .stream }));
 }
 
 test "serve shuts down on SIGTERM" {
