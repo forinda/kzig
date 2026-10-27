@@ -14,6 +14,8 @@ pub const Error = error{
     PayloadTooLarge,
     UnprocessableEntity,
     TooManyRequests,
+    /// A dependency is down (a bucket, a database): 503.
+    ServiceUnavailable,
     HttpProblem,
 };
 
@@ -37,6 +39,7 @@ pub fn statusOf(err: anyerror) ?std.http.Status {
         error.PayloadTooLarge => .payload_too_large,
         error.UnprocessableEntity => .unprocessable_entity,
         error.TooManyRequests => .too_many_requests,
+        error.ServiceUnavailable => .service_unavailable,
         else => null,
     };
 }
@@ -44,6 +47,7 @@ pub fn statusOf(err: anyerror) ?std.http.Status {
 test "statusOf maps framework errors" {
     try std.testing.expectEqual(std.http.Status.not_found, statusOf(error.NotFound).?);
     try std.testing.expectEqual(std.http.Status.unprocessable_entity, statusOf(error.UnprocessableEntity).?);
+    try std.testing.expectEqual(std.http.Status.service_unavailable, statusOf(error.ServiceUnavailable).?);
     try std.testing.expectEqual(null, statusOf(error.Foo));
     try std.testing.expectEqual(null, statusOf(error.HttpProblem));
 }

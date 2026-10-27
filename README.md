@@ -250,7 +250,10 @@ const link = try files.url(arena, "files/a.png", .{ .expires_in = 300 }); // pre
 ```
 
 `get` and `stat` answer null for a missing file, `delete` of one is fine, and `list` pages with a
-cursor. Requests are signed with SigV4 by kzig itself (no SDK). task-api's `files` module picks
+cursor. Requests are signed with SigV4 by kzig itself (no SDK). A bucket that can't be reached,
+answers 5xx or takes longer than `timeout_ms` (30 s) is `error.ServiceUnavailable`, a 503; an
+object over `max_object_bytes` (256 MiB) isn't read. The disk driver refuses keys that pass
+through a symbolic link. task-api's `files` module picks
 the driver from `STORAGE_DRIVER`.
 
 ## WebSockets

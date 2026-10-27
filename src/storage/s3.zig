@@ -271,6 +271,10 @@ pub const Options = struct {
     endpoint: ?[]const u8 = null,
     credentials: Credentials,
     force_path_style: ?bool = null,
+    /// A request whose answer hasn't arrived by then fails as unavailable.
+    timeout_ms: u32 = 30_000,
+    /// A larger object isn't read into memory.
+    max_object_bytes: usize = 256 * 1024 * 1024,
 };
 
 /// A bucket as a `Storage` (KickJS `s3Storage`).
@@ -286,6 +290,8 @@ pub const S3 = struct {
     /// `/bucket` (path style) or empty (the bucket is in `host`).
     base_path: []const u8,
     bucket: []const u8,
+    timeout_ms: u32,
+    max_object_bytes: usize,
     /// Owns the strings above.
     arena: std.heap.ArenaAllocator,
 
@@ -296,8 +302,14 @@ pub const S3 = struct {
         const endpoint = o.endpoint orelse try std.fmt.allocPrint(a, "https://s3.{s}.amazonaws.com", .{o.region});
         const uri = std.Uri.parse(endpoint) catch return error.InvalidEndpoint;
         var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
-        const host = (std.Io.net.HostName.fromUri(uri, &host_buf) catch return error.InvalidEndpoint).bytes;
-        const authority = if (uri.port) |p| try std.fmt.allocPrint(a, "{s}:{d}", .{ host, p }) else try a.dupe(u8, host);
+        const host = (std.Io.net.HostName.fromUri(uri, &host_buf) catch {
+            // std.http.Client takes host names only, not `[::1]`.
+            if (!builtin.is_test) std.log.err("S3 endpoint {s}: needs a host name (an IPv6 address can be named in /etc/hosts)", .{endpoint});
+            return error.InvalidEndpoint;
+        }).bytes;
+        // A default port isn't sent in Host by browsers following a presigned link.
+        const default_port: u16 = if (std.mem.eql(u8, uri.scheme, "https")) 443 else 80;
+        const authority = if (uri.port) |p| (if (p == default_port) try a.dupe(u8, host) else try std.fmt.allocPrint(a, "{s}:{d}", .{ host, p })) else try a.dupe(u8, host);
         const path_style = o.force_path_style orelse (o.endpoint != null);
         const prefix = std.mem.trimEnd(u8, uri.path.percent_encoded, "/");
         return .{
@@ -314,6 +326,8 @@ pub const S3 = struct {
             .host = if (path_style) authority else try std.mem.concat(a, u8, &.{ o.bucket, ".", authority }),
             .base_path = if (path_style) try std.mem.concat(a, u8, &.{ prefix, "/", try uriEncode(a, o.bucket, true) }) else try a.dupe(u8, prefix),
             .bucket = try a.dupe(u8, o.bucket),
+            .timeout_ms = o.timeout_ms,
+            .max_object_bytes = o.max_object_bytes,
             .arena = arena,
         };
     }
@@ -364,10 +378,23 @@ pub const S3 = struct {
         return if (key) |k| std.mem.concat(a, u8, &.{ s.base_path, "/", try uriEncode(a, k, false) }) else std.mem.concat(a, u8, &.{ s.base_path, "/" });
     }
 
-    // ponytail: no timeout; a stalled bucket holds the request. A deadline
-    // around the client's read (as the runtimes' watchdog) if that bites.
-    /// A signed request; the reply's strings live in `a`.
-    fn send(s: *S3, a: Allocator, method: std.http.Method, key: ?[]const u8, query: []const [2][]const u8, body: ?[]const u8, content_type: ?[]const u8) !Reply {
+    /// A signed request; the reply's strings live in `a`, its body in
+    /// `body_into`. A bucket that can't be reached, doesn't answer within
+    /// `timeout_ms` or breaks the connection is `error.ServiceUnavailable`.
+    fn send(s: *S3, a: Allocator, body_into: Allocator, method: std.http.Method, key: ?[]const u8, query: []const [2][]const u8, body: ?[]const u8, content_type: ?[]const u8) !Reply {
+        return s.sendOnce(a, body_into, method, key, query, body, content_type) catch |err| switch (err) {
+            error.OutOfMemory, error.ObjectTooLarge => err,
+            else => {
+                if (!builtin.is_test) std.log.err("S3 {t} {s}: {t}", .{ method, key orelse "(bucket)", err });
+                return error.ServiceUnavailable;
+            },
+        };
+    }
+
+    // ponytail: the timeout covers the request once connected; connecting
+    // to an address that drops packets waits for the OS (Io.Threaded can't
+    // time out a connect yet).
+    fn sendOnce(s: *S3, a: Allocator, body_into: Allocator, method: std.http.Method, key: ?[]const u8, query: []const [2][]const u8, body: ?[]const u8, content_type: ?[]const u8) !Reply {
         const path = try s.pathOf(a, key);
         const payload_hash = if (body) |b| try a.dupe(u8, &hexSha256(b)) else empty_hash;
         // One clock read: the date header and the signature must agree.
@@ -404,6 +431,10 @@ pub const S3 = struct {
             .extra_headers = headers.items,
         });
         defer req.deinit();
+        // Cut the socket when time is up: whatever was waiting fails.
+        var watchdog = if (s.timeout_ms > 0) s.io.concurrent(cut, .{ s.io, req.connection.?.stream_reader.stream, s.timeout_ms }) catch null else null;
+        defer if (watchdog) |*w| w.cancel(s.io) catch {};
+        errdefer req.connection.?.closing = true;
         if (body) |b| {
             req.transfer_encoding = .{ .content_length = b.len };
             try req.sendBodyComplete(@constCast(b));
@@ -426,16 +457,26 @@ pub const S3 = struct {
         if (reply.status == .no_content or reply.status == .not_modified) {
             req.reader.state = .ready;
         } else if (method != .HEAD) {
+            if ((reply.content_length orelse 0) > s.max_object_bytes) return error.ObjectTooLarge;
             var transfer: [8192]u8 = undefined;
-            reply.body = try response.reader(&transfer).allocRemaining(a, .unlimited);
+            reply.body = response.reader(&transfer).allocRemaining(body_into, .limited(s.max_object_bytes)) catch |err| switch (err) {
+                error.StreamTooLong => return error.ObjectTooLarge,
+                else => |e| return e,
+            };
         }
         return reply;
     }
 
-    /// A non-2xx answer, logged with S3's message.
-    fn failed(method: std.http.Method, key: ?[]const u8, reply: Reply) error{S3RequestFailed} {
+    fn cut(io: Io, stream: Io.net.Stream, ms: u32) Io.Cancelable!void {
+        try io.sleep(.fromMilliseconds(ms), .awake);
+        stream.shutdown(io, .both) catch {};
+    }
+
+    /// A non-2xx answer, logged with S3's message: 5xx is the bucket being
+    /// unavailable (503 to the caller's client), anything else a failure.
+    fn failed(method: std.http.Method, key: ?[]const u8, reply: Reply) error{ S3RequestFailed, ServiceUnavailable } {
         if (!builtin.is_test) std.log.err("S3 {t} {s}: {d} {s}", .{ method, key orelse "(bucket)", @backingInt(reply.status), reply.body[0..@min(reply.body.len, 300)] });
-        return error.S3RequestFailed;
+        return if (@backingInt(reply.status) >= 500) error.ServiceUnavailable else error.S3RequestFailed;
     }
 
     fn ok(status: std.http.Status) bool {
@@ -446,7 +487,7 @@ pub const S3 = struct {
         const s: *S3 = @ptrCast(@alignCast(ptr));
         var arena: std.heap.ArenaAllocator = .init(s.gpa);
         defer arena.deinit();
-        const reply = try s.send(arena.allocator(), .PUT, key, &.{}, data, options.content_type);
+        const reply = try s.send(arena.allocator(), arena.allocator(), .PUT, key, &.{}, data, options.content_type);
         if (!ok(reply.status)) return failed(.PUT, key, reply);
     }
 
@@ -454,17 +495,18 @@ pub const S3 = struct {
         const s: *S3 = @ptrCast(@alignCast(ptr));
         var arena: std.heap.ArenaAllocator = .init(s.gpa);
         defer arena.deinit();
-        const reply = try s.send(arena.allocator(), .GET, key, &.{}, null, null);
+        // The body straight into the caller's allocator: one copy.
+        const reply = try s.send(arena.allocator(), a, .GET, key, &.{}, null, null);
         if (reply.status == .not_found) return null;
         if (!ok(reply.status)) return failed(.GET, key, reply);
-        return try a.dupe(u8, reply.body);
+        return @constCast(reply.body);
     }
 
     fn stat(ptr: *anyopaque, a: Allocator, key: []const u8) anyerror!?store.FileInfo {
         const s: *S3 = @ptrCast(@alignCast(ptr));
         var arena: std.heap.ArenaAllocator = .init(s.gpa);
         defer arena.deinit();
-        const reply = try s.send(arena.allocator(), .HEAD, key, &.{}, null, null);
+        const reply = try s.send(arena.allocator(), arena.allocator(), .HEAD, key, &.{}, null, null);
         if (reply.status == .not_found) return null;
         if (!ok(reply.status)) return failed(.HEAD, key, reply);
         return .{
@@ -479,7 +521,7 @@ pub const S3 = struct {
         const s: *S3 = @ptrCast(@alignCast(ptr));
         var arena: std.heap.ArenaAllocator = .init(s.gpa);
         defer arena.deinit();
-        const reply = try s.send(arena.allocator(), .DELETE, key, &.{}, null, null);
+        const reply = try s.send(arena.allocator(), arena.allocator(), .DELETE, key, &.{}, null, null);
         if (!ok(reply.status) and reply.status != .not_found) return failed(.DELETE, key, reply);
     }
 
@@ -492,7 +534,7 @@ pub const S3 = struct {
         try query.appendSlice(arena.allocator(), &.{ .{ "list-type", "2" }, .{ "max-keys", try std.fmt.allocPrint(arena.allocator(), "{d}", .{options.limit}) } });
         if (options.prefix.len > 0) try query.append(arena.allocator(), .{ "prefix", options.prefix });
         if (options.cursor) |c| try query.append(arena.allocator(), .{ "continuation-token", c });
-        const reply = try s.send(arena.allocator(), .GET, null, query.items, null, null);
+        const reply = try s.send(arena.allocator(), arena.allocator(), .GET, null, query.items, null, null);
         if (!ok(reply.status)) return failed(.GET, null, reply);
         return parseList(a, reply.body);
     }
@@ -582,6 +624,7 @@ test "list XML and HTTP dates" {
 }
 
 const app_mod = @import("../app.zig");
+const fake_token = "test-session-token";
 const Ctx = @import("../context.zig").Ctx;
 const percentDecode = @import("../context.zig").percentDecode;
 
@@ -635,7 +678,10 @@ const FakeS3 = struct {
             if (now > t + expires) return deny(ctx);
             var rest: std.ArrayList([2][]const u8) = .empty;
             for (q) |p| if (!std.mem.startsWith(u8, p[0], "X-Amz-")) try rest.append(ctx.arena, p);
-            const want = try presignQuery(ctx.arena, .{ .method = "GET", .host = host, .path = path, .query = rest.items, .region = "us-east-1", .credentials = example, .time = t }, expires);
+            var creds = example;
+            creds.session_token = param(q, "X-Amz-Security-Token");
+            if (creds.session_token) |tok| if (!std.mem.eql(u8, tok, fake_token)) return deny(ctx);
+            const want = try presignQuery(ctx.arena, .{ .method = "GET", .host = host, .path = path, .query = rest.items, .region = "us-east-1", .credentials = creds, .time = t }, expires);
             t = 0;
             if (!std.mem.endsWith(u8, want, given)) return deny(ctx);
             return;
@@ -650,6 +696,7 @@ const FakeS3 = struct {
         while (names.next()) |n| if (!std.mem.eql(u8, n, "host")) try headers.append(ctx.arena, .{ n, ctx.header(n) orelse return deny(ctx) });
         const payload = ctx.header("x-amz-content-sha256") orelse return deny(ctx);
         if (!std.mem.eql(u8, payload, &hexSha256(ctx.req.body))) return deny(ctx);
+        if (ctx.header("x-amz-security-token")) |tok| if (!std.mem.eql(u8, tok, fake_token)) return deny(ctx);
         const date = ctx.header("x-amz-date") orelse return deny(ctx);
         if (date.len != 16) return deny(ctx);
         const t = civilTime(date[0..4], std.fmt.parseInt(u8, date[4..6], 10) catch 0, date[6..8], date[9..11], date[11..13], date[13..15]) orelse return deny(ctx);
@@ -800,7 +847,9 @@ test "S3 keeps the contract against a real bucket" {
     try testing.expectEqualStrings("text/plain", info.content_type.?);
 }
 
-fn bare204(server: *Io.net.Server) !void {
+/// Reads one request head, writes `reply` (if any), then holds the
+/// connection open for 2 s.
+fn rawServer(server: *Io.net.Server, reply: ?[]const u8) !void {
     const conn = try server.accept(testing.io);
     defer conn.close(testing.io);
     var buf: [4096]u8 = undefined;
@@ -809,12 +858,17 @@ fn bare204(server: *Io.net.Server) !void {
         const line = try r.interface.takeDelimiterInclusive('\n');
         if (std.mem.trimEnd(u8, line, "\r\n").len == 0) break;
     }
-    var wbuf: [128]u8 = undefined;
-    var w = conn.writer(testing.io, &wbuf);
-    try w.interface.writeAll("HTTP/1.1 204 No Content\r\nserver: bare\r\n\r\n");
-    try w.interface.flush();
-    // Keep-alive: the connection stays open.
+    if (reply) |bytes| {
+        var wbuf: [256]u8 = undefined;
+        var w = conn.writer(testing.io, &wbuf);
+        try w.interface.writeAll(bytes);
+        try w.interface.flush();
+    }
     try testing.io.sleep(.fromSeconds(2), .awake);
+}
+
+fn bare204(server: *Io.net.Server) !void {
+    return rawServer(server, "HTTP/1.1 204 No Content\r\nserver: bare\r\n\r\n");
 }
 
 test "a 204 without Content-Length doesn't wait for the connection to close" {
@@ -830,4 +884,94 @@ test "a 204 without Content-Length doesn't wait for the connection to close" {
     const t0 = Io.Clock.awake.now(testing.io);
     try s3.storage().delete("gone");
     try testing.expect(t0.durationTo(Io.Clock.awake.now(testing.io)).toNanoseconds() < std.time.ns_per_s);
+}
+
+fn withRaw(reply: ?[]const u8, options: struct { timeout_ms: u32 = 30_000 }) !struct { err: anyerror, ms: i64 } {
+    const address = try Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try address.listen(testing.io, .{ .reuse_address = true });
+    defer server.deinit(testing.io);
+    var fut = try testing.io.concurrent(rawServer, .{ &server, reply });
+    defer _ = fut.await(testing.io) catch {};
+    var buf: [64]u8 = undefined;
+    const endpoint = try std.fmt.bufPrint(&buf, "http://127.0.0.1:{d}", .{server.socket.address.getPort()});
+    var s3: S3 = try .init(testing.io, testing.allocator, .{ .bucket = "b", .endpoint = endpoint, .credentials = example, .timeout_ms = options.timeout_ms });
+    defer s3.deinit();
+    const t0 = Io.Clock.awake.now(testing.io);
+    s3.storage().delete("k") catch |err| return .{ .err = err, .ms = @intCast(@divTrunc(t0.durationTo(Io.Clock.awake.now(testing.io)).toNanoseconds(), std.time.ns_per_ms)) };
+    return error.DidNotFail;
+}
+
+test "a bucket that doesn't answer in time is unavailable (503), not a hang" {
+    const r = try withRaw(null, .{ .timeout_ms = 300 });
+    try testing.expectEqual(error.ServiceUnavailable, r.err);
+    try testing.expect(r.ms < 1500);
+}
+
+test "a 5xx from the bucket is unavailable (503); a refusal is a failure (500)" {
+    try testing.expectEqual(error.ServiceUnavailable, (try withRaw("HTTP/1.1 503 Slow Down\r\ncontent-length: 0\r\n\r\n", .{})).err);
+    try testing.expectEqual(error.S3RequestFailed, (try withRaw("HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\n\r\n", .{})).err);
+}
+
+test "an unreachable bucket is unavailable (503)" {
+    // A port nothing listens on: bound and closed again.
+    const address = try Io.net.IpAddress.parse("127.0.0.1", 0);
+    var probe = try address.listen(testing.io, .{ .reuse_address = true });
+    const port = probe.socket.address.getPort();
+    probe.deinit(testing.io);
+    var buf: [64]u8 = undefined;
+    var s3: S3 = try .init(testing.io, testing.allocator, .{ .bucket = "b", .endpoint = try std.fmt.bufPrint(&buf, "http://127.0.0.1:{d}", .{port}), .credentials = example });
+    defer s3.deinit();
+    try testing.expectError(error.ServiceUnavailable, s3.storage().delete("k"));
+}
+
+test "default ports aren't part of the host; IPv6 literals are refused clearly" {
+    var a: S3 = try .init(testing.io, testing.allocator, .{ .bucket = "b", .endpoint = "https://s3.example.com:443", .credentials = example });
+    defer a.deinit();
+    try testing.expectEqualStrings("s3.example.com", a.host);
+    var b: S3 = try .init(testing.io, testing.allocator, .{ .bucket = "b", .endpoint = "http://minio:80/", .credentials = example });
+    defer b.deinit();
+    try testing.expectEqualStrings("minio", b.host);
+    var c: S3 = try .init(testing.io, testing.allocator, .{ .bucket = "b", .endpoint = "http://minio:9000", .credentials = example });
+    defer c.deinit();
+    try testing.expectEqualStrings("minio:9000", c.host);
+    try testing.expectError(error.InvalidEndpoint, S3.init(testing.io, testing.allocator, .{ .bucket = "b", .endpoint = "http://[::1]:9000", .credentials = example }));
+}
+
+test "an object over max_object_bytes is refused, not read into memory" {
+    var fake: Fake = undefined;
+    try fake.start();
+    defer fake.stop();
+    var buf: [64]u8 = undefined;
+    var s3: S3 = try .init(testing.io, testing.allocator, .{ .bucket = "b", .endpoint = fake.endpoint(&buf), .credentials = example, .max_object_bytes = 1024 });
+    defer s3.deinit();
+    try s3.storage().put("big", &@as([2048]u8, @splat('x')), .{});
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(error.ObjectTooLarge, s3.storage().get(arena.allocator(), "big"));
+}
+
+test "temporary credentials: the session token is signed, as a header and in links" {
+    var fake: Fake = undefined;
+    try fake.start();
+    defer fake.stop();
+    var buf: [64]u8 = undefined;
+    var creds = example;
+    creds.session_token = fake_token;
+    var s3: S3 = try .init(testing.io, testing.allocator, .{ .bucket = "b", .endpoint = fake.endpoint(&buf), .credentials = creds });
+    defer s3.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try s3.storage().put("t.txt", "tok", .{});
+    try testing.expectEqualStrings("tok", (try s3.storage().get(arena.allocator(), "t.txt")).?);
+    const link = try s3.storage().url(arena.allocator(), "t.txt", .{});
+    try testing.expect(std.mem.find(u8, link, "X-Amz-Security-Token=test-session-token") != null);
+    var body: std.Io.Writer.Allocating = .init(arena.allocator());
+    var client: std.http.Client = .{ .allocator = testing.allocator, .io = testing.io };
+    defer client.deinit();
+    try testing.expectEqual(.ok, (try client.fetch(.{ .location = .{ .url = link }, .response_writer = &body.writer })).status);
+    // Another token is refused.
+    creds.session_token = "stolen";
+    var other: S3 = try .init(testing.io, testing.allocator, .{ .bucket = "b", .endpoint = fake.endpoint(&buf), .credentials = creds });
+    defer other.deinit();
+    try testing.expectError(error.S3RequestFailed, other.storage().put("t.txt", "x", .{}));
 }

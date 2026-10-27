@@ -305,6 +305,11 @@ Follow-ups:
 - [x] task-api `files` on it: `STORAGE_DRIVER` (disk in development, S3 otherwise), presigned
       links on S3, `storage:<driver>` on `/health/ready`
 - [x] HEAD answers carry the Content-Length a GET would send (found by the S3 driver's `stat`)
+- [x] S3 timeouts, a size cap and `error.ServiceUnavailable` (503) for an unreachable or failing
+      bucket; temporary credentials tested; disk paths walked without following links
+
+Not covered: IPv6 literal S3 endpoints (std.http.Client takes host names; name the address in
+`/etc/hosts`), and a timeout on connecting itself (Io.Threaded can't time out a connect yet).
 
 ### Later
 

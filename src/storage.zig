@@ -238,37 +238,64 @@ pub const Disk = struct {
         };
     }
 
-    /// Every part of `key` that exists must be a real folder or file, not a
-    /// symbolic link that could lead outside the root (KickJS's `inside`).
-    // ponytail: checked, then used: a link swapped in between still gets
-    // through, as with KickJS's realpath check.
-    fn noLinks(d: *Disk, root: Io.Dir, key: []const u8) !void {
+    /// `key`'s folder, opened one part at a time without following a
+    /// symbolic link (O_NOFOLLOW), so no link, even one swapped in meanwhile,
+    /// leads outside the root (KickJS's `inside`). Null when a part is
+    /// missing and `create` is off.
+    fn parentOf(d: *Disk, root: Io.Dir, key: []const u8, create: bool) !?Io.Dir {
         // `C:x` is a drive on Windows, `a:b` an alternate stream.
         if (builtin.os.tag == .windows and std.mem.findScalar(u8, key, ':') != null) return error.InvalidKey;
-        var end: usize = 0;
-        while (true) {
-            const next = std.mem.findScalarPos(u8, key, end, '/') orelse key.len;
-            const st = root.statFile(d.io, key[0..next], .{ .follow_symlinks = false }) catch |err| switch (err) {
-                error.FileNotFound, error.NotDir => return,
+        var dir = try root.openDir(d.io, ".", .{});
+        errdefer dir.close(d.io);
+        var parts = std.mem.splitScalar(u8, key, '/');
+        var part = parts.first();
+        while (parts.next()) |rest| : (part = rest) {
+            const next = dir.openDir(d.io, part, .{ .follow_symlinks = false }) catch |err| switch (err) {
+                error.FileNotFound => blk: {
+                    if (!create) {
+                        dir.close(d.io);
+                        return null;
+                    }
+                    dir.createDir(d.io, part, .default_dir) catch |e| switch (e) {
+                        error.PathAlreadyExists => {},
+                        else => return e,
+                    };
+                    break :blk try dir.openDir(d.io, part, .{ .follow_symlinks = false });
+                },
+                // A link (or a file where a folder should be).
+                error.SymLinkLoop, error.NotDir => return error.InvalidKey,
                 else => return err,
             };
-            if (st.kind == .sym_link) return error.InvalidKey;
-            if (next == key.len) return;
-            end = next + 1;
+            dir.close(d.io);
+            dir = next;
         }
+        return dir;
+    }
+
+    /// The last part of `key`, refused if it is a link.
+    fn leaf(d: *Disk, parent: Io.Dir, key: []const u8) ![]const u8 {
+        const name = std.fs.path.basenamePosix(key);
+        const st = parent.statFile(d.io, name, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => return name,
+            else => return err,
+        };
+        if (st.kind == .sym_link) return error.InvalidKey;
+        return name;
     }
 
     fn put(ptr: *anyopaque, key: []const u8, data: []const u8, _: PutOptions) anyerror!void {
         const d: *Disk = @ptrCast(@alignCast(ptr));
         var root = (try d.open(true)).?;
         defer root.close(d.io);
-        try d.noLinks(root, key);
-        if (std.fs.path.dirname(key)) |parent| try root.createDirPath(d.io, parent);
+        var parent = (try d.parentOf(root, key, true)).?;
+        defer parent.close(d.io);
+        const name = try d.leaf(parent, key);
         var buf: [std.fs.max_path_bytes]u8 = undefined;
-        const temp = try std.mem.print(&buf, "{s}.{s}.tmp", .{ key, &@import("multipart.zig").uuid(d.io) });
-        errdefer root.deleteFile(d.io, temp) catch {};
-        try root.writeFile(d.io, .{ .sub_path = temp, .data = data });
-        try root.rename(temp, root, key, d.io);
+        const temp = try std.mem.print(&buf, "{s}.{s}.tmp", .{ name, &@import("multipart.zig").uuid(d.io) });
+        errdefer parent.deleteFile(d.io, temp) catch {};
+        try parent.writeFile(d.io, .{ .sub_path = temp, .data = data });
+        // rename replaces the entry itself; it never follows a link there.
+        try parent.rename(temp, parent, name, d.io);
     }
 
     /// `put`'s `<key>.<uuid>.tmp`.
@@ -282,22 +309,30 @@ pub const Disk = struct {
         const d: *Disk = @ptrCast(@alignCast(ptr));
         var root = try d.open(false) orelse return null;
         defer root.close(d.io);
-        try d.noLinks(root, key);
-        return root.readFileAlloc(d.io, key, a, .unlimited) catch |err| switch (err) {
-            error.FileNotFound, error.NotDir, error.IsDir => null,
-            else => err,
+        var parent = try d.parentOf(root, key, false) orelse return null;
+        defer parent.close(d.io);
+        const file = parent.openFile(d.io, std.fs.path.basenamePosix(key), .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound, error.IsDir => return null,
+            error.SymLinkLoop => return error.InvalidKey,
+            else => return err,
         };
+        defer file.close(d.io);
+        var buf: [8192]u8 = undefined;
+        var r = file.reader(d.io, &buf);
+        return try r.interface.allocRemaining(a, .unlimited);
     }
 
     fn stat(ptr: *anyopaque, a: Allocator, key: []const u8) anyerror!?FileInfo {
         const d: *Disk = @ptrCast(@alignCast(ptr));
         var root = try d.open(false) orelse return null;
         defer root.close(d.io);
-        try d.noLinks(root, key);
-        const st = root.statFile(d.io, key, .{}) catch |err| switch (err) {
-            error.FileNotFound, error.NotDir => return null,
+        var parent = try d.parentOf(root, key, false) orelse return null;
+        defer parent.close(d.io);
+        const st = parent.statFile(d.io, std.fs.path.basenamePosix(key), .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => return null,
             else => return err,
         };
+        if (st.kind == .sym_link) return error.InvalidKey;
         if (st.kind != .file) return null;
         return .{ .key = try a.dupe(u8, key), .size = st.size, .last_modified = @intCast(@divFloor(st.mtime.toNanoseconds(), std.time.ns_per_s)) };
     }
@@ -306,9 +341,10 @@ pub const Disk = struct {
         const d: *Disk = @ptrCast(@alignCast(ptr));
         var root = try d.open(false) orelse return;
         defer root.close(d.io);
-        try d.noLinks(root, key);
-        root.deleteFile(d.io, key) catch |err| switch (err) {
-            error.FileNotFound, error.NotDir => {},
+        var parent = try d.parentOf(root, key, false) orelse return;
+        defer parent.close(d.io);
+        parent.deleteFile(d.io, try d.leaf(parent, key)) catch |err| switch (err) {
+            error.FileNotFound => {},
             else => return err,
         };
     }
@@ -439,6 +475,11 @@ test "disk refuses keys that lead out through a symbolic link" {
     try testing.expectError(error.InvalidKey, s.delete("link/secret"));
     try tmp.dir.access(testing.io, "outside/secret", .{});
     try testing.expectError(error.FileNotFound, tmp.dir.access(testing.io, "outside/new", .{}));
+    // A link as the file itself, too.
+    try tmp.dir.symLink(testing.io, "../outside/secret", "root/alias", .{});
+    try testing.expectError(error.InvalidKey, s.get(arena.allocator(), "alias"));
+    try testing.expectError(error.InvalidKey, s.put("alias", "overwritten", .{}));
+    try testing.expectEqualStrings("s3cr3t", try tmp.dir.readFileAlloc(testing.io, "outside/secret", arena.allocator(), .limited(64)));
 }
 
 test "disk lists a key that ends in .tmp; only its own temporary files are hidden" {
