@@ -94,6 +94,8 @@ fn addBench(b: *std.Build, step: *std.Build.Step, kzig: *std.Build.Module, httpz
 /// Test results are cached by binary, not environment: with an integration
 /// server configured they always run, or a run without one would stand in.
 fn runTests(b: *std.Build, t: *std.Build.Step.Compile) *std.Build.Step {
+    // The configure step is cached too and doesn't see environment reads.
+    b.graph.poisonCache();
     const run = b.addRunArtifact(t);
     for ([_][]const u8{ "DATABASE_URL", "S3_TEST_ENDPOINT" }) |name| {
         if (b.graph.environ_map.get(name) != null) run.has_side_effects = true;
