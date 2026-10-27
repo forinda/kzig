@@ -22,6 +22,7 @@ pub const Column = schema_.Column;
 const query_ = @import("query.zig");
 pub const snapshot = @import("snapshot.zig");
 pub const diff = @import("diff.zig");
+pub const emit_pg = @import("emit_pg.zig");
 pub const Client = query_.Client;
 pub const eq = query_.eq;
 pub const ne = query_.ne;
@@ -252,6 +253,7 @@ test {
     _ = query_;
     _ = snapshot;
     _ = diff;
+    _ = emit_pg;
     _ = pg;
 }
 

@@ -70,3 +70,19 @@ test "schema: its snapshot is task-kickdb-api's, byte for byte (relations carrie
     ours.relations = archived.relations;
     try testing.expectEqualStrings(text[0 .. text.len - 1], try kzig.db.snapshot.toJson(a, ours));
 }
+
+test "schema: generating from nothing writes task-kickdb-api's up.sql and down.sql" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const db = kzig.db;
+    const dir = "examples/task-api/db/migrations/20261015_231323_init/";
+    const changes = try db.diff.diff(a, .{}, db.snapshot.fromSchema(Schema), .{});
+    inline for (.{ "up.sql", "down.sql" }, 0..) |file, i| {
+        const text = try std.Io.Dir.cwd().readFileAlloc(testing.io, dir ++ file, a, .limited(1 << 20));
+        // Past kick/db's banner line, without the trailing newline.
+        const body = text[std.mem.findScalar(u8, text, '\n').? + 1 .. text.len - 1];
+        const sql = try db.emit_pg.emit(a, if (i == 0) changes else try db.diff.invert(a, changes));
+        try testing.expectEqualStrings(body, sql);
+    }
+}
