@@ -421,6 +421,45 @@ test "sessions run in UTC with ISO dates, whatever the server's defaults" {
     try testing.expectEqualStrings("ISO, MDY", r.ds);
 }
 
+/// `PG_TEST_ROOTCERT`: the CA of a TLS-enabled test server whose
+/// certificate names `localhost` (CI makes one; skipped without it).
+fn tlsUrl(a: Allocator, url: []const u8, host: []const u8, mode: []const u8, ca: []const u8) ![]const u8 {
+    const cfg = try pg.Config.parse(a, url);
+    return std.fmt.allocPrint(a, "postgres://{s}:{s}@{s}:{d}/{s}?sslmode={s}&sslrootcert={s}", .{ cfg.user, cfg.password, host, cfg.port, cfg.database, mode, ca });
+}
+
+test "TLS: verify-full against the server's CA and name; a wrong name or CA is refused" {
+    var env: std.process.Environ.Map = undefined;
+    const url = testUrl(&env) catch |err| {
+        if (err == error.SkipZigTest) env.deinit();
+        return err;
+    };
+    defer env.deinit();
+    const ca = env.get("PG_TEST_ROOTCERT") orelse return error.SkipZigTest;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Ssl = struct { ssl: bool };
+    const on = "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()";
+    for ([_][]const u8{ "verify-full", "verify-ca", "require", "prefer" }) |mode| {
+        var db: Pool = try .init(testing.io, testing.allocator, .{ .url = try tlsUrl(a, url, "localhost", mode, ca), .max_connections = 1 });
+        defer db.deinit();
+        const r = (try db.queryOne(a, Ssl, on, .{})).?;
+        try testing.expect(r.ssl);
+    }
+    // The certificate names localhost, not 127.0.0.1.
+    var wrong_host: Pool = try .init(testing.io, testing.allocator, .{ .url = try tlsUrl(a, url, "127.0.0.1", "verify-full", ca), .max_connections = 1 });
+    defer wrong_host.deinit();
+    try testing.expectError(error.TlsHandshakeFailed, wrong_host.ping());
+    var wrong_ca: Pool = try .init(testing.io, testing.allocator, .{ .url = try tlsUrl(a, url, "localhost", "verify-ca", "src/db/testdata/unrelated-ca.pem"), .max_connections = 1 });
+    defer wrong_ca.deinit();
+    try testing.expectError(error.TlsHandshakeFailed, wrong_ca.ping());
+    // disable stays in the clear.
+    var plain: Pool = try .init(testing.io, testing.allocator, .{ .url = try tlsUrl(a, url, "localhost", "disable", ca), .max_connections = 1 });
+    defer plain.deinit();
+    try testing.expect(!(try plain.queryOne(a, Ssl, on, .{})).?.ssl);
+}
+
 test "Timestamp round-trips through timestamptz and timestamp" {
     var env: std.process.Environ.Map = undefined;
     const url = testUrl(&env) catch |err| {
@@ -497,6 +536,13 @@ test "database URLs" {
     try testing.expectEqualStrings("app", c.database);
     try testing.expectEqualStrings("api", c.application_name);
     try testing.expectEqualStrings("ada", (try pg.Config.parse(a, "postgresql://ada@localhost")).database);
-    try testing.expectError(error.TlsNotSupported, pg.Config.parse(a, "postgres://ada@h/app?sslmode=require"));
+    // libpq's sslmode, prefer by default; sslrootcert names the CA file.
+    try testing.expectEqual(pg.SslMode.prefer, c.sslmode);
+    const v = try pg.Config.parse(a, "postgres://ada@h/app?sslmode=verify-full&sslrootcert=/etc/ca.pem");
+    try testing.expectEqual(pg.SslMode.verify_full, v.sslmode);
+    try testing.expectEqualStrings("/etc/ca.pem", v.sslrootcert.?);
+    try testing.expectEqual(pg.SslMode.disable, (try pg.Config.parse(a, "postgres://ada@h/app?sslmode=disable")).sslmode);
+    try testing.expectEqual(pg.SslMode.verify_ca, (try pg.Config.parse(a, "postgres://ada@h/app?sslmode=verify-ca")).sslmode);
+    try testing.expectError(error.InvalidDatabaseUrl, pg.Config.parse(a, "postgres://ada@h/app?sslmode=strict"));
     try testing.expectError(error.InvalidDatabaseUrl, pg.Config.parse(a, "mysql://ada@h/app"));
 }
