@@ -896,7 +896,13 @@ pub fn fromJson(comptime F: type, a: Allocator, v: std.json.Value) !F {
     if (F == std.json.Value) return v;
     switch (@typeInfo(F)) {
         .optional => |o| return if (v == .null) null else try fromJson(o.child, a, v),
-        .bool => return if (v == .bool) v.bool else error.DbDecode,
+        // SQLite's JSON has no booleans: 1/0.
+        .bool => return switch (v) {
+            .bool => |b| b,
+            .integer => |i| if (i == 0 or i == 1) i == 1 else error.DbDecode,
+            .number_string => |n| if (std.mem.eql(u8, n, "1")) true else if (std.mem.eql(u8, n, "0")) false else error.DbDecode,
+            else => error.DbDecode,
+        },
         .int => return switch (v) {
             .integer => |i| std.math.cast(F, i) orelse error.DbDecode,
             .number_string, .string => |s| std.fmt.parseInt(F, s, 10) catch error.DbDecode,

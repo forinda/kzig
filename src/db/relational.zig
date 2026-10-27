@@ -210,7 +210,24 @@ fn renderSelect(comptime S: type, comptime tag: []const u8, comptime depth: usiz
 /// relation's columns (through the junction for a many-through).
 fn renderRelation(comptime S: type, comptime src_tag: []const u8, comptime r: schema.RelationInfo, comptime depth: usize, comptime parent: []const u8, opts: anytype, w: *Writer) !void {
     const child = comptime aliasOf(S, r.target_tag, depth);
-    try w.raw(if (r.kind == .many) "SELECT coalesce(json_agg(agg), '[]') FROM (" else "SELECT to_json(obj) FROM (");
+    if (S.dialect == .sqlite) {
+        // kysely's sqlite helpers, with nested relations wrapped in json() so
+        // they stay JSON instead of becoming strings inside the object.
+        const Opts = @TypeOf(opts);
+        const t = if (r.kind == .many) "\"agg\"" else "\"obj\"";
+        try w.raw(if (r.kind == .many) "SELECT coalesce(json_group_array(json_object(" else "SELECT json_object(");
+        inline for (comptime columnKeys(S, r.target_tag, Opts), 0..) |k, i| {
+            if (i > 0) try w.raw(", ");
+            try w.raw("'" ++ k ++ "', " ++ t ++ ".");
+            try w.ident(k);
+        }
+        if (@hasField(Opts, "with")) inline for (@typeInfo(@FieldType(Opts, "with")).@"struct".field_names) |rk| {
+            try w.raw(", '" ++ rk ++ "', json(" ++ t ++ ".");
+            try w.ident(rk);
+            try w.raw(")");
+        };
+        try w.raw(if (r.kind == .many) ")), '[]') FROM (" else ") FROM (");
+    } else try w.raw(if (r.kind == .many) "SELECT coalesce(json_agg(agg), '[]') FROM (" else "SELECT to_json(obj) FROM (");
     try renderSelect(S, r.target_tag, depth, opts, w);
     if (r.through) |th| {
         // kick/db: EXISTS, so a pair in the junction twice is one row.
@@ -249,7 +266,10 @@ fn renderRelation(comptime S: type, comptime src_tag: []const u8, comptime r: sc
     // A one is one row, whatever limit it's given (kick/db's limit(1)).
     try renderTail(S, r.target_tag, child, opts, w, null, r.kind == .one);
     if (r.kind == .one) try w.raw(" LIMIT 1");
-    try w.raw(if (r.kind == .many) ") AS agg" else ") AS obj");
+    if (S.dialect == .sqlite)
+        try w.raw(if (r.kind == .many) ") AS \"agg\"" else ") AS \"obj\"")
+    else
+        try w.raw(if (r.kind == .many) ") AS agg" else ") AS obj");
 }
 
 fn qcol(w: *Writer, alias: []const u8, name: []const u8) !void {
@@ -306,6 +326,7 @@ const users = schema.table("rq_users", .{
     .secret = .{ .type = .text },
     .role = .{ .type = .{ .@"enum" = Role }, .not_null = true, .default = .{ .value = "member" } },
     .joined = .{ .type = .timestamp, .not_null = true, .default = .now },
+    .active = .{ .type = .boolean, .not_null = true, .default = .{ .value = "true" } },
 }, .{});
 const posts = schema.table("rq_posts", .{
     .id = .{ .type = .serial, .primary_key = true },
@@ -321,7 +342,7 @@ const post_tags = schema.table("rq_post_tags", .{
     .postId = .{ .type = .integer, .not_null = true, .references = .{ .to = "rq_posts.id" } },
     .tagId = .{ .type = .integer, .not_null = true, .references = .{ .to = "rq_tags.id" } },
 }, .{});
-const TestSchema = schema.Schema(.{ .users = users, .posts = posts, .tags = tags, .post_tags = post_tags }, .{ .relations = .{
+const test_relations = .{
     .users = .{ .posts = .{ .many = .posts } },
     .posts = .{
         .author = .{ .one = .users, .fields = .{.authorId}, .references = .{.id} },
@@ -329,7 +350,10 @@ const TestSchema = schema.Schema(.{ .users = users, .posts = posts, .tags = tags
         .replies = .{ .many = .posts },
         .tags = .{ .many = .tags, .through = .post_tags },
     },
-} });
+};
+const test_tables = .{ .users = users, .posts = posts, .tags = tags, .post_tags = post_tags };
+const TestSchema = schema.Schema(test_tables, .{ .relations = test_relations });
+const LiteSchema = schema.Schema(test_tables, .{ .relations = test_relations, .dialect = .sqlite });
 
 fn expectSql(q: anytype, opts: anytype, comptime first: bool, want: []const u8, params: []const []const u8) !void {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
@@ -357,7 +381,7 @@ test "relational SQL: columns, nested many/one/through, correlation, where/order
         .orderBy = .{.{ .id, .desc }},
         .limit = 10,
     }, true,
-        \\SELECT "rq_posts_0"."title", (SELECT to_json(obj) FROM (SELECT "rq_users_1"."id", "rq_users_1"."name", "rq_users_1"."role" FROM "rq_users" AS "rq_users_1" WHERE "rq_users_1"."id" = "rq_posts_0"."authorId" LIMIT 1) AS obj) AS "author", (SELECT coalesce(json_agg(agg), '[]') FROM (SELECT "rq_tags_1"."name" FROM "rq_tags" AS "rq_tags_1" WHERE EXISTS (SELECT 1 FROM "rq_post_tags" AS "rq_tags_1_j" WHERE "rq_tags_1_j"."tagId" = "rq_tags_1"."id" AND "rq_tags_1_j"."postId" = "rq_posts_0"."id") AND "rq_tags_1"."name" <> $1 LIMIT $2) AS agg) AS "tags", (SELECT to_json(obj) FROM (SELECT "rq_posts_1"."title", (SELECT to_json(obj) FROM (SELECT "rq_posts_2"."id" FROM "rq_posts" AS "rq_posts_2" WHERE "rq_posts_2"."id" = "rq_posts_1"."parentId" LIMIT 1) AS obj) AS "parent" FROM "rq_posts" AS "rq_posts_1" WHERE "rq_posts_1"."id" = "rq_posts_0"."parentId" LIMIT 1) AS obj) AS "parent" FROM "rq_posts" AS "rq_posts_0" WHERE "rq_posts_0"."title" = $3 ORDER BY "rq_posts_0"."id" DESC LIMIT $4
+        \\SELECT "rq_posts_0"."title", (SELECT to_json(obj) FROM (SELECT "rq_users_1"."id", "rq_users_1"."name", "rq_users_1"."role", "rq_users_1"."active" FROM "rq_users" AS "rq_users_1" WHERE "rq_users_1"."id" = "rq_posts_0"."authorId" LIMIT 1) AS obj) AS "author", (SELECT coalesce(json_agg(agg), '[]') FROM (SELECT "rq_tags_1"."name" FROM "rq_tags" AS "rq_tags_1" WHERE EXISTS (SELECT 1 FROM "rq_post_tags" AS "rq_tags_1_j" WHERE "rq_tags_1_j"."tagId" = "rq_tags_1"."id" AND "rq_tags_1_j"."postId" = "rq_posts_0"."id") AND "rq_tags_1"."name" <> $1 LIMIT $2) AS agg) AS "tags", (SELECT to_json(obj) FROM (SELECT "rq_posts_1"."title", (SELECT to_json(obj) FROM (SELECT "rq_posts_2"."id" FROM "rq_posts" AS "rq_posts_2" WHERE "rq_posts_2"."id" = "rq_posts_1"."parentId" LIMIT 1) AS obj) AS "parent" FROM "rq_posts" AS "rq_posts_1" WHERE "rq_posts_1"."id" = "rq_posts_0"."parentId" LIMIT 1) AS obj) AS "parent" FROM "rq_posts" AS "rq_posts_0" WHERE "rq_posts_0"."title" = $3 ORDER BY "rq_posts_0"."id" DESC LIMIT $4
     , &.{ "y", "2", "x", "1" });
     // A one reads one row whatever limit it's given.
     try expectSql(test_client.query(.posts), .{ .columns = .{.id}, .with = .{ .author = .{ .columns = .{.id}, .limit = 5 } } }, false,
@@ -384,20 +408,24 @@ test "relational reads on Postgres: nested rows, null one, empty many, timestamp
     try pool.execScript(
         \\DROP TABLE IF EXISTS rq_post_tags, rq_tags, rq_posts, rq_users; DROP TYPE IF EXISTS rq_role;
         \\CREATE TYPE rq_role AS ENUM ('admin', 'member');
-        \\CREATE TABLE rq_users (id serial PRIMARY KEY, name text NOT NULL, secret text, role rq_role NOT NULL DEFAULT 'member', joined timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP);
+        \\CREATE TABLE rq_users (id serial PRIMARY KEY, name text NOT NULL, secret text, role rq_role NOT NULL DEFAULT 'member', joined timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP, active boolean NOT NULL DEFAULT true);
         \\CREATE TABLE rq_posts (id serial PRIMARY KEY, "authorId" integer NOT NULL REFERENCES rq_users(id), "parentId" integer REFERENCES rq_posts(id), title text NOT NULL);
         \\CREATE TABLE rq_tags (id serial PRIMARY KEY, name text NOT NULL);
         \\CREATE TABLE rq_post_tags ("postId" integer NOT NULL REFERENCES rq_posts(id), "tagId" integer NOT NULL REFERENCES rq_tags(id));
-        \\INSERT INTO rq_users (name, secret, role, joined) VALUES ('Ada', 's1', 'admin', '2026-10-27 12:00:00.5'), ('Linus', NULL, 'member', '2026-10-27 13:00:00');
+        \\INSERT INTO rq_users (name, secret, role, joined, active) VALUES ('Ada', 's1', 'admin', '2026-10-27 12:00:00.5', false), ('Linus', NULL, 'member', '2026-10-27 13:00:00', true);
         \\INSERT INTO rq_posts ("authorId", "parentId", title) VALUES (1, NULL, 'Hello'), (1, 1, 'Re: Hello');
         \\INSERT INTO rq_tags (name) VALUES ('intro'), ('sql');
         \\INSERT INTO rq_post_tags VALUES (1, 1), (1, 2), (1, 2);
     );
     defer pool.execScript("DROP TABLE IF EXISTS rq_post_tags, rq_tags, rq_posts, rq_users; DROP TYPE IF EXISTS rq_role;") catch {};
+    try relationalSuite(TestSchema, &pool);
+}
+
+fn relationalSuite(comptime S: type, pool: *@import("db.zig").Pool) !void {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const db: query.Client(TestSchema) = .init(.{ .pool = &pool });
+    const db: query.Client(S) = .init(.{ .pool = pool });
 
     const people = try db.query(.users).findMany(a, .{ .columns = .{ .secret = false }, .orderBy = .id, .with = .{ .posts = .{ .orderBy = .id, .with = .{ .tags = .{ .orderBy = .id } } } } });
     try testing.expectEqual(2, people.len);
@@ -413,9 +441,37 @@ test "relational reads on Postgres: nested rows, null one, empty many, timestamp
     const reply = (try db.query(.posts).findFirst(a, .{ .where = query.eq(.title, "Re: Hello"), .with = .{ .parent = .{ .with = .{ .author = true } }, .author = .{ .columns = .{.name} } } })).?;
     try testing.expectEqualStrings("Hello", reply.parent.?.title);
     try testing.expectEqualStrings("Ada", reply.parent.?.author.?.name);
+    // Timestamps, enums and booleans inside nested rows read as at the top.
+    try testing.expectEqual((try Timestamp.parse("2026-10-27 12:00:00.5")).us, reply.parent.?.author.?.joined.us);
+    try testing.expectEqual(Role.admin, reply.parent.?.author.?.role);
+    try testing.expect(!reply.parent.?.author.?.active);
     try testing.expectEqual(null, reply.parent.?.parentId);
     const root = (try db.query(.posts).findFirst(a, .{ .where = query.eq(.id, 1), .with = .{ .parent = true, .replies = .{ .columns = .{.title} } } })).?;
     try testing.expectEqual(null, root.parent);
     try testing.expectEqualStrings("Re: Hello", root.replies[0].title);
     try testing.expectEqual(null, try db.query(.posts).findUnique(a, .{ .where = query.eq(.id, 99) }));
+}
+
+test "relational SQL on SQLite: json_group_array / json_object, nested JSON kept as JSON, ?n parameters" {
+    const lite: query.Client(LiteSchema) = .{ .conn = undefined };
+    try expectSql(lite.query(.users), .{ .columns = .{.name}, .with = .{ .posts = .{ .columns = .{.title}, .where = query.ne(.title, "x"), .with = .{ .author = .{ .columns = .{.id} } } } } }, true,
+        \\SELECT "rq_users_0"."name", (SELECT coalesce(json_group_array(json_object('title', "agg"."title", 'author', json("agg"."author"))), '[]') FROM (SELECT "rq_posts_1"."title", (SELECT json_object('id', "obj"."id") FROM (SELECT "rq_users_2"."id" FROM "rq_users" AS "rq_users_2" WHERE "rq_users_2"."id" = "rq_posts_1"."authorId" LIMIT 1) AS "obj") AS "author" FROM "rq_posts" AS "rq_posts_1" WHERE "rq_posts_1"."authorId" = "rq_users_0"."id" AND "rq_posts_1"."title" <> ?1) AS "agg") AS "posts" FROM "rq_users" AS "rq_users_0" LIMIT ?2
+    , &.{ "x", "1" });
+}
+
+test "relational reads on SQLite" {
+    if (!@import("kzig_options").sqlite) return error.SkipZigTest;
+    var pool: @import("db.zig").Pool = try .init(testing.io, testing.allocator, .{ .url = "sqlite::memory:" });
+    defer pool.deinit();
+    try pool.execScript(
+        \\CREATE TABLE rq_users (id integer PRIMARY KEY, name text NOT NULL, secret text, role text NOT NULL DEFAULT 'member', joined text NOT NULL, active integer NOT NULL DEFAULT 1);
+        \\CREATE TABLE rq_posts (id integer PRIMARY KEY, "authorId" integer NOT NULL REFERENCES rq_users(id), "parentId" integer REFERENCES rq_posts(id), title text NOT NULL);
+        \\CREATE TABLE rq_tags (id integer PRIMARY KEY, name text NOT NULL);
+        \\CREATE TABLE rq_post_tags ("postId" integer NOT NULL REFERENCES rq_posts(id), "tagId" integer NOT NULL REFERENCES rq_tags(id));
+        \\INSERT INTO rq_users (name, secret, role, joined, active) VALUES ('Ada', 's1', 'admin', '2026-10-27 12:00:00.500', 0), ('Linus', NULL, 'member', '2026-10-27 13:00:00.000', 1);
+        \\INSERT INTO rq_posts ("authorId", "parentId", title) VALUES (1, NULL, 'Hello'), (1, 1, 'Re: Hello');
+        \\INSERT INTO rq_tags (name) VALUES ('intro'), ('sql');
+        \\INSERT INTO rq_post_tags VALUES (1, 1), (1, 2), (1, 2);
+    );
+    try relationalSuite(LiteSchema, &pool);
 }
