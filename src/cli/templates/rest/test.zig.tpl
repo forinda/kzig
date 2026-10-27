@@ -57,21 +57,20 @@ test "{{plural}}: search, filter and sort over several rows" {
         defer res.deinit();
         try testing.expectEqual(.created, res.status);
     }
-    const ListBody = struct { data: []const {{Pascal}}, meta: struct { total: usize } };
 
     var searched = try t.get("/api/v1/{{plural}}?q=alpha");
     defer searched.deinit();
-    try testing.expectEqual(2, (try searched.json(ListBody)).meta.total);
+    try testing.expectEqual(2, (try searched.json(struct { data: []const {{Pascal}}, meta: struct { total: usize } })).meta.total);
 
     var filtered = try t.get("/api/v1/{{plural}}?filter=name:eq:Beta");
     defer filtered.deinit();
-    const one = try filtered.json(ListBody);
+    const one = try filtered.json(struct { data: []const {{Pascal}}, meta: struct { total: usize } });
     try testing.expectEqual(1, one.meta.total);
     try testing.expectEqualStrings("Beta", one.data[0].name);
 
     var sorted = try t.get("/api/v1/{{plural}}?sort=-name");
     defer sorted.deinit();
-    const rows = (try sorted.json(ListBody)).data;
+    const rows = (try sorted.json(struct { data: []const {{Pascal}}, meta: struct { total: usize } })).data;
     try testing.expectEqual(3, rows.len);
     for (rows, [_][]const u8{ "Beta", "Alphabet", "Alpha" }) |row, name| try testing.expectEqualStrings(name, row.name);
 }
@@ -89,9 +88,25 @@ test "{{plural}}: the /:id routes document 404" {
     defer t.deinit();
     var res = try t.get("/openapi.json");
     defer res.deinit();
+    // Without the Swagger plugin there is no spec to check.
+    if (res.status == .not_found) return error.SkipZigTest;
     const spec = try std.json.parseFromSlice(std.json.Value, testing.allocator, res.body, .{});
     defer spec.deinit();
     const item = spec.value.object.get("paths").?.object.get("/api/v1/{{plural}}/{id}").?.object;
     for ([_][]const u8{ "get", "patch", "delete" }) |method|
         try testing.expect(item.get(method).?.object.get("responses").?.object.contains("404"));
+}
+
+test "{{plural}}: filter=name:in: matches any of the values" {
+    const t = try test_app.boot(&.{});
+    defer t.deinit();
+    for ([_][]const u8{ "One", "Two", "Three" }) |name| {
+        const body = try std.fmt.allocPrint(testing.allocator, "{{\"name\":\"{s}\"}}", .{name});
+        defer testing.allocator.free(body);
+        var res = try t.request(.{ .method = .POST, .target = "/api/v1/{{plural}}", .headers = &.{json}, .body = body });
+        defer res.deinit();
+    }
+    var res = try t.get("/api/v1/{{plural}}?filter=name:in:One,Three");
+    defer res.deinit();
+    try testing.expectEqual(2, (try res.json(struct { meta: struct { total: usize } })).meta.total);
 }

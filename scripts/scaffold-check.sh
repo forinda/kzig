@@ -45,6 +45,7 @@ step "module names that shadow template names: query, page, error"
 "$KZIG" g module query
 "$KZIG" g module page
 "$KZIG" g module error
+"$KZIG" g module list-body
 zig build test
 
 step "kzig dev rebuilds and restarts on change"
@@ -92,6 +93,9 @@ step "kzig add swagger and httpz"
 "$KZIG" add swagger | grep -q "already"
 edit '/\/\/ \/openapi.json/,/})},/d' src/main.zig
 if grep -q swagger src/main.zig; then echo "swagger block not removed" >&2; exit 1; fi
+"$KZIG" g module memo
+zig build test
+"$KZIG" rm module memo --force
 "$KZIG" add swagger
 grep -q "kzig.swagger.Plugin" src/main.zig
 fails "$KZIG" add nonsense
@@ -124,6 +128,7 @@ step "kzig g controller/service/middleware/contributor/adapter/dto/guard/test"
 "$KZIG" g guard auth
 "$KZIG" g test smoke
 "$KZIG" g test audit --module tasks
+fails "$KZIG" g test task --module tasks --force
 grep -q 'smoke.test.zig' src/main.zig && grep -q 'modules/tasks/audit.test.zig' src/main.zig
 
 step "--module must name an existing module folder inside the project"
@@ -166,6 +171,12 @@ test "auth guard" {
     var allowed = try kzig.testing.request(std.testing.allocator, &app, .{ .target = "/api/v1/guarded", .headers = &.{.{ .name = "authorization", .value = "Bearer t" }} });
     defer allowed.deinit();
     try std.testing.expectEqualStrings("in", allowed.body);
+    var lower = try kzig.testing.request(std.testing.allocator, &app, .{ .target = "/api/v1/guarded", .headers = &.{.{ .name = "authorization", .value = "bearer t" }} });
+    defer lower.deinit();
+    try std.testing.expectEqualStrings("in", lower.body);
+    var blank = try kzig.testing.request(std.testing.allocator, &app, .{ .target = "/api/v1/guarded", .headers = &.{.{ .name = "authorization", .value = "Bearer   " }} });
+    defer blank.deinit();
+    try std.testing.expectEqual(.unauthorized, blank.status);
 }
 ZIG
 edit 's|^    // kzig:tests|    _ = @import("stubs.test.zig");\

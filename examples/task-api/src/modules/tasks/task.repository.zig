@@ -124,6 +124,11 @@ fn matches(row: Task, query: constants.Query) bool {
         const ok = switch (f.operator) {
             .eq => std.mem.eql(u8, row.name, f.value),
             .neq => !std.mem.eql(u8, row.name, f.value),
+            .in => in: {
+                var values = std.mem.splitScalar(u8, f.value, ',');
+                while (values.next()) |v| if (std.mem.eql(u8, row.name, v)) break :in true;
+                break :in false;
+            },
             .contains => std.ascii.findIgnoreCase(row.name, f.value) != null,
             .starts => std.ascii.startsWithIgnoreCase(row.name, f.value),
             .ends => std.ascii.endsWithIgnoreCase(row.name, f.value),

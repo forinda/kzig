@@ -22,7 +22,7 @@ jobs:
         run: |
           mkdir dist
           for target in x86_64-linux-musl aarch64-linux-musl x86_64-macos aarch64-macos; do
-            zig build -Doptimize=ReleaseSafe -Dtarget=$target --prefix "out/$target"
+            zig build -Doptimize=ReleaseSafe -Dtarget=$target "-Dversion=$GITHUB_REF_NAME" --prefix "out/$target"
             tar -czf "dist/kzig-$GITHUB_REF_NAME-$target.tar.gz" -C "out/$target/bin" kzig
           done
           (cd dist && sha256sum -- * > SHA256SUMS)

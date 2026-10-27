@@ -11,6 +11,7 @@ const Names = @import("names.zig").Names;
 const render = @import("templates.zig").render;
 const registry = @import("registry.zig");
 const dev = @import("dev.zig");
+const build_options = @import("build_options");
 
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -49,7 +50,9 @@ const usage =
     \\
 ;
 
-const kzig_url = "git+https://github.com/forinda/kzig";
+/// A released kzig (`-Dversion=v0.1.0`) scaffolds against its own tag, so
+/// templates and library match; a dev build follows main.
+const kzig_url = "git+https://github.com/forinda/kzig" ++ if (build_options.version) |v| "#" ++ v else "";
 
 const Template = struct {
     path: []const u8,
@@ -510,6 +513,14 @@ fn generateStub(cli: Cli, flags: Flags, s: Stub, raw: []const u8) !void {
         };
         break :blk d;
     } else "src";
+    // A module's own test is `kzig g module`'s; --force mustn't replace it.
+    if (std.mem.eql(u8, s.kind, "test")) {
+        const module_file = try std.fmt.allocPrint(cli.arena, "{s}/{s}.module.zig", .{ dir, n.kebab });
+        if (cli.cwd.access(cli.io, module_file, .{})) |_| {
+            cli.fail("{s}/{s}.test.zig is the module's own test; pick another name\n", .{ dir, n.kebab });
+            return error.Exists;
+        } else |_| {}
+    }
     // From the file back to src/, where test_app.zig is.
     const root = if (std.mem.eql(u8, dir, "src")) "" else "../../";
     try writeAll(cli, dir, &.{s.template}, try vars(n, &.{.{ "root", root }}, cli.arena), flags.force);

@@ -12,7 +12,7 @@ pub const Query = kzig.ListQuery(.{
 /// not a filter that quietly matches everything.
 pub fn checkFilters(ctx: *kzig.Ctx, query: Query) !void {
     for (query.filters) |f| switch (f.operator) {
-        .eq, .neq, .contains, .starts, .ends => {},
-        else => return ctx.fail(.bad_request, "filter: name supports eq, neq, contains, starts and ends"),
+        .eq, .neq, .in, .contains, .starts, .ends => {},
+        else => return ctx.fail(.bad_request, "filter: name supports eq, neq, in, contains, starts and ends"),
     };
 }

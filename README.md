@@ -216,7 +216,8 @@ before the response is written — a response body must not borrow memory `dispo
 ## CLI
 
 Prebuilt `kzig` binaries for Linux and macOS are attached to each
-[release](https://github.com/forinda/kzig/releases); or build it:
+[release](https://github.com/forinda/kzig/releases) (on macOS, a browser download needs
+`xattr -d com.apple.quarantine kzig`); or build it:
 
 ```console
 $ zig build                  # builds zig-out/bin/kzig

@@ -20,9 +20,11 @@ pub const Names = struct {
         var start: usize = 0;
         for (raw, 0..) |c, i| {
             const boundary = c == '-' or c == '_';
-            // `taskList` → task|List; `HTTPClient` → HTTP|Client.
+            // `taskList` → task|List; `HTTPClient` → HTTP|Client, but `APIs`
+            // stays one word.
+            const plural_s = i + 1 < raw.len and raw[i + 1] == 's' and (i + 2 == raw.len or !std.ascii.isLower(raw[i + 2]));
             const camel_step = i > 0 and std.ascii.isUpper(c) and (!std.ascii.isUpper(raw[i - 1]) and std.ascii.isAlphanumeric(raw[i - 1]) or
-                std.ascii.isUpper(raw[i - 1]) and i + 1 < raw.len and std.ascii.isLower(raw[i + 1]));
+                std.ascii.isUpper(raw[i - 1]) and i + 1 < raw.len and std.ascii.isLower(raw[i + 1]) and !plural_s);
             if (boundary or camel_step) {
                 if (i > start) try words.append(a, try std.ascii.allocLowerString(a, raw[start..i]));
                 start = if (boundary) i + 1 else i;
@@ -70,7 +72,8 @@ pub fn plural(a: Allocator, word: []const u8) ![]const u8 {
     for (irregular) |p| if (std.mem.eql(u8, word, p[0])) return a.dupe(u8, p[1]);
     for (uncountable) |u| if (std.mem.eql(u8, word, u)) return a.dupe(u8, word);
     for (takes_oes) |o| if (std.mem.eql(u8, word, o)) return std.mem.concat(a, u8, &.{ word, "es" });
-    if (std.mem.endsWith(u8, word, "z") and !std.mem.endsWith(u8, word, "zz")) return std.mem.concat(a, u8, &.{ word, "zes" });
+    if (std.mem.eql(u8, word, "quiz")) return a.dupe(u8, "quizzes");
+    if (std.mem.endsWith(u8, word, "is") and word.len > 3) return std.mem.concat(a, u8, &.{ word[0 .. word.len - 2], "es" });
     const vowels = "aeiou";
     if (word.len > 1 and word[word.len - 1] == 'y' and std.mem.findScalar(u8, vowels, word[word.len - 2]) == null)
         return std.mem.concat(a, u8, &.{ word[0 .. word.len - 1], "ies" });
@@ -137,4 +140,14 @@ test "acronyms split before the last capital of a run" {
     try testing.expectEqualStrings("HttpClient", n.pascal);
     const m = try Names.init(arena.allocator(), "userID");
     try testing.expectEqualStrings("user-id", m.kebab);
+}
+
+test "review: plural acronyms, -z and -is words" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqualStrings("apis", (try Names.init(a, "APIs")).kebab);
+    try testing.expectEqualStrings("user-ids", (try Names.init(a, "userIDs")).kebab);
+    for ([_][2][]const u8{ .{ "waltz", "waltzes" }, .{ "topaz", "topazes" }, .{ "quiz", "quizzes" }, .{ "analysis", "analyses" }, .{ "crisis", "crises" } }) |c|
+        try testing.expectEqualStrings(c[1], try plural(a, c[0]));
 }

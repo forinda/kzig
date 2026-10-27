@@ -16,6 +16,10 @@ pub fn build(b: *std.Build) void {
 
     // The `kzig` CLI (kzig new, kzig g module, …).
     const cli_mod = b.createModule(.{ .root_source_file = b.path("src/cli/main.zig"), .target = target, .optimize = optimize });
+    // The release workflow passes the tag: `kzig new` then fetches that kzig.
+    const cli_options = b.addOptions();
+    cli_options.addOption(?[]const u8, "version", b.option([]const u8, "version", "Release tag the CLI scaffolds against"));
+    cli_mod.addOptions("build_options", cli_options);
     const cli = b.addExecutable(.{ .name = "kzig", .root_module = cli_mod });
     b.installArtifact(cli);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cli_mod })).step);
