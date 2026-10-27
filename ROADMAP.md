@@ -263,7 +263,7 @@ Follow-ups:
       multipart parsed from the body; 415 for a type not allowed, 413 over the size or count,
       400 malformed; server-side names never from the client; OpenAPI `multipart/form-data`
 - [x] task-api `files` module (`file-storage-api`, disk storage): API key, signed download links
-- [ ] WebSocket gateways (`@forinda/kickjs-ws`): `.gateways` on modules, `{event, data}` frames,
+- [x] WebSocket gateways (`@forinda/kickjs-ws`): `.gateways` on modules, `{event, data}` frames,
       rooms, `connect`/`disconnect`/`draining`, heartbeat, close codes; on both runtimes
 - [ ] task-api `chat` module (`ws-chat`, without Redis): tokens, rooms, presence
 

@@ -522,8 +522,10 @@ fn webSockets(comptime ServerFn: fn (type) type) !void {
         defer quiet.deinit();
         _ = try quiet.next(); // welcome
         if ((try quiet.next()).op != 9) return fail("ws: the heartbeat pings", "");
+        // Dropped: the socket ends, with or without a close frame.
         while (true) {
             const f = quiet.next() catch break;
+            if (f.op == 8) break;
             if (f.op != 9) return fail("ws: a socket that misses a pong is dropped", f.data);
         }
         const lively = try h.client("/ws/echo?name=bo");
