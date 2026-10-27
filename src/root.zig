@@ -21,8 +21,12 @@ pub const contributor = @import("contributor.zig");
 pub const runtime = struct {
     pub const std = @import("runtime/std.zig");
     pub const Options = @import("runtime/options.zig").Options;
+    /// Response rules every runtime applies before writing.
+    pub const wire = @import("runtime/wire.zig");
     /// The socket-level behaviour every runtime shares; for runtime tests.
     pub const conformance = @import("runtime/conformance.zig");
+    /// SIGINT/SIGTERM handling shared by runtimes' `serve`.
+    pub const signals = @import("runtime/std.zig").signals;
 };
 
 pub const Ctx = context.Ctx;
@@ -57,4 +61,5 @@ test {
     _ = query;
     _ = middleware;
     _ = runtime.std;
+    _ = runtime.wire;
 }

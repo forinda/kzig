@@ -30,8 +30,8 @@ table.
 ```bash
 zig build              # Build
 zig build test         # Run all tests
-zig fmt .              # Format
-zig fmt --check .      # Check formatting
+zig fmt build.zig src examples tests              # Format
+zig fmt --check build.zig build.zig.zon src examples tests      # Check formatting
 zig build --watch      # Rebuild on change
 ```
 

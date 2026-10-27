@@ -3,7 +3,14 @@
     .version = "0.0.0",
     .fingerprint = 0xf3ec668d44f039dc, // Changing this has security and trust implications.
     .minimum_zig_version = "0.17.0",
-    .dependencies = .{},
+    .dependencies = .{
+        .httpz = .{
+            .url = "git+https://github.com/karlseguin/http.zig#5b81bded629f7ce16db3ad3f1a76bddca5560096",
+            .hash = "httpz-0.0.0-PNVzrEg0CQD-n7jqECTtPVfTxog5lp6bOCc0fQggnJ5t",
+            // Only fetched for the http.zig runtime (-Dhttpz).
+            .lazy = true,
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",

@@ -14,6 +14,23 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&b.addRunArtifact(tests).step);
 
+    // The http.zig runtime is its own module behind -Dhttpz, so std-runtime
+    // users never fetch http.zig.
+    if (b.option(bool, "httpz", "Build the http.zig runtime (kzig_httpz module)") orelse false) {
+        if (b.lazyDependency("httpz", .{ .target = target, .optimize = optimize })) |dep| {
+            const httpz_mod = b.addModule("kzig_httpz", .{
+                .root_source_file = b.path("src/runtime/httpz.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "kzig", .module = mod },
+                    .{ .name = "httpz", .module = dep.module("httpz") },
+                },
+            });
+            test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = httpz_mod })).step);
+        }
+    }
+
     // Apps ported from kickjs-examples-archive; their tests run with ours.
     const examples_step = b.step("examples", "Build the example apps");
     for (examples) |name| {

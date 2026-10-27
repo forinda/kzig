@@ -4,6 +4,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const context = @import("../context.zig");
 const router = @import("../router.zig");
+const wire = @import("wire.zig");
 
 const Io = std.Io;
 const Ctx = context.Ctx;
@@ -195,30 +196,15 @@ pub fn Server(comptime App: type) type {
             self.app.handle(&ctx);
             arm(io, deadline, self.options.body_timeout_ms);
 
-            var status = res.status;
-            var content = res.body;
-            // std.http asserts on 1xx, and a body on 204/304 would be read as
-            // the start of the next response.
-            if (@backingInt(status) < 200) {
-                if (!builtin.is_test) std.log.err("{t} {s}: handler set status {d}", .{ method, request.path, @backingInt(status) });
-                status = .internal_server_error;
-                content = "";
-            }
-            if (status == .no_content or status == .not_modified) content = "";
-
+            const w = wire.finish(method, request.path, &res);
             const out = try arena.alloc(http.Header, res.headers.items.len);
             var n: usize = 0;
-            for (res.headers.items) |h| {
-                // std asserts on these; drop the header rather than crash.
-                if (h.name.len == 0 or std.mem.findAny(u8, h.name, ":\r\n") != null or std.mem.findAny(u8, h.value, "\r\n") != null) continue;
-                // std writes the framing itself; a second, different length
-                // would desync the client.
-                if (std.ascii.eqlIgnoreCase(h.name, "content-length") or std.ascii.eqlIgnoreCase(h.name, "transfer-encoding")) continue;
+            for (res.headers.items) |h| if (wire.sendable(h)) {
                 out[n] = .{ .name = h.name, .value = h.value };
                 n += 1;
-            }
+            };
             const keep_alive = client_keep_alive and !self.draining.load(.acquire);
-            try req.respond(content, .{ .status = status, .keep_alive = keep_alive, .extra_headers = out[0..n] });
+            try req.respond(w.body, .{ .status = w.status, .keep_alive = keep_alive, .extra_headers = out[0..n] });
             return if (keep_alive) .keep_alive else .close;
         }
 
@@ -319,11 +305,11 @@ fn runUntilStopped(comptime App: type) fn (*Server(App), *std.atomic.Value(bool)
     }.f;
 }
 
-const signals = struct {
+pub const signals = struct {
     var received: std.atomic.Value(u32) = .init(0);
     var installed: std.atomic.Value(bool) = .init(false);
 
-    fn count() u32 {
+    pub fn count() u32 {
         return received.load(.acquire);
     }
 
@@ -332,7 +318,7 @@ const signals = struct {
         if (received.fetchAdd(1, .acq_rel) > 0) exitNow(130);
     }
 
-    fn install() void {
+    pub fn install() void {
         if (builtin.os.tag == .windows) return;
         received.store(0, .release);
         const act: std.posix.Sigaction = .{
@@ -500,7 +486,14 @@ fn roundTripParts(opts: Options, parts: []const []const u8, gap_ms: i64, half_cl
 }
 
 test "std runtime conformance" {
-    try @import("conformance.zig").run(Server);
+    try @import("conformance.zig").run(Server, .{});
+}
+
+test "pipelined requests are answered in order" {
+    const out = try roundTripOpts(.{}, "GET /hello HTTP/1.1\r\nhost: x\r\n\r\nPOST /echo HTTP/1.1\r\nhost: x\r\n\r\n" ++
+        "GET /hello HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n", true);
+    defer testing.allocator.free(out);
+    try testing.expectEqual(3, std.mem.count(u8, out, "HTTP/1.1 "));
 }
 
 test "chunked body over limit is 413" {

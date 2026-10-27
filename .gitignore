@@ -20,3 +20,4 @@ zig-out/
 .ignored/
 CLAUDE.local.md
 .superpowers/
+zig-pkg/

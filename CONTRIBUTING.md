@@ -40,7 +40,7 @@ the reference; a deliberate difference is listed in the roadmap.
 
    ```bash
    zig build test
-   zig fmt --check .
+   zig fmt --check build.zig build.zig.zon src examples tests
    ```
 
 4. Commit with a [Conventional Commits](https://www.conventionalcommits.org/) message

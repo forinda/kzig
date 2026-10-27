@@ -103,13 +103,23 @@ fn Harness(comptime ServerFn: fn (type) type) type {
                 };
             }
         }
-        /// Sends `raw`, half-closes if asked, returns all the server wrote.
-        fn exchange(self: *Self, raw: []const u8, half_close: bool) ![]u8 {
+        /// Sends `raw` (then `then`, after reading one response), half-closes
+        /// if asked, returns everything the server wrote.
+        fn exchange(self: *Self, raw: []const u8, then: ?[]const u8, half_close: bool) ![]u8 {
             const s = try self.connect();
             defer s.close(testing.io);
+            var rbuf: [4096]u8 = undefined;
+            var r = s.reader(testing.io, &rbuf);
+            var out: std.ArrayList(u8) = .empty;
+            errdefer out.deinit(testing.allocator);
             try send(s, raw);
+            if (then) |next| {
+                try readResponse(&r.interface, &out);
+                try send(s, next);
+            }
             if (half_close) try s.shutdown(testing.io, .send);
-            return readAll(s);
+            try r.interface.appendRemaining(testing.allocator, &out, .limited(64 * 1024));
+            return out.toOwnedSlice(testing.allocator);
         }
     };
 }
@@ -127,6 +137,20 @@ fn readAll(stream: Io.net.Stream) ![]u8 {
     return r.interface.allocRemaining(testing.allocator, .limited(64 * 1024));
 }
 
+/// One response: head lines, then `content-length` bytes of body.
+fn readResponse(r: *Io.Reader, out: *std.ArrayList(u8)) !void {
+    var length: usize = 0;
+    while (true) {
+        const line = try r.takeDelimiterInclusive('\n');
+        try out.appendSlice(testing.allocator, line);
+        const trimmed = std.mem.trimEnd(u8, line, "\r\n");
+        if (trimmed.len == 0) break;
+        if (std.ascii.startsWithIgnoreCase(trimmed, "content-length:"))
+            length = try std.fmt.parseInt(usize, std.mem.trim(u8, trimmed["content-length:".len..], " "), 10);
+    }
+    try out.appendSlice(testing.allocator, try r.take(length));
+}
+
 fn fill(comptime n: usize, comptime c: u8) [n]u8 {
     return @splat(c);
 }
@@ -139,6 +163,9 @@ const Check = struct {
     name: []const u8,
     opts: Options = .{},
     request: []const u8,
+    /// Sent on the same connection after the first response was read
+    /// (keep-alive as clients use it; pipelining is engine-specific).
+    then: ?[]const u8 = null,
     half_close: bool = false,
     expect: *const fn (out: []const u8) bool,
 };
@@ -151,7 +178,7 @@ const checks = [_]Check{
             return std.mem.startsWith(u8, o, "HTTP/1.1 200 ") and std.mem.endsWith(u8, o, "\r\n\r\nhi");
         }
     }.f },
-    .{ .name = "keep-alive serves two requests", .request = "GET /hello HTTP/1.1\r\nhost: x\r\n\r\nGET /hello HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n", .expect = struct {
+    .{ .name = "keep-alive serves two requests", .request = "GET /hello HTTP/1.1\r\nhost: x\r\n\r\n", .then = "GET /hello HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n", .expect = struct {
         fn f(o: []const u8) bool {
             return std.mem.count(u8, o, " 200 ") == 2;
         }
@@ -176,7 +203,7 @@ const checks = [_]Check{
             return std.mem.startsWith(u8, o, "HTTP/1.1 431 ");
         }
     }.f },
-    .{ .name = "POST without content-length has an empty body", .half_close = true, .request = "POST /echo HTTP/1.1\r\nhost: x\r\n\r\nGET /hello HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n", .expect = struct {
+    .{ .name = "POST without content-length has an empty body", .request = "POST /echo HTTP/1.1\r\nhost: x\r\n\r\n", .then = "GET /hello HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n", .expect = struct {
         fn f(o: []const u8) bool {
             return std.mem.count(u8, o, "HTTP/1.1 ") == 2;
         }
@@ -191,7 +218,7 @@ const checks = [_]Check{
             return std.mem.startsWith(u8, o, "HTTP/1.1 400 ") and !has(o, "SECRET");
         }
     }.f },
-    .{ .name = "204 is sent without a body", .request = "GET /empty HTTP/1.1\r\nhost: x\r\n\r\nGET /hello HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n", .expect = struct {
+    .{ .name = "204 is sent without a body", .request = "GET /empty HTTP/1.1\r\nhost: x\r\n\r\n", .then = "GET /hello HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n", .expect = struct {
         fn f(o: []const u8) bool {
             return std.mem.startsWith(u8, o, "HTTP/1.1 204 ") and !has(o, "body") and std.mem.count(u8, o, "HTTP/1.1 ") == 2;
         }
@@ -203,20 +230,40 @@ const checks = [_]Check{
     }.f },
     .{ .name = "framing headers from a handler are not sent", .request = "GET /framed HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n", .expect = struct {
         fn f(o: []const u8) bool {
-            return std.ascii.findIgnoreCase(o, "transfer-encoding") == null and
-                std.mem.count(u8, o, "ontent-length") == 1 and std.ascii.findIgnoreCase(o, "content-length: 2\r\n") != null;
+            var lower: [512]u8 = undefined;
+            if (o.len > lower.len) return false;
+            const l = std.ascii.lowerString(&lower, o);
+            return std.mem.find(u8, l, "transfer-encoding") == null and
+                std.mem.count(u8, l, "content-length") == 1 and std.mem.find(u8, l, "content-length: 2\r\n") != null;
         }
     }.f },
 };
 
+pub const Known = struct {
+    /// Checks this engine is known to fail, by name; each must be listed
+    /// as a follow-up in ROADMAP.md.
+    differences: []const []const u8 = &.{},
+};
+
 /// Runs every check against `ServerFn` (a runtime's `Server`), naming the
-/// first that fails.
-pub fn run(comptime ServerFn: fn (type) type) !void {
+/// first that fails. A known difference that starts passing fails too, so
+/// the list stays true.
+pub fn run(comptime ServerFn: fn (type) type, comptime known: Known) !void {
     const H = Harness(ServerFn);
     inline for (checks) |c| {
+        const expected_to_fail = comptime for (known.differences) |d| {
+            if (std.mem.eql(u8, d, c.name)) break true;
+        } else false;
+        if (expected_to_fail) {
+            if (try passes(H, c)) {
+                std.debug.print("conformance: {s} now passes; drop it from the known differences\n", .{c.name});
+                return error.ConformanceFailed;
+            }
+            continue;
+        }
         var h: H = .{};
         try h.start(c.opts);
-        const out = h.exchange(c.request, c.half_close) catch |err| {
+        const out = h.exchange(c.request, c.then, c.half_close) catch |err| {
             h.stop();
             std.debug.print("conformance: {s}: {t}\n", .{ c.name, err });
             return err;
@@ -229,6 +276,15 @@ pub fn run(comptime ServerFn: fn (type) type) !void {
         }
     }
     try lifecycle(ServerFn);
+}
+
+fn passes(comptime H: type, comptime c: Check) !bool {
+    var h: H = .{};
+    try h.start(c.opts);
+    defer h.stop();
+    const out = h.exchange(c.request, c.then, c.half_close) catch return false;
+    defer testing.allocator.free(out);
+    return c.expect(out);
 }
 
 fn lifecycle(comptime ServerFn: fn (type) type) !void {
