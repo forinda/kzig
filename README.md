@@ -279,8 +279,13 @@ violation is `error.Conflict` (409); a server that can't be reached is `error.Se
 TLS follows libpq's `sslmode` in the URL: `prefer` (the default) encrypts when the server
 offers it, `require` insists, `verify-ca` also checks the certificate chain and `verify-full` the
 host name too, against `sslrootcert=/path/ca.pem` or the system's CAs; `disable` stays in the
-clear. A password is never sent in cleartext over an unencrypted connection, and SCRAM sign-in
-must end with the server proving it knows the password.
+clear. As in libpq, `require` with an `sslrootcert` checks the chain; unlike it, `verify-ca`
+against the system's CAs checks the host name too, since any public certificate would pass
+otherwise. SNI names the host in every mode.
+
+Passwords: SCRAM (Postgres's default) never sends one. A server asking for a cleartext or MD5
+password gets one only over verified TLS (`verify-ca`/`verify-full`); for an old server on a
+trusted network, `insecure_auth=true` allows it.
 
 ```text
 postgres://app:secret@db.example.com/app?sslmode=verify-full&sslrootcert=/etc/ssl/db-ca.pem

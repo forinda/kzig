@@ -544,5 +544,6 @@ test "database URLs" {
     try testing.expectEqual(pg.SslMode.disable, (try pg.Config.parse(a, "postgres://ada@h/app?sslmode=disable")).sslmode);
     try testing.expectEqual(pg.SslMode.verify_ca, (try pg.Config.parse(a, "postgres://ada@h/app?sslmode=verify-ca")).sslmode);
     try testing.expectError(error.InvalidDatabaseUrl, pg.Config.parse(a, "postgres://ada@h/app?sslmode=strict"));
+    try testing.expect((try pg.Config.parse(a, "postgres://ada@h/app?insecure_auth=true")).insecure_auth);
     try testing.expectError(error.InvalidDatabaseUrl, pg.Config.parse(a, "mysql://ada@h/app"));
 }

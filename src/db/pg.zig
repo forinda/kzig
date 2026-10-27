@@ -2,7 +2,9 @@
 //! (SCRAM-SHA-256, MD5, cleartext), the extended query protocol with text
 //! parameters and results, and the simple protocol for scripts. No TLS yet.
 const std = @import("std");
-const tls = std.crypto.tls;
+const tls = struct {
+    const Client = @import("tls/Client.zig");
+};
 const builtin = @import("builtin");
 const Timestamp = @import("timestamp.zig").Timestamp;
 
@@ -29,6 +31,9 @@ pub const Config = struct {
     /// PEM file of the CAs to trust (`verify-ca`, `verify-full`); the
     /// system's when null.
     sslrootcert: ?[]const u8 = null,
+    /// `insecure_auth=true`: answer a cleartext or MD5 password request on
+    /// an unverified connection (an old server); off, that's `error.InsecureAuth`.
+    insecure_auth: bool = false,
 
     /// `postgres://user:password@host:port/database[?sslmode=disable]`. The
     /// strings point into `url` and `a`.
@@ -54,6 +59,8 @@ pub const Config = struct {
                     if (mode.len > buf.len) return error.InvalidDatabaseUrl;
                     for (mode, 0..) |ch, i| buf[i] = if (ch == '-') '_' else ch;
                     c.sslmode = std.meta.stringToEnum(SslMode, buf[0..mode.len]) orelse return error.InvalidDatabaseUrl;
+                } else if (std.mem.eql(u8, pair, "insecure_auth=true")) {
+                    c.insecure_auth = true;
                 } else if (std.mem.startsWith(u8, pair, "sslrootcert=")) {
                     c.sslrootcert = pair["sslrootcert=".len..];
                 } else if (std.mem.startsWith(u8, pair, "application_name=")) {
@@ -86,8 +93,33 @@ pub const Error = error{
     /// A column missing from the result, or a value its field can't hold.
     DbDecode,
     UnsupportedAuth,
+    /// The server asked for a cleartext or MD5 password over a connection
+    /// whose server wasn't verified (sslmode verify-ca/verify-full); see
+    /// `Config.insecure_auth`.
+    InsecureAuth,
+    /// sslmode require or stronger, and the server has no TLS.
+    TlsRefused,
+    /// The handshake failed: the certificate didn't verify, or the server
+    /// speaks no TLS we do.
+    TlsHandshakeFailed,
+    /// `sslrootcert` couldn't be read, or the system's CAs couldn't be loaded.
+    TlsConfig,
     OutOfMemory,
 };
+
+/// What a connection's TLS checks, from sslmode and sslrootcert as libpq
+/// reads them, made safer: `require` with a root cert is `verify-ca`
+/// (libpq), and `verify-ca` against the system's CAs also checks the host
+/// (any public certificate would pass otherwise).
+pub const TlsPlan = struct { chain: bool, host: bool, os_roots: bool };
+
+pub fn tlsPlan(cfg: Config) TlsPlan {
+    var mode = cfg.sslmode;
+    if (mode == .require and cfg.sslrootcert != null) mode = .verify_ca;
+    if (mode == .verify_ca and cfg.sslrootcert == null) mode = .verify_full;
+    const chain = mode == .verify_ca or mode == .verify_full;
+    return .{ .chain = chain, .host = mode == .verify_full, .os_roots = cfg.sslrootcert == null };
+}
 
 /// One connection. Not thread-safe: the pool hands it to one task at a time.
 pub const Conn = struct {
@@ -101,6 +133,8 @@ pub const Conn = struct {
     wbuf: [tls.Client.min_buffer_len]u8 = undefined,
     /// Messages go through it once the server accepted SSLRequest.
     tls: ?tls.Client = null,
+    /// The certificate chain (and maybe host) was checked: passwords may go.
+    tls_verified: bool = false,
     tls_rbuf: [tls.Client.min_buffer_len]u8 = undefined,
     tls_wbuf: [tls.Client.min_buffer_len]u8 = undefined,
     /// A read or write failed; the connection is dropped, not reused.
@@ -156,6 +190,9 @@ pub const Conn = struct {
         c.writer.interface.writeAll(&req) catch return c.lost();
         c.flushOut() catch return c.lost();
         const answer = c.reader.interface.takeByte() catch return c.lost();
+        // CVE-2021-23222: anything sent with the answer came before TLS and
+        // could be anyone's; libpq hangs up on it.
+        if (c.reader.interface.bufferedLen() != 0) return c.lost();
         switch (answer) {
             'S' => {},
             'N' => switch (cfg.sslmode) {
@@ -167,7 +204,8 @@ pub const Conn = struct {
             },
             else => return c.lost(),
         }
-        const verify = cfg.sslmode == .verify_ca or cfg.sslmode == .verify_full;
+        const plan = tlsPlan(cfg);
+        const verify = plan.chain;
         const now = Io.Clock.real.now(c.io);
         var bundle: std.crypto.Certificate.Bundle = .empty;
         defer bundle.deinit(c.gpa);
@@ -178,15 +216,21 @@ pub const Conn = struct {
             if (cfg.sslrootcert) |path|
                 bundle.addCertsFromFilePath(c.gpa, c.io, now, Io.Dir.cwd(), path) catch |err| {
                     if (!builtin.is_test) std.log.err("postgres: sslrootcert {s}: {t}", .{ path, err });
-                    return error.TlsHandshakeFailed;
+                    return error.TlsConfig;
                 }
             else
-                bundle.rescan(c.gpa, c.io, now) catch return error.TlsHandshakeFailed;
+                bundle.rescan(c.gpa, c.io, now) catch |err| {
+                    if (!builtin.is_test) std.log.err("postgres: the system's CAs: {t}", .{err});
+                    return error.TlsConfig;
+                };
         }
         var entropy: [tls.Client.Options.entropy_len]u8 = undefined;
         c.io.random(&entropy);
         c.tls = tls.Client.init(&c.reader.interface, &c.writer.interface, .{
-            .host = if (cfg.sslmode == .verify_full) .{ .explicit = cfg.host } else .no_verification,
+            .host = if (plan.host) .{ .explicit = cfg.host } else .no_verification,
+            // SNI in every mode (libpq's sslsni), but never an IP address (RFC 6066).
+            .server_name = if (isIp(cfg.host)) null else cfg.host,
+            .os_roots = plan.os_roots,
             .ca = if (verify) .{ .bundle = .{ .gpa = c.gpa, .io = c.io, .lock = &lock, .bundle = &bundle } } else .no_verification,
             .read_buffer = &c.tls_rbuf,
             .write_buffer = &c.tls_wbuf,
@@ -199,6 +243,12 @@ pub const Conn = struct {
             c.broken = true;
             return error.TlsHandshakeFailed;
         };
+        c.tls_verified = verify;
+    }
+
+    fn isIp(host: []const u8) bool {
+        _ = Io.net.IpAddress.parse(host, 0) catch return false;
+        return true;
     }
 
     pub fn close(c: *Conn) void {
@@ -311,6 +361,9 @@ pub const Conn = struct {
 
         var scram: ?Scram = null;
         var proven = false;
+        // A password, or MD5 of it with a salt the server picked, only to a
+        // verified server (or when the URL says the server is old).
+        const may_send_password = c.tls_verified or cfg.insecure_auth;
         while (true) {
             const m = try c.next();
             switch (m.kind) {
@@ -322,16 +375,13 @@ pub const Conn = struct {
                         // isn't a server that knows the password.
                         0 => if (scram != null and !proven) return error.DbAuthFailed,
                         3 => {
-                            // Never the password itself over an unencrypted socket.
-                            if (c.tls == null) {
-                                if (!builtin.is_test) std.log.err("postgres: the server asked for a cleartext password without TLS; refused", .{});
-                                return error.InsecureAuth;
-                            }
+                            if (!may_send_password) return insecure("a cleartext password");
                             try c.begin('p');
                             try c.cstr(cfg.password);
                             try c.send();
                         },
                         5 => {
+                            if (!may_send_password) return insecure("an MD5 password");
                             if (m.body.len < 8) return c.lost();
                             const hashed = md5Password(cfg.user, cfg.password, m.body[4..8].*);
                             try c.begin('p');
@@ -359,6 +409,8 @@ pub const Conn = struct {
                         },
                         12 => {
                             const s = &(scram orelse return c.lost());
+                            // The server's proof comes after its first message, never instead of it.
+                            if (!s.answered) return error.DbAuthFailed;
                             if (!s.verifyServer(m.body[4..])) return error.DbAuthFailed;
                             proven = true;
                         },
@@ -377,6 +429,11 @@ pub const Conn = struct {
                 else => {},
             }
         }
+    }
+
+    fn insecure(what: []const u8) error{InsecureAuth} {
+        if (!builtin.is_test) std.log.err("postgres: the server asked for {s} without verified TLS (sslmode verify-ca/verify-full); refused. insecure_auth=true allows it", .{what});
+        return error.InsecureAuth;
     }
 
     fn readError(c: *Conn, body: []const u8) void {
@@ -591,6 +648,8 @@ pub const Scram = struct {
     first_bare_len: usize = 0,
     message: [512]u8 = undefined,
     server_signature: [HmacSha256.mac_length]u8 = undefined,
+    /// `clientFinal` ran: `server_signature` is set.
+    answered: bool = false,
     user: []const u8 = "",
 
     pub fn init(random: [18]u8) Scram {
@@ -654,6 +713,7 @@ pub const Scram = struct {
 
         var proof_b64: [44]u8 = undefined;
         _ = std.base64.standard.Encoder.encode(&proof_b64, &proof);
+        s.answered = true;
         return std.fmt.bufPrint(&s.message, "{s},p={s}", .{ without_proof, &proof_b64 }) catch return error.BadServerMessage;
     }
 
@@ -1020,6 +1080,113 @@ test "a cleartext password is only sent over TLS; SCRAM must end with the server
     }
     {
         const f = try Fake.start(Script.scramWithoutProof);
+        try testing.expectError(error.DbAuthFailed, Conn.connect(testing.io, testing.allocator, f.config(.disable)));
+        try f.finish();
+    }
+}
+
+test "what TLS verifies: libpq's upgrades, and the system store only with the host checked" {
+    const base: Config = .{ .user = "u", .database = "d", .host = "db.example.com" };
+    var c = base;
+    c.sslmode = .require;
+    try testing.expectEqual(TlsPlan{ .chain = false, .host = false, .os_roots = true }, tlsPlan(c));
+    c.sslrootcert = "ca.pem"; // require with a root cert is verify-ca, as libpq
+    try testing.expectEqual(TlsPlan{ .chain = true, .host = false, .os_roots = false }, tlsPlan(c));
+    c = base;
+    c.sslmode = .verify_ca; // the system's CAs prove nothing without the host name
+    try testing.expectEqual(TlsPlan{ .chain = true, .host = true, .os_roots = true }, tlsPlan(c));
+    c.sslmode = .verify_full;
+    c.sslrootcert = "ca.pem";
+    try testing.expectEqual(TlsPlan{ .chain = true, .host = true, .os_roots = false }, tlsPlan(c));
+    c = base;
+    try testing.expectEqual(TlsPlan{ .chain = false, .host = false, .os_roots = true }, tlsPlan(c));
+}
+
+test "TLS: SNI names a host name in every mode, never an IP address" {
+    const Script = struct {
+        fn hello(s: Io.net.Stream, want: bool) anyerror!void {
+            var buf: [64]u8 = undefined;
+            _ = try Fake.readStartup(s, &buf);
+            try Fake.send(s, "S");
+            var rb: [2048]u8 = undefined;
+            var r = s.reader(testing.io, &rb);
+            const header = try r.interface.takeArray(5); // record header
+            const client_hello = try r.interface.take(std.mem.readInt(u16, header[3..5], .big));
+            try testing.expectEqual(want, std.mem.find(u8, client_hello, "localhost") != null);
+        }
+        fn named(s: Io.net.Stream) anyerror!void {
+            return hello(s, true);
+        }
+        fn ip(s: Io.net.Stream) anyerror!void {
+            return hello(s, false);
+        }
+    };
+    {
+        const f = try Fake.start(Script.named);
+        var cfg = f.config(.require);
+        cfg.host = "localhost";
+        try testing.expectError(error.TlsHandshakeFailed, Conn.connect(testing.io, testing.allocator, cfg));
+        try f.finish();
+    }
+    {
+        const f = try Fake.start(Script.ip);
+        try testing.expectError(error.TlsHandshakeFailed, Conn.connect(testing.io, testing.allocator, f.config(.require)));
+        try f.finish();
+    }
+}
+
+test "MD5 only over verified TLS unless the URL allows it; nothing trusted after the SSL answer; server-final needs server-first" {
+    const Script = struct {
+        fn md5(s: Io.net.Stream) anyerror!void {
+            var buf: [512]u8 = undefined;
+            _ = try Fake.readStartup(s, &buf);
+            try Fake.send(s, "R\x00\x00\x00\x0c\x00\x00\x00\x05salt");
+            var rb: [256]u8 = undefined;
+            var r = s.reader(testing.io, &rb);
+            if ((r.interface.takeByte() catch return) != 'p') return error.TestUnexpectedResult;
+            const len = try r.interface.takeInt(u32, .big);
+            _ = try r.interface.take(len - 4);
+            try Fake.send(s, Fake.auth_ok);
+        }
+        fn smuggled(s: Io.net.Stream) anyerror!void {
+            var buf: [64]u8 = undefined;
+            _ = try Fake.readStartup(s, &buf);
+            // 'N' and, in the same packet, a forged AuthenticationOk.
+            try Fake.send(s, "N" ++ Fake.auth_ok);
+        }
+        fn finalFirst(s: Io.net.Stream) anyerror!void {
+            var buf: [512]u8 = undefined;
+            _ = try Fake.readStartup(s, &buf);
+            try Fake.send(s, "R\x00\x00\x00\x17\x00\x00\x00\x0aSCRAM-SHA-256\x00\x00");
+            var rb: [512]u8 = undefined;
+            var r = s.reader(testing.io, &rb);
+            _ = try r.interface.takeByte();
+            const len = try r.interface.takeInt(u32, .big);
+            _ = try r.interface.take(len - 4);
+            const v = "v=qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo=";
+            try Fake.send(s, "R\x00\x00\x00\x34\x00\x00\x00\x0c" ++ v ++ Fake.auth_ok);
+        }
+    };
+    {
+        const f = try Fake.start(Script.md5);
+        try testing.expectError(error.InsecureAuth, Conn.connect(testing.io, testing.allocator, f.config(.disable)));
+        try f.finish();
+    }
+    {
+        const f = try Fake.start(Script.md5);
+        var cfg = f.config(.disable);
+        cfg.insecure_auth = true;
+        const c = try Conn.connect(testing.io, testing.allocator, cfg);
+        c.close();
+        try f.finish();
+    }
+    {
+        const f = try Fake.start(Script.smuggled);
+        try testing.expectError(error.ServiceUnavailable, Conn.connect(testing.io, testing.allocator, f.config(.prefer)));
+        try f.finish();
+    }
+    {
+        const f = try Fake.start(Script.finalFirst);
         try testing.expectError(error.DbAuthFailed, Conn.connect(testing.io, testing.allocator, f.config(.disable)));
         try f.finish();
     }

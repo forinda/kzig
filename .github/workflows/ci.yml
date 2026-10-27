@@ -42,13 +42,17 @@ jobs:
           printf "subjectAltName=DNS:localhost\n" > ext.cnf
           openssl x509 -req -in server.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 2 -out server.pem -extfile ext.cnf
           docker run -d --name pg -p 5432:5432 -e POSTGRES_USER=kzig -e POSTGRES_PASSWORD=kzigpass -e POSTGRES_DB=kzig_test postgres:17-alpine
-          for i in $(seq 60); do docker exec pg pg_isready -U kzig -h 127.0.0.1 >/dev/null 2>&1 && break; sleep 1; done
+          ready() { for i in $(seq 60); do docker exec pg pg_isready -U kzig -h 127.0.0.1 >/dev/null 2>&1 && return 0; sleep 1; done; docker logs pg; return 1; }
+          ready
           docker cp server.pem pg:/var/lib/postgresql/server.pem
           docker cp server.key pg:/var/lib/postgresql/server.key
           docker exec pg sh -c 'chown postgres /var/lib/postgresql/server.*; chmod 600 /var/lib/postgresql/server.key'
-          for q in "ALTER SYSTEM SET ssl = on" "ALTER SYSTEM SET ssl_cert_file = '/var/lib/postgresql/server.pem'" "ALTER SYSTEM SET ssl_key_file = '/var/lib/postgresql/server.key'" "SELECT pg_reload_conf()"; do
+          for q in "ALTER SYSTEM SET ssl = on" "ALTER SYSTEM SET ssl_cert_file = '/var/lib/postgresql/server.pem'" "ALTER SYSTEM SET ssl_key_file = '/var/lib/postgresql/server.key'"; do
             docker exec pg psql -U kzig -d kzig_test -qtAc "$q"
           done
+          # A restart, not a reload: SHOW ssl right after a reload can race it.
+          docker restart pg >/dev/null
+          ready
           [ "$(docker exec pg psql -U kzig -d kzig_test -tAc 'SHOW ssl')" = on ]
       - name: S3 server
         run: |

@@ -75,7 +75,8 @@ after M6.
 | `set({ x: null })` | `Update` fields are `??T`: null leaves a column, `@as(?T, null)` sets NULL | Same reason |
 | `executeTakeFirstOrThrow` without a row: a 500 | `error.NotFound`, a 404 | The usual meaning of "no such row" in a handler |
 | `pg` driver | A Postgres client in Zig, TLS from `std.crypto.tls` | No dependency |
-| libpq sends a cleartext password when the server asks | Only over TLS (`error.InsecureAuth` otherwise); SCRAM must end with the server's proof | A downgrade can't read the password |
+| libpq sends a cleartext or MD5 password whenever the server asks | Only over verified TLS (`verify-ca`/`verify-full`), else `error.InsecureAuth`; `insecure_auth=true` for old servers | A man in the middle can ask for either |
+| `verify-ca` against `sslrootcert=system` is refused by libpq | `verify-ca` without `sslrootcert` checks the host too (verify-full) | The system's CAs vouch for anyone's certificate |
 | `sslmode=allow` tries plaintext first | Treated as `prefer` (TLS first) | Encrypt when possible |
 | A DB adapter always reports health | `onHealthCheck` may return null; no database configured, nothing on `/health/ready` | task-api runs without a database |
 
@@ -390,7 +391,11 @@ after their exports.
 
 - [x] `sslmode` (disable, prefer by default, require, verify-ca, verify-full) and `sslrootcert`,
       or the system's CAs; close_notify on close
-- [x] SCRAM sign-in must end with a verified server signature; a cleartext password only over TLS
+- [x] SCRAM sign-in must end with a verified server signature (and server-final after
+      server-first); cleartext and MD5 passwords only over verified TLS
+- [x] libpq's rules for `require` + `sslrootcert`; SNI in every mode (not for IP addresses); bytes
+      sent with the SSL answer refused (CVE-2021-23222); a pinned `sslrootcert` never falls back to
+      the OS store
 - [x] CI runs every database test over TLS (a throwaway CA) and checks verify-full, a wrong host
       and a wrong CA
 
