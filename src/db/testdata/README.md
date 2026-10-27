@@ -4,3 +4,7 @@ an unrelated CA, and private keys in each format the TLS client reads
 
 Encrypted copies (password `kzig-test`): PBES2 (PBKDF2-HMAC-SHA256 + AES-256-CBC, and
 PBKDF2-HMAC-SHA1 + AES-128-CBC) and OpenSSL's traditional `DEK-Info` PEM (AES-256, AES-128).
+
+Also: an Ed25519 key (PKCS#8), self-signed certificates for the EC, RSA and Ed25519 keys (to
+check a key matches its certificate), and keys encrypted with scrypt (PBES2) and with 3DES
+(PBES2 and DEK-Info).

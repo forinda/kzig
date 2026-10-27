@@ -258,6 +258,7 @@ test {
     _ = generate;
     _ = @import("relational.zig");
     _ = @import("tls/keys.zig");
+    _ = @import("tls/des.zig");
     _ = pg;
 }
 
@@ -483,7 +484,7 @@ test "TLS: a client certificate signs in (EC and RSA keys); without one the serv
     defer arena.deinit();
     const a = arena.allocator();
     const cfg = try pg.Config.parse(a, url);
-    for ([_][]const u8{ "ec", "rsa" }) |kind| {
+    for ([_][]const u8{ "ec", "rsa", "ed25519" }) |kind| {
         const cert_url = try std.fmt.allocPrint(a, "postgres://certuser@localhost:{d}/{s}?sslmode=verify-full&sslrootcert={s}&sslcert={s}/certuser-{s}.pem&sslkey={s}/certuser-{s}.key", .{ cfg.port, cfg.database, ca, dir, kind, dir, kind });
         var db: Pool = try .init(testing.io, testing.allocator, .{ .url = cert_url, .max_connections = 1 });
         defer db.deinit();
@@ -498,6 +499,10 @@ test "TLS: a client certificate signs in (EC and RSA keys); without one the serv
     var wrong: Pool = try .init(testing.io, testing.allocator, .{ .url = try std.fmt.allocPrint(a, "{s}nope", .{enc}), .max_connections = 1 });
     defer wrong.deinit();
     try testing.expectError(error.TlsConfig, wrong.ping());
+    // A key that isn't the certificate's is refused before connecting.
+    var mismatched: Pool = try .init(testing.io, testing.allocator, .{ .url = try std.fmt.allocPrint(a, "postgres://certuser@localhost:{d}/{s}?sslmode=verify-full&sslrootcert={s}&sslcert={s}/certuser-ec.pem&sslkey={s}/certuser-rsa.key", .{ cfg.port, cfg.database, ca, dir, dir }), .max_connections = 1 });
+    defer mismatched.deinit();
+    try testing.expectError(error.TlsConfig, mismatched.ping());
     var none: Pool = try .init(testing.io, testing.allocator, .{ .url = try std.fmt.allocPrint(a, "postgres://certuser@localhost:{d}/{s}?sslmode=verify-full&sslrootcert={s}", .{ cfg.port, cfg.database, ca }), .max_connections = 1 });
     defer none.deinit();
     try testing.expectError(error.DbAuthFailed, none.ping());

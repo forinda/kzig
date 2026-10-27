@@ -42,9 +42,12 @@ jobs:
           printf "subjectAltName=DNS:localhost\n" > ext.cnf
           openssl x509 -req -in server.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 2 -out server.pem -extfile ext.cnf
           # Client certificates for a `certuser` that signs in by certificate.
-          for kind in ec rsa; do
-            if [ $kind = ec ]; then openssl ecparam -name prime256v1 -genkey -noout -out certuser-ec.key
-            else openssl genrsa -traditional -out certuser-rsa.key 2048; fi
+          for kind in ec rsa ed25519; do
+            case $kind in
+              ec) openssl ecparam -name prime256v1 -genkey -noout -out certuser-ec.key ;;
+              rsa) openssl genrsa -traditional -out certuser-rsa.key 2048 ;;
+              ed25519) openssl genpkey -algorithm ed25519 -out certuser-ed25519.key ;;
+            esac
             openssl req -new -key certuser-$kind.key -out certuser-$kind.csr -subj "/CN=certuser"
             openssl x509 -req -in certuser-$kind.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 2 -out certuser-$kind.pem
           done

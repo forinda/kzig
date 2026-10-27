@@ -278,11 +278,11 @@ pub const Conn = struct {
             const cwd = Io.Dir.cwd();
             const cert_pem = cwd.readFileAlloc(c.io, cert_path, ca, .limited(64 << 10)) catch |err| return tlsConfig("sslcert", cert_path, err);
             const key_pem = cwd.readFileAlloc(c.io, cfg.sslkey.?, ca, .limited(16 << 10)) catch |err| return tlsConfig("sslkey", cfg.sslkey.?, err);
-            break :blk .{
-                .chain = keys.parseChain(ca, cert_pem) catch |err| return tlsConfig("sslcert", cert_path, err),
-                .key = keys.PrivateKey.parsePem(ca, key_pem, cfg.sslpassword) catch |err| return tlsConfig("sslkey", cfg.sslkey.?, err),
-                .io = c.io,
-            };
+            const chain = keys.parseChain(ca, cert_pem) catch |err| return tlsConfig("sslcert", cert_path, err);
+            const key = keys.PrivateKey.parsePem(ca, key_pem, cfg.sslpassword) catch |err| return tlsConfig("sslkey", cfg.sslkey.?, err);
+            // libpq: a key that isn't the certificate's is a configuration error.
+            if (!(key.matches(chain[0]) catch false)) return tlsConfig("sslkey", cfg.sslkey.?, error.KeyDoesNotMatchCertificate);
+            break :blk .{ .chain = chain, .key = key, .io = c.io };
         } else null;
         defer if (client_auth) |*auth| std.crypto.secureZero(u8, std.mem.asBytes(&auth.key));
         var entropy: [tls.Client.Options.entropy_len]u8 = undefined;
