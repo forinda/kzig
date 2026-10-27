@@ -33,14 +33,18 @@ pub const Set = struct {
         return .{ .entries = entries.items };
     }
 
-    /// The certificate's issuer has a CRL here that lists its serial.
+    /// The certificate's issuer has a CRL here that lists its serial. No CRL
+    /// from its issuer is `error.CrlMissing`: as libpq (OpenSSL's CRL_CHECK_ALL),
+    /// a certificate that can't be checked isn't trusted.
     pub fn revoked(set: Set, cert_der: []const u8) !bool {
         const id = try certId(cert_der);
+        var found = false;
         for (set.entries) |e| {
             if (!std.mem.eql(u8, e.issuer, id.issuer)) continue;
+            found = true;
             for (e.serials) |s| if (std.mem.eql(u8, s, id.serial)) return true;
         }
-        return false;
+        return if (found) false else error.CrlMissing;
     }
 };
 
@@ -84,7 +88,7 @@ fn parseVerified(a: Allocator, crl: []const u8, cas: []const []const u8, now_sec
     if (tbs.peek() == 0x02) _ = try tbs.int(); // version
     _ = try tbs.next(0x30); // signature algorithm (again)
     const issuer = (try tbs.element(0x30)).raw;
-    _ = try time(&tbs); // thisUpdate
+    if (try time(&tbs) > now_sec) return error.CrlNotYetValid; // thisUpdate
     if (tbs.peek() == 0x17 or tbs.peek() == 0x18) {
         if (try time(&tbs) < now_sec) return error.CrlExpired;
     }
@@ -94,15 +98,42 @@ fn parseVerified(a: Allocator, crl: []const u8, cas: []const []const u8, now_sec
         while (revoked_list.peek() != null) {
             var entry: Der = .{ .buf = try revoked_list.next(0x30) };
             try serials.append(a, try entry.int());
+            _ = try time(&entry); // revocationDate
+            if (entry.peek() == 0x30) try noCritical(try entry.next(0x30));
         }
     }
+    // Critical extensions mark indirect, delta and partial CRLs, read
+    // differently: refused rather than read as a plain full CRL.
+    if (tbs.peek() == 0xA0) {
+        var exts: Der = .{ .buf = try tbs.next(0xA0) };
+        try noCritical(try exts.next(0x30));
+    }
 
-    // The CA whose subject is this CRL's issuer, and its signature.
-    const ca = for (cas) |c| {
-        if (std.mem.eql(u8, (try certId(c)).subject, issuer)) break c;
-    } else return error.CrlIssuerUnknown;
-    try verify(tbs_el.raw, sig_oid, signature, ca);
-    return .{ .issuer = issuer, .serials = serials.items };
+    // A CA whose subject is this CRL's issuer and whose key signed it (two
+    // with one name happen across a key rollover).
+    var last: anyerror = error.CrlIssuerUnknown;
+    for (cas) |c| {
+        if (!std.mem.eql(u8, (try certId(c)).subject, issuer)) continue;
+        verify(tbs_el.raw, sig_oid, signature, c) catch |err| {
+            last = err;
+            continue;
+        };
+        return .{ .issuer = issuer, .serials = serials.items };
+    }
+    return last;
+}
+
+/// Extensions (a SEQUENCE's contents): none marked critical.
+fn noCritical(exts: []const u8) !void {
+    var list: Der = .{ .buf = exts };
+    while (list.peek() != null) {
+        var ext: Der = .{ .buf = try list.next(0x30) };
+        _ = try ext.next(0x06);
+        if (ext.peek() == 0x01) {
+            const critical = try ext.next(0x01);
+            if (critical.len == 1 and critical[0] != 0) return error.UnsupportedCrl;
+        }
+    }
 }
 
 fn verify(msg: []const u8, sig_oid: []const u8, signature: []const u8, ca_der: []const u8) !void {
@@ -191,8 +222,8 @@ fn der(a: Allocator, comptime name: []const u8) ![]const u8 {
     return (try keys.parseChain(a, fixture(name)))[0];
 }
 
-/// 2026-10-27: after the test CRLs were issued, long before they lapse.
-const test_now: i64 = 1793102400;
+/// 2026-10-28 12:00 UTC: after the test CRLs were issued, long before they lapse.
+const test_now: i64 = 1793188800;
 
 test "CRLs load when their CA signed them, and list what they revoked" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
@@ -215,10 +246,38 @@ test "a CRL nobody here signed, a forged one, or a lapsed one is refused" {
     const ec_ca = [_][]const u8{try der(a, "ec-ca.pem")};
     try testing.expectError(error.CrlIssuerUnknown, Set.load(a, fixture("rsa-crl.pem"), &ec_ca, test_now));
     try testing.expectError(error.CrlExpired, Set.load(a, fixture("ec-crl-expired.pem"), &ec_ca, test_now));
-    // Flip a bit in the signed part.
+    // Change thisUpdate's last seconds digit: still well-formed, no longer signed.
     const crl_der = (try pemCrls(a, fixture("ec-crl.pem")))[0];
     const forged = try a.dupe(u8, crl_der);
-    forged[forged.len / 2] ^= 1;
+    forged[std.mem.find(u8, forged, &.{ 0x17, 0x0D }).? + 2 + 11] ^= 1;
     try testing.expectError(error.CrlSignatureInvalid, Set.loadDer(a, &.{forged}, &ec_ca, test_now));
     try testing.expectError(error.NoCrl, Set.load(a, "nothing", &ec_ca, test_now));
+}
+
+test "a certificate whose issuer has no CRL here can't be checked" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cas = [_][]const u8{try der(a, "rsa-ca.pem")};
+    const set = try Set.load(a, fixture("rsa-crl.pem"), &cas, test_now);
+    try testing.expectError(error.CrlMissing, set.revoked(try der(a, "ec-good.pem")));
+}
+
+test "a CRL not yet valid, or with a critical extension, is refused" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const ec_ca = [_][]const u8{try der(a, "ec-ca.pem")};
+    try testing.expectError(error.CrlNotYetValid, Set.load(a, fixture("ec-crl.pem"), &ec_ca, 0));
+    // An IssuingDistributionPoint (indirect, delta or partial CRLs) is critical.
+    try testing.expectError(error.UnsupportedCrl, Set.load(a, fixture("ec-crl-critical.pem"), &ec_ca, test_now));
+}
+
+test "two CAs with one name: the CRL's is the one whose key signed it" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cas = [_][]const u8{ try der(a, "ec-ca-rollover.pem"), try der(a, "ec-ca.pem") };
+    const set = try Set.load(a, fixture("ec-crl.pem"), &cas, test_now);
+    try testing.expect(try set.revoked(try der(a, "ec-revoked.pem")));
 }

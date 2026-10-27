@@ -417,13 +417,14 @@ after their exports.
 
 - [x] Ed25519 client keys (TLS 1.3); keys encrypted with scrypt or 3DES; `sslkey` checked against
       `sslcert`; RSA signatures blinded; channel binding to SHA-224-signed server certificates
-- [x] `sslcrl`: CRLs verified against their CA, every server certificate checked; CI revokes the
-      test server's certificate
+- [x] `sslcrl`: CRLs verified against their CA, every server certificate checked (one whose issuer
+      has no CRL is refused, as libpq); CI revokes the test server's certificate
 
 Not covered: Ed25519 client keys on TLS 1.2 (they sign the handshake itself, not a hash), channel
 binding to Ed25519-signed server certificates (no hash defined; Postgres can't bind them either),
-CRLs issued by an intermediate CA unless it's in `sslrootcert`, delta CRLs and fetching CRL
-distribution points.
+CRLs issued by an intermediate CA unless it's in `sslrootcert` (the chain then ends there, so the
+intermediate itself isn't checked against its root's CRL), delta and indirect CRLs (refused),
+issuer names matched byte for byte rather than canonically, and fetching CRL distribution points.
 
 ### Later
 

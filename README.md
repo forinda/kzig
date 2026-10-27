@@ -297,8 +297,9 @@ More of libpq's options:
   PEM; AES or 3DES) takes `sslpassword=`. A key that isn't the certificate's is refused before
   connecting.
 - `sslcrl=crl.pem`: revocation lists (PEM or DER), each verified against its CA in
-  `sslrootcert`; a server certificate they list is refused. A lapsed or unverifiable CRL is a
-  configuration error.
+  `sslrootcert`; a server certificate they list is refused, and so is one whose issuer has no CRL
+  there (as libpq). A lapsed, not-yet-valid or unverifiable CRL, or one with a critical extension
+  (indirect, delta), is a configuration error.
 
 Passwords: SCRAM (Postgres's default) never sends one. A server asking for a cleartext or MD5
 password gets one only over verified TLS (`verify-ca`/`verify-full`); for an old server on a

@@ -180,6 +180,7 @@ pub const InitError = error{
     TlsNoApplicationProtocol,
     /// kzig: a CRL lists one of the server's certificates.
     TlsCertificateRevoked,
+    TlsCertificateRevocationUnknown,
     /// kzig: a TLS 1.2 server asked for a client certificate.
     TlsClientAuthUnsupported,
     /// kzig: the certificate chain doesn't fit one record.
@@ -784,7 +785,11 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                             const subject = try subject_cert.parse();
                             // kzig: every certificate in the chain, against the CRLs.
                             if (options.crl) |set| {
-                                if (set.revoked(certd.buf) catch return error.TlsDecodeError) return error.TlsCertificateRevoked;
+                                const revoked = set.revoked(certd.buf) catch |err| return switch (err) {
+                                    error.CrlMissing => error.TlsCertificateRevocationUnknown,
+                                    else => error.TlsDecodeError,
+                                };
+                                if (revoked) return error.TlsCertificateRevoked;
                             }
                             if (cert_index == 0) {
                                 // kzig: tls-server-end-point, from the leaf's DER.

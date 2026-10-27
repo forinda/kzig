@@ -11,3 +11,6 @@ check a key matches its certificate), and keys encrypted with scrypt (PBES2) and
 
 `crl/`: an EC and an RSA test CA, certificates they issued (one revoked each), their CRLs, and an
 already-lapsed CRL.
+
+Also in `crl/`: a CRL with a critical extension (IssuingDistributionPoint), and a second CA with
+the EC CA's name but another key (a rollover).
