@@ -18,6 +18,7 @@ const adapter_mod = @import("adapter.zig");
 const openapi = @import("../openapi/openapi.zig");
 const ws = @import("../ws/ws.zig");
 const cron = @import("../cron/cron.zig");
+const db_snapshot = @import("../db/snapshot.zig");
 
 /// Injectable as `*const kzig.Process`.
 pub const Process = struct {
@@ -98,7 +99,7 @@ pub fn Plugin(comptime spec: anytype) type {
 /// `.default_version = 1`, `.health = true` (mounts `/health/live` and
 /// `/health/ready`).
 pub fn App(comptime spec: anytype) type {
-    checkFields(spec, &.{ "modules", "config", "api_prefix", "default_version", "health", "middleware", "contributors", "settings", "adapters", "plugins", "ws" }, "App");
+    checkFields(spec, &.{ "modules", "config", "api_prefix", "default_version", "health", "middleware", "contributors", "settings", "adapters", "plugins", "ws", "schema" }, "App");
     const plugins: []const type = opt(spec, "plugins", @as([]const type, &.{}));
     comptime var plugin_modules: []const type = &.{};
     comptime var plugin_adapters: []const type = &.{};
@@ -178,6 +179,15 @@ pub fn App(comptime spec: anytype) type {
         /// Each gateway's full path; runtimes upgrade requests to these.
         pub const ws_paths: []const []const u8 = ws.paths(gateways, ws_opts);
         pub const ws_options: ws.Options = ws_opts;
+        /// The `kzig.db.Schema` that `kzig db generate` writes migrations for.
+        pub const schema: ?type = if (@hasField(@TypeOf(spec), "schema")) spec.schema else null;
+
+        /// The schema's snapshot.json text, as kick/db writes it; owned by `gpa`.
+        pub fn snapshotJson(gpa: std.mem.Allocator) ![]const u8 {
+            var arena: std.heap.ArenaAllocator = .init(gpa);
+            defer arena.deinit();
+            return gpa.dupe(u8, try db_snapshot.toJson(arena.allocator(), db_snapshot.fromSchema(schema.?)));
+        }
         const cron_infos = cron.infosOf(cron_defs);
         const cron_exprs = cron.exprsOf(cron_defs);
 
@@ -200,6 +210,15 @@ pub fn App(comptime spec: anytype) type {
         pub fn initWith(self: *Self, io: std.Io, gpa: std.mem.Allocator, env: *const std.process.Environ.Map, overrides: anytype) !void {
             if (@typeInfo(@TypeOf(overrides)).@"struct".field_names.len > 0 and !builtin.is_test)
                 @compileError("App overrides are only allowed in tests");
+            // `kzig db generate` runs the app for its schema: print it, stop.
+            if (comptime schema != null and !builtin.is_test) if (env.get("KZIG_DB_SNAPSHOT") != null) {
+                const json = try snapshotJson(gpa);
+                var buf: [4096]u8 = undefined;
+                var out: std.Io.File.Writer = .init(.stdout(), io, &buf);
+                try out.interface.writeAll(json);
+                try out.interface.flush();
+                std.process.exit(0);
+            };
             // `self` is usually `undefined` before init: no field default applies.
             self.health_cache = .{};
             self.mounted = 0;
@@ -761,6 +780,15 @@ fn boot(app: *TestApp, pairs: []const [2][]const u8) !void {
     defer env.deinit();
     for (pairs) |p| try env.put(p[0], p[1]);
     try app.init(testing.io, testing.allocator, &env);
+}
+
+test "an App with a schema gives kzig db generate its snapshot" {
+    const db_schema = @import("../db/schema.zig");
+    const t = db_schema.table("notes", .{ .id = .{ .type = .serial, .primary_key = true } }, .{});
+    const A = App(.{ .modules = &.{}, .schema = db_schema.Schema(.{ .notes = t }, .{}) });
+    const json = try A.snapshotJson(testing.allocator);
+    defer testing.allocator.free(json);
+    try testing.expect(std.mem.startsWith(u8, json, "{\n  \"version\": 1,\n  \"dialect\": \"postgres\",\n  \"tables\": {\n    \"notes\""));
 }
 
 test "mounts under /api/v1 + module path" {

@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "dialect": "postgres",
+  "entries": [
+    {
+      "id": "20261015_231323_init",
+      "tag": "init",
+      "hash": "sha256:b7d788610f205090d8307364c199715eacc2efc6d772dc930312965dd6327170",
+      "createdAt": "2026-10-15T23:13:23.661Z"
+    }
+  ]
+}
