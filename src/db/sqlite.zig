@@ -42,6 +42,11 @@ pub const Conn = struct {
         conn.gpa.destroy(conn);
     }
 
+    /// The last error's text (tests' fake D1 answers with it).
+    pub fn lastError(conn: *Conn) []const u8 {
+        return std.mem.span(c.sqlite3_errmsg(conn.handle));
+    }
+
     /// Inside BEGIN … COMMIT.
     pub fn inTransaction(conn: *Conn) bool {
         return c.sqlite3_get_autocommit(conn.handle) == 0;

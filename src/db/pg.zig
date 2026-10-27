@@ -127,6 +127,8 @@ pub const ServerError = struct {
 pub const Error = error{
     /// The server refused the statement; see `Conn.last_error`.
     DbError,
+    /// More parameters than the database binds in one statement (D1: 100).
+    TooManyParameters,
     /// SQLSTATE 23505: a unique constraint (409 through the framework).
     Conflict,
     /// The connection broke; it is not reused.

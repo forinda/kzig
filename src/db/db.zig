@@ -79,18 +79,21 @@ const sqlite = if (has_sqlite) @import("sqlite.zig") else struct {
     pub const Conn = void;
 };
 const libsql = @import("libsql.zig");
+const d1 = @import("d1.zig");
 
 /// A connection of either driver.
 const Conn = union(enum) {
     pg: *pg.Conn,
     sqlite: *sqlite.Conn,
     libsql: *libsql.Session,
+    d1: *d1.Client,
 
     fn run(c: Conn, text: []const u8, params: []const ?[]const u8, ctx: anytype, comptime row: anytype) pg.Error!u64 {
         return switch (c) {
             .pg => |p| p.run(text, params, ctx, row),
             .sqlite => |s| if (!has_sqlite) unreachable else s.run(text, params, ctx, row),
             .libsql => |s| s.run(text, params, ctx, row),
+            .d1 => |s| s.run(text, params, ctx, row),
         };
     }
 
@@ -99,13 +102,14 @@ const Conn = union(enum) {
             .pg => |p| p.script(text),
             .sqlite => |s| if (!has_sqlite) unreachable else s.script(text),
             .libsql => |s| s.script(text),
+            .d1 => |s| s.script(text),
         };
     }
 
     fn dialect(c: Conn) Dialect {
         return switch (c) {
             .pg => .postgres,
-            .sqlite, .libsql => .sqlite,
+            .sqlite, .libsql, .d1 => .sqlite,
         };
     }
 };
@@ -118,7 +122,7 @@ const Conn = union(enum) {
 pub const Pool = struct {
     io: Io,
     gpa: Allocator,
-    driver: union(enum) { pg: pg.Config, sqlite: *sqlite.Conn, libsql: *libsql.Client },
+    driver: union(enum) { pg: pg.Config, sqlite: *sqlite.Conn, libsql: *libsql.Client, d1: *d1.Client },
     arena: std.heap.ArenaAllocator,
     mutex: Io.Mutex = .init,
     idle: std.ArrayList(*pg.Conn) = .empty,
@@ -130,6 +134,10 @@ pub const Pool = struct {
             if (!has_sqlite) return error.SqliteNotBuilt;
             const conn = try sqlite.Conn.open(gpa, o.url["sqlite:".len..]);
             return .{ .io = io, .gpa = gpa, .driver = .{ .sqlite = conn }, .arena = .init(gpa), .permits = .{ .permits = 1 }, .acquire_timeout_ms = o.acquire_timeout_ms };
+        }
+        if (std.mem.startsWith(u8, o.url, "d1://")) {
+            const client = try d1.Client.init(io, gpa, o.url);
+            return .{ .io = io, .gpa = gpa, .driver = .{ .d1 = client }, .arena = .init(gpa), .permits = .{ .permits = o.max_connections } };
         }
         for ([_][]const u8{ "libsql://", "https://", "http://" }) |scheme| if (std.mem.startsWith(u8, o.url, scheme)) {
             const client = try libsql.Client.init(io, gpa, o.url);
@@ -149,13 +157,14 @@ pub const Pool = struct {
         p.idle.deinit(p.gpa);
         if (p.driver == .sqlite) if (has_sqlite) p.driver.sqlite.close();
         if (p.driver == .libsql) p.driver.libsql.deinit();
+        if (p.driver == .d1) p.driver.d1.deinit();
         p.arena.deinit();
     }
 
     pub fn dialect(p: *const Pool) Dialect {
         return switch (p.driver) {
             .pg => .postgres,
-            .sqlite, .libsql => .sqlite,
+            .sqlite, .libsql, .d1 => .sqlite,
         };
     }
 
@@ -170,6 +179,7 @@ pub const Pool = struct {
         p.permits.wait(p.io) catch return error.ServiceUnavailable;
         errdefer p.permits.post(p.io);
         if (p.driver == .libsql) return .{ .libsql = try libsql.Session.open(p.driver.libsql) };
+        if (p.driver == .d1) return .{ .d1 = p.driver.d1 };
         const config = p.driver.pg;
         {
             p.mutex.lockUncancelable(p.io);
@@ -186,6 +196,7 @@ pub const Pool = struct {
             .sqlite => |s| if (has_sqlite and s.inTransaction()) s.script("ROLLBACK") catch {},
             // An open stream is closed (and its transaction with it).
             .libsql => |s| s.close(),
+            .d1 => {},
             .pg => |c| {
                 if (c.broken or c.tx_status != 'I') return c.close();
                 p.mutex.lockUncancelable(p.io);
@@ -235,6 +246,17 @@ pub const Pool = struct {
         return c.script(text);
     }
 
+    /// D1 only: statements in one transaction, all or none.
+    pub fn batch(p: *Pool, stmts: []const d1.Stmt) !void {
+        if (p.driver != .d1) return error.BatchUnsupported;
+        return p.driver.d1.batch(stmts);
+    }
+
+    /// Migrations go as batches (`batch`) instead of transactions.
+    pub fn batchOnly(p: *const Pool) bool {
+        return p.driver == .d1;
+    }
+
     /// `SELECT 1`: for `/health/ready`.
     pub fn ping(p: *Pool) !void {
         _ = try p.exec("SELECT 1", .{});
@@ -248,6 +270,8 @@ pub const Pool = struct {
     /// just after the transaction ends (SQLite's foreign_keys pragma does
     /// nothing inside one).
     pub fn beginWith(p: *Pool, around: struct { before: []const u8 = "", after: []const u8 = "" }) !Tx {
+        // D1 has batches (`batch`), not interactive transactions.
+        if (p.driver == .d1) return error.TransactionsUnsupported;
         const c = try p.acquire();
         errdefer p.release(c);
         // A remote SQLite keeps one stream for the transaction.
@@ -373,6 +397,7 @@ test {
     _ = pg;
     if (@import("kzig_options").sqlite) _ = @import("sqlite.zig");
     _ = @import("libsql.zig");
+    _ = @import("d1.zig");
 }
 
 /// `DATABASE_URL` for the tests that need a server; skipped without one.

@@ -287,6 +287,7 @@ pub fn rollback(pool: *db.Pool, a: Allocator, list: []const Migration, o: Option
 /// commits the rebuilt tables' keys are checked and their triggers, dropped
 /// with the old table, made again. As kick/db's SQLite adapter.
 fn applyOne(pool: *db.Pool, a: Allocator, id: []const u8, sql: []const u8, record: []const u8, args: anytype) !void {
+    if (pool.batchOnly()) return applyBatch(pool, a, id, sql, record, args);
     const rebuilt = if (pool.dialect() == .sqlite) try rebuiltTables(a, sql) else &.{};
     var triggers: []const []const u8 = &.{};
     if (rebuilt.len > 0) {
@@ -321,6 +322,74 @@ fn applyOne(pool: *db.Pool, a: Allocator, id: []const u8, sql: []const u8, recor
         };
     }
     try tx.commit();
+}
+
+/// D1 (kick/db's async adapter): the migration's statements, its rebuilt
+/// tables' triggers, its record and a foreign-key guard in one batch. Foreign
+/// keys can't be turned off there, so a rebuild or drop of a table others
+/// reference (its DROP would cascade) is refused before anything runs.
+fn applyBatch(pool: *db.Pool, a: Allocator, id: []const u8, sql: []const u8, record: []const u8, args: anytype) !void {
+    const d1 = @import("d1.zig");
+    const rebuilt = try rebuiltTables(a, sql);
+    try refuseCascadingRebuild(pool, a, id, sql, rebuilt);
+    var stmts: std.ArrayList(d1.Stmt) = .empty;
+    for (try d1.split(a, sql)) |s| try stmts.append(a, .{ .sql = s });
+    for (rebuilt) |t| for (try pool.query(a, struct { sql: []const u8 }, "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ?1", .{t})) |r|
+        try stmts.append(a, .{ .sql = r.sql });
+    try stmts.append(a, .{ .sql = record, .params = try @import("pg.zig").encodeArgs(a, args, .sqlite) });
+    if (rebuilt.len > 0) {
+        // Fails the batch (json() of a non-JSON string) when a rebuilt table
+        // is in a broken foreign key: SQLite has no raise() outside triggers.
+        var marks: std.ArrayList(u8) = .empty;
+        for (rebuilt, 1..) |_, i| try marks.print(a, "{s}?{d}", .{ if (i > 1) ", " else "", i });
+        try stmts.append(a, .{
+            .sql = try std.fmt.allocPrint(a, "SELECT CASE WHEN EXISTS (SELECT 1 FROM pragma_foreign_key_check WHERE \"table\" IN ({s}) OR \"parent\" IN ({s})) THEN json('not json') END", .{ marks.items, marks.items }),
+            .params = blk: {
+                const ps = try a.alloc(?[]const u8, rebuilt.len);
+                for (rebuilt, ps) |t, *x| x.* = t;
+                break :blk ps;
+            },
+        });
+    }
+    pool.batch(stmts.items) catch |err| {
+        if (!builtin.is_test) std.log.err("migration {s} failed; rolled back", .{id});
+        return err;
+    };
+}
+
+fn refuseCascadingRebuild(pool: *db.Pool, a: Allocator, id: []const u8, sql: []const u8, rebuilt: []const []const u8) !void {
+    // Tables dropped outright lose their rows before they go too.
+    var emptied: std.ArrayList([]const u8) = .empty;
+    try emptied.appendSlice(a, rebuilt);
+    var dropped: std.ArrayList([]const u8) = .empty;
+    var i: usize = 0;
+    while (std.mem.findPos(u8, sql, i, "DROP TABLE ")) |at| {
+        var j = at + "DROP TABLE ".len;
+        if (std.mem.startsWith(u8, sql[j..], "IF EXISTS ")) j += "IF EXISTS ".len;
+        i = j;
+        if (j >= sql.len or sql[j] != '"') continue;
+        const end = std.mem.findScalarPos(u8, sql, j + 1, '"') orelse break;
+        const name = sql[j + 1 .. end];
+        i = end;
+        if (std.mem.startsWith(u8, name, "_kick_new_") or contains(rebuilt, name)) continue;
+        try dropped.append(a, name);
+        try emptied.append(a, name);
+    }
+    if (emptied.items.len == 0) return;
+    const Name = struct { name: []const u8 };
+    for (try pool.query(a, Name, "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '\\_cf\\_%' ESCAPE '\\'", .{})) |t| {
+        if (contains(dropped.items, t.name)) continue;
+        const list = try std.fmt.allocPrint(a, "SELECT \"table\" AS name FROM pragma_foreign_key_list(?1)", .{});
+        for (try pool.query(a, Name, list, .{t.name})) |k| if (contains(emptied.items, k.name)) {
+            if (!builtin.is_test) std.log.err("migration {s} rebuilds or drops {s}, which {s} references: on D1 its DROP would run their ON DELETE (foreign keys are always on); make the change in steps that don't rebuild it", .{ id, k.name, t.name });
+            return error.RebuildOfReferencedTable;
+        };
+    }
+}
+
+fn contains(list: []const []const u8, x: []const u8) bool {
+    for (list) |y| if (std.mem.eql(u8, x, y)) return true;
+    return false;
 }
 
 /// The tables a migration rebuilds: `ALTER TABLE "_kick_new_<t>" RENAME TO`.
