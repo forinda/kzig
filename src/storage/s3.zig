@@ -271,7 +271,9 @@ pub const Options = struct {
     endpoint: ?[]const u8 = null,
     credentials: Credentials,
     force_path_style: ?bool = null,
-    /// A request whose answer hasn't arrived by then fails as unavailable.
+    /// The longest the bucket may stay silent (no answer, or a stalled
+    /// body) before the request fails as unavailable. A slow but moving
+    /// transfer isn't cut.
     timeout_ms: u32 = 30_000,
     /// A larger object isn't read into memory.
     max_object_bytes: usize = 256 * 1024 * 1024,
@@ -382,14 +384,47 @@ pub const S3 = struct {
     /// `body_into`. A bucket that can't be reached, doesn't answer within
     /// `timeout_ms` or breaks the connection is `error.ServiceUnavailable`.
     fn send(s: *S3, a: Allocator, body_into: Allocator, method: std.http.Method, key: ?[]const u8, query: []const [2][]const u8, body: ?[]const u8, content_type: ?[]const u8) !Reply {
-        return s.sendOnce(a, body_into, method, key, query, body, content_type) catch |err| switch (err) {
-            error.OutOfMemory, error.ObjectTooLarge => err,
-            else => {
-                if (!builtin.is_test) std.log.err("S3 {t} {s}: {t}", .{ method, key orelse "(bucket)", err });
-                return error.ServiceUnavailable;
-            },
+        return s.sendOnce(a, body_into, method, key, query, body, content_type) catch |err| {
+            if (!builtin.is_test) std.log.err("S3 {t} {s}: {t}", .{ method, key orelse "(bucket)", err });
+            return if (unreachableBucket(err)) error.ServiceUnavailable else err;
         };
     }
+
+    /// The network, not the request: worth a 503 and a retry. A bad
+    /// endpoint or certificate stays an error of its own (500).
+    fn unreachableBucket(err: anyerror) bool {
+        inline for (.{ "ConnectionRefused", "ConnectionResetByPeer", "ConnectionTimedOut", "NetworkUnreachable", "NetworkDown", "HostUnreachable", "UnknownHostName", "NameServerFailure", "TemporaryNameServerFailure", "HttpConnectionClosing", "ReadFailed", "WriteFailed", "EndOfStream", "BrokenPipe" }) |name| {
+            if (err == @field(anyerror, name)) return true;
+        }
+        return false;
+    }
+
+    /// Cuts the socket once the bucket has been silent for `ms`; `arm`
+    /// restarts the wait whenever something arrives.
+    const Watchdog = struct {
+        io: Io,
+        stream: Io.net.Stream,
+        ms: u32,
+        deadline: std.atomic.Value(i64) = .init(std.math.maxInt(i64)),
+        fired: std.atomic.Value(bool) = .init(false),
+
+        fn arm(w: *Watchdog) void {
+            w.deadline.store(@as(i64, @intCast(@divTrunc(Io.Clock.awake.now(w.io).toNanoseconds(), std.time.ns_per_ms))) + w.ms, .release);
+        }
+
+        fn watch(w: *Watchdog) Io.Cancelable!void {
+            while (true) {
+                const now: i64 = @intCast(@divTrunc(Io.Clock.awake.now(w.io).toNanoseconds(), std.time.ns_per_ms));
+                const left = w.deadline.load(.acquire) - now;
+                if (left <= 0) {
+                    w.fired.store(true, .release);
+                    w.stream.shutdown(w.io, .both) catch {};
+                    return;
+                }
+                try w.io.sleep(.fromMilliseconds(@min(left, 50)), .awake);
+            }
+        }
+    };
 
     // ponytail: the timeout covers the request once connected; connecting
     // to an address that drops packets waits for the OS (Io.Threaded can't
@@ -431,16 +466,27 @@ pub const S3 = struct {
             .extra_headers = headers.items,
         });
         defer req.deinit();
-        // Cut the socket when time is up: whatever was waiting fails.
-        var watchdog = if (s.timeout_ms > 0) s.io.concurrent(cut, .{ s.io, req.connection.?.stream_reader.stream, s.timeout_ms }) catch null else null;
-        defer if (watchdog) |*w| w.cancel(s.io) catch {};
+        var dog: Watchdog = .{ .io = s.io, .stream = req.connection.?.stream_reader.stream, .ms = s.timeout_ms };
+        dog.arm();
+        var watching = if (s.timeout_ms > 0) s.io.concurrent(Watchdog.watch, .{&dog}) catch |err| blk: {
+            if (!builtin.is_test) std.log.warn("S3: no timeout for this request: {t}", .{err});
+            break :blk null;
+        } else null;
+        // Runs before `req.deinit`: a socket the watchdog cut, even after
+        // the answer was read, never goes back to the pool.
+        defer {
+            if (watching) |*w| w.cancel(s.io) catch {};
+            if (dog.fired.load(.acquire)) req.connection.?.closing = true;
+        }
         errdefer req.connection.?.closing = true;
         if (body) |b| {
             req.transfer_encoding = .{ .content_length = b.len };
             try req.sendBodyComplete(@constCast(b));
         } else try req.sendBodiless();
+        dog.arm();
         var redirect: [1024]u8 = undefined;
         var response = try req.receiveHead(&redirect);
+        dog.arm();
         var reply: Reply = .{
             .status = response.head.status,
             .content_type = if (response.head.content_type) |ct| try a.dupe(u8, ct) else null,
@@ -458,18 +504,23 @@ pub const S3 = struct {
             req.reader.state = .ready;
         } else if (method != .HEAD) {
             if ((reply.content_length orelse 0) > s.max_object_bytes) return error.ObjectTooLarge;
+            // Only a success is the caller's; an error body is scratch.
+            var out: std.Io.Writer.Allocating = .init(if (ok(reply.status)) body_into else a);
+            errdefer out.deinit();
             var transfer: [8192]u8 = undefined;
-            reply.body = response.reader(&transfer).allocRemaining(body_into, .limited(s.max_object_bytes)) catch |err| switch (err) {
-                error.StreamTooLong => return error.ObjectTooLarge,
-                else => |e| return e,
-            };
+            const rd = response.reader(&transfer);
+            while (true) {
+                _ = rd.stream(&out.writer, .limited(64 * 1024)) catch |err| switch (err) {
+                    error.EndOfStream => break,
+                    error.WriteFailed => return error.OutOfMemory,
+                    error.ReadFailed => |e| return e,
+                };
+                if (out.written().len > s.max_object_bytes) return error.ObjectTooLarge;
+                dog.arm();
+            }
+            reply.body = try out.toOwnedSlice();
         }
         return reply;
-    }
-
-    fn cut(io: Io, stream: Io.net.Stream, ms: u32) Io.Cancelable!void {
-        try io.sleep(.fromMilliseconds(ms), .awake);
-        stream.shutdown(io, .both) catch {};
     }
 
     /// A non-2xx answer, logged with S3's message: 5xx is the bucket being
@@ -974,4 +1025,51 @@ test "temporary credentials: the session token is signed, as a header and in lin
     var other: S3 = try .init(testing.io, testing.allocator, .{ .bucket = "b", .endpoint = fake.endpoint(&buf), .credentials = creds });
     defer other.deinit();
     try testing.expectError(error.S3RequestFailed, other.storage().put("t.txt", "x", .{}));
+}
+
+fn slowBody(server: *Io.net.Server) !void {
+    const conn = try server.accept(testing.io);
+    defer conn.close(testing.io);
+    var buf: [4096]u8 = undefined;
+    var r = conn.reader(testing.io, &buf);
+    while (true) {
+        const line = try r.interface.takeDelimiterInclusive('\n');
+        if (std.mem.trimEnd(u8, line, "\r\n").len == 0) break;
+    }
+    var wbuf: [256]u8 = undefined;
+    var w = conn.writer(testing.io, &wbuf);
+    try w.interface.writeAll("HTTP/1.1 200 OK\r\ncontent-length: 8\r\n\r\n");
+    try w.interface.flush();
+    // A byte every 100 ms: slow, never idle for the timeout.
+    for ("trickled") |c| {
+        try testing.io.sleep(.fromMilliseconds(100), .awake);
+        try w.interface.writeByte(c);
+        try w.interface.flush();
+    }
+}
+
+test "the timeout is for silence, not for a slow transfer" {
+    const address = try Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try address.listen(testing.io, .{ .reuse_address = true });
+    defer server.deinit(testing.io);
+    var fut = try testing.io.concurrent(slowBody, .{&server});
+    defer _ = fut.await(testing.io) catch {};
+    var buf: [64]u8 = undefined;
+    const endpoint = try std.fmt.bufPrint(&buf, "http://127.0.0.1:{d}", .{server.socket.address.getPort()});
+    var s3: S3 = try .init(testing.io, testing.allocator, .{ .bucket = "b", .endpoint = endpoint, .credentials = example, .timeout_ms = 300 });
+    defer s3.deinit();
+    const body = (try s3.storage().get(testing.allocator, "slow")).?;
+    defer testing.allocator.free(body);
+    try testing.expectEqualStrings("trickled", body);
+}
+
+test "a miss leaves nothing in the caller's allocator" {
+    var fake: Fake = undefined;
+    try fake.start();
+    defer fake.stop();
+    var buf: [64]u8 = undefined;
+    var s3: S3 = try .init(testing.io, testing.allocator, .{ .bucket = "b", .endpoint = fake.endpoint(&buf), .credentials = example });
+    defer s3.deinit();
+    // testing.allocator: a leaked error body fails the test.
+    try testing.expectEqual(null, try s3.storage().get(testing.allocator, "missing"));
 }

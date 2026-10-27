@@ -262,8 +262,15 @@ pub const Disk = struct {
                     };
                     break :blk try dir.openDir(d.io, part, .{ .follow_symlinks = false });
                 },
-                // A link (or a file where a folder should be).
-                error.SymLinkLoop, error.NotDir => return error.InvalidKey,
+                // A link, or a file where a folder should be: O_NOFOLLOW
+                // can't tell them apart, so look.
+                error.SymLinkLoop, error.NotDir => {
+                    const st = try dir.statFile(d.io, part, .{ .follow_symlinks = false });
+                    if (st.kind == .sym_link or create) return error.InvalidKey;
+                    // No file under a file (KickJS: ENOTDIR is missing).
+                    dir.close(d.io);
+                    return null;
+                },
                 else => return err,
             };
             dir.close(d.io);
@@ -311,7 +318,7 @@ pub const Disk = struct {
         defer root.close(d.io);
         var parent = try d.parentOf(root, key, false) orelse return null;
         defer parent.close(d.io);
-        const file = parent.openFile(d.io, std.fs.path.basenamePosix(key), .{ .follow_symlinks = false }) catch |err| switch (err) {
+        const file = parent.openFile(d.io, std.fs.path.basenamePosix(key), .{ .follow_symlinks = false, .allow_directory = false }) catch |err| switch (err) {
             error.FileNotFound, error.IsDir => return null,
             error.SymLinkLoop => return error.InvalidKey,
             else => return err,
@@ -494,4 +501,22 @@ test "disk lists a key that ends in .tmp; only its own temporary files are hidde
     const page = try d.storage().list(arena.allocator(), .{});
     try testing.expectEqual(1, page.files.len);
     try testing.expectEqualStrings("notes.tmp", page.files[0].key);
+}
+
+test "disk: a folder or a path through a file is no file (null), as in KickJS" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer testing.allocator.free(root);
+    var d: Disk = .{ .io = testing.io, .root = root };
+    const s = d.storage();
+    try s.put("docs/a.txt", "a", .{});
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqual(null, try s.get(a, "docs"));
+    try testing.expectEqual(null, try s.stat(a, "docs"));
+    try testing.expectEqual(null, try s.get(a, "docs/a.txt/x"));
+    try testing.expectEqual(null, try s.stat(a, "docs/a.txt/x"));
+    try s.delete("docs/a.txt/x");
 }
