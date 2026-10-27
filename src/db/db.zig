@@ -256,6 +256,7 @@ test {
     _ = diff;
     _ = emit_pg;
     _ = generate;
+    _ = @import("relational.zig");
     _ = pg;
 }
 

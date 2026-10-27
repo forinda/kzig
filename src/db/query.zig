@@ -5,6 +5,7 @@ const std = @import("std");
 const schema = @import("schema.zig");
 const Timestamp = @import("timestamp.zig").Timestamp;
 const pg = @import("pg.zig");
+const relational = @import("relational.zig");
 const dbm = @import("db.zig");
 
 const Allocator = std.mem.Allocator;
@@ -43,6 +44,12 @@ pub fn Client(comptime S: type) type {
 
         pub fn deleteFrom(self: Self, comptime t: S.Tag) Delete(S, @tagName(t), void, null) {
             return .{ .conn = self.conn, .wheres = {} };
+        }
+
+        /// kick/db's `db.query.<table>`: `findMany`, `findFirst`, `findUnique`
+        /// with `columns`, `where`, `orderBy`, `limit`, `offset` and `with`.
+        pub fn query(self: Self, comptime t: S.Tag) relational.Relational(S, @tagName(t)) {
+            return .{ .conn = self.conn };
         }
 
         /// kick/db's `upsert`: insert, or update the row whose `target` key
@@ -101,16 +108,16 @@ pub fn Client(comptime S: type) type {
 
 // ---- writing SQL
 
-const Writer = struct {
+pub const Writer = struct {
     a: Allocator,
     buf: std.ArrayList(u8) = .empty,
     params: std.ArrayList(?[]const u8) = .empty,
 
-    fn raw(w: *Writer, s: []const u8) !void {
+    pub fn raw(w: *Writer, s: []const u8) !void {
         try w.buf.appendSlice(w.a, s);
     }
 
-    fn ident(w: *Writer, s: []const u8) !void {
+    pub fn ident(w: *Writer, s: []const u8) !void {
         try w.buf.append(w.a, '"');
         for (s) |ch| {
             if (ch == '"') try w.buf.append(w.a, '"');
@@ -119,18 +126,25 @@ const Writer = struct {
         try w.buf.append(w.a, '"');
     }
 
-    fn param(w: *Writer, v: anytype) !void {
+    pub fn param(w: *Writer, v: anytype) !void {
         try w.params.append(w.a, try pg.encodeValue(w.a, v));
         try w.buf.print(w.a, "${d}", .{w.params.items.len});
     }
 
-    fn done(w: *Writer) Sql {
+    pub fn done(w: *Writer) Sql {
         return .{ .sql = w.buf.items, .params = w.params.items };
     }
 };
 
 /// What unqualified column names mean while rendering.
-const Scope = struct { S: type, from: []const u8, qualify: bool };
+pub const Scope = struct {
+    S: type,
+    from: []const u8,
+    qualify: bool,
+    /// The table's alias in this statement (relational reads): its columns
+    /// are written `"alias"."col"`.
+    alias: ?[]const u8 = null,
+};
 
 const ColRef = struct {
     table: []const u8,
@@ -139,6 +153,7 @@ const ColRef = struct {
     Z: type,
     nullable: bool,
     qualified: bool,
+    alias: ?[]const u8 = null,
 };
 
 fn tableTag(comptime S: type, comptime declared: []const u8) ?[]const u8 {
@@ -164,6 +179,7 @@ fn resolveCol(comptime sc: Scope, comptime ref: []const u8) ColRef {
             .Z = schema.ZigType(def.type),
             .nullable = col.nullable,
             .qualified = sc.qualify or dot != null,
+            .alias = if (dot == null) sc.alias else null,
         };
         @compileError(info.name ++ ": no column " ++ key);
     }
@@ -174,7 +190,10 @@ fn zigName(comptime Z: type) []const u8 {
 }
 
 fn writeCol(w: *Writer, comptime r: ColRef) !void {
-    if (r.qualified) {
+    if (r.alias) |al| {
+        try w.ident(al);
+        try w.raw(".");
+    } else if (r.qualified) {
         try w.ident(r.table);
         try w.raw(".");
     }
@@ -477,7 +496,7 @@ fn opExpr(comptime col: anytype, comptime op: Op, value: anytype) OpExpr(col, op
 
 // ---- running
 
-fn runRows(conn: Conn, a: Allocator, comptime Row: type, q: Sql) ![]Row {
+pub fn runRows(conn: Conn, a: Allocator, comptime Row: type, q: Sql) ![]Row {
     return switch (conn) {
         .pool => |p| p.queryParams(a, Row, q.sql, q.params),
         .tx => |t| t.queryParams(a, Row, q.sql, q.params),

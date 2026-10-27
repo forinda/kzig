@@ -591,6 +591,11 @@ fn decodeValue(comptime F: type, a: Allocator, value: ?[]const u8) !F {
     if (F == []const u8) return try a.dupe(u8, v);
     if (F == std.json.Value) return std.json.parseFromSliceLeaky(std.json.Value, a, v, .{ .allocate = .alloc_always }) catch error.DbDecode;
     if (@typeInfo(F) == .@"struct" and @hasDecl(F, "fromPg")) return F.fromPg(v);
+    // A relational read's nested row(s): JSON from to_json / json_agg.
+    if (@typeInfo(F) == .@"struct" or (@typeInfo(F) == .pointer and @typeInfo(F).pointer.size == .slice)) {
+        const j = std.json.parseFromSliceLeaky(std.json.Value, a, v, .{ .allocate = .alloc_always }) catch return error.DbDecode;
+        return fromJson(F, a, j);
+    }
     return switch (@typeInfo(F)) {
         .int => std.fmt.parseInt(F, v, 10) catch error.DbDecode,
         .float => std.fmt.parseFloat(F, v) catch error.DbDecode,
@@ -598,6 +603,50 @@ fn decodeValue(comptime F: type, a: Allocator, value: ?[]const u8) !F {
         .@"enum" => std.meta.stringToEnum(F, v) orelse error.DbDecode,
         else => @compileError("db: a column can't be read into " ++ @typeName(F) ++ " (strings, ints, floats, bools, enums, optionals)"),
     };
+}
+
+/// A JSON value (nested rows) as `F`: the same types rows read into.
+pub fn fromJson(comptime F: type, a: Allocator, v: std.json.Value) !F {
+    if (F == std.json.Value) return v;
+    switch (@typeInfo(F)) {
+        .optional => |o| return if (v == .null) null else try fromJson(o.child, a, v),
+        .bool => return if (v == .bool) v.bool else error.DbDecode,
+        .int => return switch (v) {
+            .integer => |i| std.math.cast(F, i) orelse error.DbDecode,
+            .number_string, .string => |s| std.fmt.parseInt(F, s, 10) catch error.DbDecode,
+            else => error.DbDecode,
+        },
+        .float => return switch (v) {
+            .integer => |i| @floatFromInt(i),
+            .float => |f| @floatCast(f),
+            .number_string, .string => |s| std.fmt.parseFloat(F, s) catch error.DbDecode,
+            else => error.DbDecode,
+        },
+        .@"enum" => return if (v == .string) (std.meta.stringToEnum(F, v.string) orelse error.DbDecode) else error.DbDecode,
+        .pointer => |p| {
+            if (F == []const u8) return switch (v) {
+                .string, .number_string => |s| s,
+                // numeric columns come out of to_json as numbers
+                .integer => |i| try std.fmt.allocPrint(a, "{d}", .{i}),
+                .float => |f| try std.fmt.allocPrint(a, "{d}", .{f}),
+                else => error.DbDecode,
+            };
+            if (p.size != .slice or v != .array) return error.DbDecode;
+            const out = try a.alloc(p.child, v.array.items.len);
+            for (v.array.items, out) |x, *o| o.* = try fromJson(p.child, a, x);
+            return out;
+        },
+        .@"struct" => |info| {
+            if (@hasDecl(F, "fromJsonValue")) return F.fromJsonValue(v) orelse error.DbDecode;
+            if (v != .object) return error.DbDecode;
+            var out: F = undefined;
+            inline for (info.field_names, info.field_types) |name, T| {
+                @field(out, name) = if (v.object.get(name)) |x| try fromJson(T, a, x) else if (@typeInfo(T) == .optional) null else return error.DbDecode;
+            }
+            return out;
+        },
+        else => @compileError("db: a nested row can't hold " ++ @typeName(F)),
+    }
 }
 
 /// A query's arguments (a tuple) as text parameters, in `a`.

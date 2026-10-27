@@ -131,6 +131,7 @@ const compile_errors = [_][2][]const u8{
     .{ "db_relation_no_inverse", "users.posts: no one back from posts and no single foreign key to users" },
     .{ "db_relation_alias", "users.name: a relation can't share a column's name" },
     .{ "db_relation_option", "posts.author: no option .refs" },
+    .{ "db_with_unknown_relation", "users: no relation posts" },
     .{ "db_enum_default", "t.r: default \"zzz\" is not a value of role" },
     .{ "unknown_module_option", "Module has no option .paths" },
     .{ "module_path_without_slash", "M: module path must be empty or start with '/'" },
