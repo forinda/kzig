@@ -35,6 +35,9 @@ const usage =
     \\      Builds and runs the app; rebuilds and restarts it when src/ or
     \\      build.zig changes (NODE_ENV=development unless set).
     \\
+    \\  kzig add swagger|httpz
+    \\      Wires a feature in: Swagger UI and /openapi.json, or the http.zig runtime.
+    \\
     \\  kzig build [-- <zig build args>]
     \\      zig build -Doptimize=ReleaseSafe.
     \\
@@ -224,6 +227,11 @@ fn run(cli: Cli, flags: Flags) !void {
         try requireProject(cli);
         return dev.run(cli.io, cli.gpa, cli.arena, cli.environ, cli.out, .{ .bin = flags.bin, .args = flags.rest });
     }
+    if (std.mem.eql(u8, cmd, "add")) {
+        if (p.len != 2) return error.Usage;
+        try requireProject(cli);
+        return add(cli, p[1]);
+    }
     if (std.mem.eql(u8, cmd, "build")) {
         if (p.len != 1) return error.Usage;
         try requireProject(cli);
@@ -344,6 +352,74 @@ fn newProject(cli: Cli, flags: Flags, raw: []const u8) !void {
         \\  kzig g module task
         \\
     , .{dir});
+}
+
+/// A text replacement in a file `kzig new` wrote.
+const Patch = struct { path: []const u8, anchor: []const u8, with: []const u8 };
+
+/// A format string: `{s}` is the title.
+const swagger_block =
+    \\    // /openapi.json, /docs, /redoc — development and test only.
+    \\    .plugins = &.{{kzig.swagger.Plugin(.{{
+    \\        .info = .{{ .title = "{s}", .version = "0.0.1" }},
+    \\        .disable_in_prod = true,
+    \\    }})}},
+    \\
+;
+
+const httpz_import =
+    \\    // http.zig is a lazy dependency of kzig: absent on the first pass.
+    \\    if (kzig.builder.modules.get("kzig_httpz")) |httpz| mod.addImport("kzig_httpz", httpz);
+    \\
+    \\
+;
+
+/// KickJS's `kick add`: a feature wired into the project.
+fn add(cli: Cli, feature: []const u8) !void {
+    const main_zig = try cli.cwd.readFileAlloc(cli.io, "src/main.zig", cli.arena, .limited(1 << 20));
+    var patches: []const Patch = undefined;
+    if (std.mem.eql(u8, feature, "swagger")) {
+        if (std.mem.find(u8, main_zig, "kzig.swagger.Plugin") != null) {
+            cli.print("swagger is already added (src/main.zig)\n", .{});
+            return;
+        }
+        const title = try dev.binName(cli.io, cli.arena, cli.cwd) orelse "api";
+        const block = try std.fmt.allocPrint(cli.arena, swagger_block, .{title});
+        if (std.mem.find(u8, main_zig, ".plugins") != null) {
+            cli.fail("src/main.zig has its own .plugins; add this to the list yourself:\n{s}", .{block});
+            return error.Exists;
+        }
+        const anchor = "pub const App = kzig.App(.{\n";
+        patches = &.{.{ .path = "src/main.zig", .anchor = anchor, .with = try std.mem.concat(cli.arena, u8, &.{ anchor, block }) }};
+    } else if (std.mem.eql(u8, feature, "httpz")) {
+        if (std.mem.find(u8, main_zig, "@import(\"kzig_httpz\")") != null) {
+            cli.print("httpz is already added (src/main.zig)\n", .{});
+            return;
+        }
+        patches = &.{
+            .{ .path = "build.zig", .anchor = "b.dependency(\"kzig\", .{ .target = target, .optimize = optimize })", .with = "b.dependency(\"kzig\", .{ .target = target, .optimize = optimize, .httpz = true })" },
+            .{ .path = "build.zig", .anchor = "    const exe = b.addExecutable(", .with = httpz_import ++ "    const exe = b.addExecutable(" },
+            .{ .path = "src/main.zig", .anchor = "kzig.runtime.std.serve(App,", .with = "@import(\"kzig_httpz\").serve(App," },
+        };
+    } else {
+        cli.fail("kzig add {s}: features are swagger and httpz\n", .{feature});
+        return error.Exists;
+    }
+    // Every anchor first, so a project that moved away from the template
+    // is left as it was.
+    for (patches) |patch| {
+        const source = try cli.cwd.readFileAlloc(cli.io, patch.path, cli.arena, .limited(1 << 20));
+        if (std.mem.count(u8, source, patch.anchor) != 1) {
+            cli.fail("{s} doesn't have `{s}` (once) as `kzig new` wrote it; change it yourself to:\n{s}\n", .{ patch.path, std.mem.trim(u8, patch.anchor, " \n"), patch.with });
+            return error.Exists;
+        }
+    }
+    for (patches) |patch| {
+        const source = try cli.cwd.readFileAlloc(cli.io, patch.path, cli.arena, .limited(1 << 20));
+        const updated = try std.mem.replaceOwned(u8, cli.arena, source, patch.anchor, patch.with);
+        try cli.cwd.writeFile(cli.io, .{ .sub_path = patch.path, .data = updated });
+        cli.print("  update {s}\n", .{patch.path});
+    }
 }
 
 /// KickJS's `kick build`: a release build (ReleaseSafe keeps safety checks).

@@ -248,7 +248,7 @@ Follow-ups:
 
 - [x] `kzig dev`: rebuild and restart on change; a failed build keeps the running app
 - [x] `kzig build` (ReleaseSafe) / `kzig start` (execs the app, `NODE_ENV=production`)
-- [ ] Generators for DTO-only, guards, tests; `kzig add <feature>` (swagger, http.zig runtime)
+- [x] `kzig g dto|guard|test`; `kzig add swagger|httpz`
 - [ ] Prebuilt `kzig` binaries in releases
 - [x] Errors to stderr; `kzig --help` / `kzig help` exit 0
 - [x] Generated list endpoint: 400 for filter operators it doesn't support (today they match all)

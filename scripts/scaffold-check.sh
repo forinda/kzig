@@ -88,6 +88,24 @@ kill -TERM $START
 wait $START
 grep -q "draining" start.log
 
+step "kzig add swagger and httpz"
+"$KZIG" add swagger | grep -q "already"
+edit '/\/\/ \/openapi.json/,/})},/d' src/main.zig
+if grep -q swagger src/main.zig; then echo "swagger block not removed" >&2; exit 1; fi
+"$KZIG" add swagger
+grep -q "kzig.swagger.Plugin" src/main.zig
+fails "$KZIG" add nonsense
+"$KZIG" add httpz
+"$KZIG" add httpz | grep -q "already"
+zig build test
+"$KZIG" build
+"$KZIG" start --port 39813 > start.log 2>&1 &
+START=$!
+waitfor 30 curl -sf localhost:39813/api/v1/hello
+kill -TERM $START
+wait $START
+grep -q "http.zig" start.log
+
 step "kzig g module note --minimal"
 "$KZIG" g module note --minimal
 zig build test
