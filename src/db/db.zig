@@ -469,6 +469,32 @@ test "TLS: verify-full against the server's CA and name; a wrong name or CA is r
     try testing.expect(!(try plain.queryOne(a, Ssl, on, .{})).?.ssl);
 }
 
+test "TLS: a client certificate signs in (EC and RSA keys); without one the server refuses" {
+    var env: std.process.Environ.Map = undefined;
+    const url = testUrl(&env) catch |err| {
+        if (err == error.SkipZigTest) env.deinit();
+        return err;
+    };
+    defer env.deinit();
+    const ca = env.get("PG_TEST_ROOTCERT") orelse return error.SkipZigTest;
+    // certuser-{ec,rsa}.{pem,key}, for a `hostssl all certuser all cert` rule.
+    const dir = env.get("PG_TEST_CERT_DIR") orelse return error.SkipZigTest;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cfg = try pg.Config.parse(a, url);
+    for ([_][]const u8{ "ec", "rsa" }) |kind| {
+        const cert_url = try std.fmt.allocPrint(a, "postgres://certuser@localhost:{d}/{s}?sslmode=verify-full&sslrootcert={s}&sslcert={s}/certuser-{s}.pem&sslkey={s}/certuser-{s}.key", .{ cfg.port, cfg.database, ca, dir, kind, dir, kind });
+        var db: Pool = try .init(testing.io, testing.allocator, .{ .url = cert_url, .max_connections = 1 });
+        defer db.deinit();
+        const who = (try db.queryOne(a, struct { u: []const u8 }, "SELECT current_user::text AS u", .{})).?;
+        try testing.expectEqualStrings("certuser", who.u);
+    }
+    var none: Pool = try .init(testing.io, testing.allocator, .{ .url = try std.fmt.allocPrint(a, "postgres://certuser@localhost:{d}/{s}?sslmode=verify-full&sslrootcert={s}", .{ cfg.port, cfg.database, ca }), .max_connections = 1 });
+    defer none.deinit();
+    try testing.expectError(error.DbAuthFailed, none.ping());
+}
+
 test "Timestamp round-trips through timestamptz and timestamp" {
     var env: std.process.Environ.Map = undefined;
     const url = testUrl(&env) catch |err| {

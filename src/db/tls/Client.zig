@@ -15,6 +15,15 @@ const assert = std.debug.assert;
 const Certificate = std.crypto.Certificate;
 const Reader = std.Io.Reader;
 const Writer = std.Io.Writer;
+const keys = @import("keys.zig");
+
+/// kzig: a client certificate chain (leaf first, DER) and its private key,
+/// for a server that asks (TLS 1.3 only).
+pub const ClientAuth = struct {
+    chain: []const []const u8,
+    key: keys.PrivateKey,
+    io: std.Io,
+};
 
 const max_ciphertext_len = tls.max_ciphertext_len;
 const hmacExpandLabel = tls.hmacExpandLabel;
@@ -122,6 +131,9 @@ pub const Options = struct {
     },
     write_buffer: []u8,
     read_buffer: []u8,
+    /// kzig: the certificate to answer a CertificateRequest with; without it
+    /// an empty Certificate is sent (the server decides whether that's enough).
+    client_auth: ?ClientAuth = null,
     /// kzig: an ALPN protocol to offer (`postgresql` for direct TLS). The
     /// server must select it; a TLS 1.2 server can't (`error.TlsNoApplicationProtocol`).
     alpn: ?[]const u8 = null,
@@ -162,6 +174,12 @@ pub const Options = struct {
 pub const InitError = error{
     /// kzig: `alpn` was offered and the server didn't select it.
     TlsNoApplicationProtocol,
+    /// kzig: a TLS 1.2 server asked for a client certificate.
+    TlsClientAuthUnsupported,
+    /// kzig: the certificate chain doesn't fit one record.
+    TlsClientCertTooLarge,
+    /// kzig: the private key couldn't sign.
+    TlsClientAuthFailed,
     InsufficientEntropy,
     DiskQuota,
     LockViolation,
@@ -363,6 +381,10 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
     var alpn_selected = false;
     var end_point: [64]u8 = undefined;
     var end_point_len: u8 = 0;
+    var cert_requested = false;
+    var req_ctx: [255]u8 = undefined;
+    var req_ctx_len: usize = 0;
+    var scheme_ok = false;
     var handshake_cipher: tls.HandshakeCipher = undefined;
     var main_cert_pub_key: CertificatePublicKey = undefined;
     var tls12_negotiated_group: ?tls.NamedGroup = null;
@@ -607,6 +629,36 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                             },
                             else => return error.TlsIllegalParameter,
                         }
+                    },
+                    // kzig: the server wants a client certificate.
+                    .certificate_request => {
+                        if (tls_version != .tls_1_3) return error.TlsClientAuthUnsupported;
+                        if (cipher_state != .handshake or handshake_state != .certificate) return error.TlsUnexpectedMessage;
+                        switch (handshake_cipher) {
+                            inline else => |*p| p.transcript_hash.update(wrapped_handshake),
+                        }
+                        try hsd.ensure(1);
+                        const ctx_len = hsd.decode(u8);
+                        try hsd.ensure(ctx_len);
+                        @memcpy(req_ctx[0..ctx_len], hsd.slice(ctx_len));
+                        req_ctx_len = ctx_len;
+                        try hsd.ensure(2);
+                        var exts = try hsd.sub(hsd.decode(u16));
+                        while (!exts.eof()) {
+                            try exts.ensure(4);
+                            const et = exts.decode(u16);
+                            var extd = try exts.sub(exts.decode(u16));
+                            if (et != @backingInt(tls.ExtensionType.signature_algorithms)) continue;
+                            const ca = options.client_auth orelse continue;
+                            try extd.ensure(2);
+                            const list_len = extd.decode(u16);
+                            try extd.ensure(list_len);
+                            var i: usize = 0;
+                            while (i + 2 <= list_len) : (i += 2) {
+                                if (extd.decode(u16) == @backingInt(ca.key.scheme())) scheme_ok = true;
+                            }
+                        }
+                        cert_requested = true;
                     },
                     .encrypted_extensions => {
                         if (tls_version != .tls_1_3) return error.TlsUnexpectedMessage;
@@ -916,27 +968,37 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                     p.transcript_hash.update(wrapped_handshake);
                                     const expected_server_verify_data = tls.hmac(P.Hmac, &finished_digest, pv.server_finished_key);
                                     if (!std.crypto.timing_safe.eql([P.Hmac.mac_length]u8, expected_server_verify_data, hsd.array(P.Hmac.mac_length).*)) return error.TlsDecryptError;
-                                    const handshake_hash = p.transcript_hash.finalResult();
-                                    const verify_data = tls.hmac(P.Hmac, &handshake_hash, pv.client_finished_key);
-                                    const out_cleartext = .{@backingInt(tls.HandshakeType.finished)} ++
-                                        array(u24, u8, verify_data) ++
-                                        .{@backingInt(tls.ContentType.handshake)};
+                                    // Application secrets come from the transcript through the server's Finished.
+                                    const handshake_hash = p.transcript_hash.peek();
+                                    // kzig: Certificate and CertificateVerify when asked for,
+                                    // then Finished, in one record (handshake sequence 0).
+                                    var clear: [tls.max_ciphertext_inner_record_len]u8 = undefined;
+                                    var clear_len: usize = 0;
+                                    if (cert_requested) clear_len = try clientAuthMessages(&clear, &p.transcript_hash, options.client_auth, scheme_ok, req_ctx[0..req_ctx_len]);
+                                    const fin_hash = p.transcript_hash.peek();
+                                    const verify_data = tls.hmac(P.Hmac, &fin_hash, pv.client_finished_key);
+                                    const fin = .{@backingInt(tls.HandshakeType.finished)} ++ array(u24, u8, verify_data);
+                                    if (clear_len + fin.len + 1 > clear.len) return error.TlsClientCertTooLarge;
+                                    @memcpy(clear[clear_len..][0..fin.len], &fin);
+                                    clear_len += fin.len;
+                                    clear[clear_len] = @backingInt(tls.ContentType.handshake);
+                                    clear_len += 1;
 
-                                    const wrapped_len = out_cleartext.len + P.AEAD.tag_length;
-
-                                    var finished_msg = .{@backingInt(tls.ContentType.application_data)} ++
-                                        int(u16, @backingInt(tls.ProtocolVersion.tls_1_2)) ++
-                                        array(u16, u8, @as([wrapped_len]u8, undefined));
-
+                                    var finished_buf: [@as(usize, tls.record_header_len) + tls.max_ciphertext_inner_record_len + P.AEAD.tag_length]u8 = undefined;
+                                    const wrapped_len = clear_len + P.AEAD.tag_length;
+                                    finished_buf[0] = @backingInt(tls.ContentType.application_data);
+                                    mem.writeInt(u16, finished_buf[1..3], @backingInt(tls.ProtocolVersion.tls_1_2), .big);
+                                    mem.writeInt(u16, finished_buf[3..5], @intCast(wrapped_len), .big);
+                                    const finished_msg = finished_buf[0 .. tls.record_header_len + wrapped_len];
                                     const ad = finished_msg[0..tls.record_header_len];
-                                    const ciphertext = finished_msg[tls.record_header_len..][0..out_cleartext.len];
-                                    const auth_tag = finished_msg[finished_msg.len - P.AEAD.tag_length ..];
+                                    const ciphertext = finished_msg[tls.record_header_len..][0..clear_len];
+                                    const auth_tag = finished_msg[finished_msg.len - P.AEAD.tag_length ..][0..P.AEAD.tag_length];
                                     const nonce = pv.client_handshake_iv;
-                                    P.AEAD.encrypt(ciphertext, auth_tag, &out_cleartext, ad, nonce, pv.client_handshake_key);
+                                    P.AEAD.encrypt(ciphertext, auth_tag, clear[0..clear_len], ad, nonce, pv.client_handshake_key);
 
                                     var all_msgs_vec: [2][]const u8 = .{
                                         &client_change_cipher_spec_msg,
-                                        &finished_msg,
+                                        finished_msg,
                                     };
                                     try output.writeVecAll(&all_msgs_vec);
                                     try output.flush();
@@ -1666,6 +1728,49 @@ const CertificatePublicKey = struct {
         }
     }
 };
+
+/// kzig: TLS 1.3 client authentication (RFC 8446 §4.4.2-4.4.3): a
+/// Certificate (empty without `auth`, or when the server takes none of our
+/// key's schemes) and, with a certificate, a CertificateVerify over the
+/// transcript so far. Both join the transcript. Returns the bytes written.
+fn clientAuthMessages(out: []u8, transcript: anytype, auth: ?ClientAuth, scheme_ok: bool, context: []const u8) !usize {
+    var w: Writer = .fixed(out);
+    const send = if (auth) |a| scheme_ok and a.chain.len > 0 else false;
+    var list_len: usize = 0;
+    if (send) for (auth.?.chain) |der| {
+        list_len += 3 + der.len + 2;
+    };
+    const body_len = 1 + context.len + 3 + list_len;
+    w.writeByte(@backingInt(tls.HandshakeType.certificate)) catch return error.TlsClientCertTooLarge;
+    w.writeInt(u24, @intCast(body_len), .big) catch return error.TlsClientCertTooLarge;
+    w.writeByte(@intCast(context.len)) catch return error.TlsClientCertTooLarge;
+    w.writeAll(context) catch return error.TlsClientCertTooLarge;
+    w.writeInt(u24, @intCast(list_len), .big) catch return error.TlsClientCertTooLarge;
+    if (send) for (auth.?.chain) |der| {
+        w.writeInt(u24, @intCast(der.len), .big) catch return error.TlsClientCertTooLarge;
+        w.writeAll(der) catch return error.TlsClientCertTooLarge;
+        w.writeInt(u16, 0, .big) catch return error.TlsClientCertTooLarge;
+    };
+    transcript.update(w.buffered());
+    if (!send) return w.end;
+
+    // The signed content: 64 spaces, the context string, 0, the transcript hash.
+    const digest = transcript.peek();
+    var content: [64 + 34 + digest.len]u8 = undefined;
+    @memset(content[0..64], 0x20);
+    @memcpy(content[64..][0..34], "TLS 1.3, client CertificateVerify\x00");
+    @memcpy(content[98..], &digest);
+    var sig_buf: [keys.max_signature_len]u8 = undefined;
+    const sig = auth.?.key.sign(auth.?.io, &content, &sig_buf) catch return error.TlsClientAuthFailed;
+    const start = w.end;
+    w.writeByte(@backingInt(tls.HandshakeType.certificate_verify)) catch return error.TlsClientCertTooLarge;
+    w.writeInt(u24, @intCast(2 + 2 + sig.len), .big) catch return error.TlsClientCertTooLarge;
+    w.writeInt(u16, @backingInt(auth.?.key.scheme()), .big) catch return error.TlsClientCertTooLarge;
+    w.writeInt(u16, @intCast(sig.len), .big) catch return error.TlsClientCertTooLarge;
+    w.writeAll(sig) catch return error.TlsClientCertTooLarge;
+    transcript.update(out[start..w.end]);
+    return w.end;
+}
 
 fn tryDownloadRootCert(chain: *Certificate.Chain, options: *const Options) !void {
     if (Certificate.Chain != void) switch (options.ca) {

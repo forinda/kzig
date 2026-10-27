@@ -5,6 +5,7 @@ const std = @import("std");
 const tls = struct {
     const Client = @import("tls/Client.zig");
 };
+const keys = @import("tls/keys.zig");
 const builtin = @import("builtin");
 const Timestamp = @import("timestamp.zig").Timestamp;
 
@@ -43,6 +44,10 @@ pub const Config = struct {
     /// PEM file of the CAs to trust (`verify-ca`, `verify-full`); the
     /// system's when null.
     sslrootcert: ?[]const u8 = null,
+    /// A client certificate chain (PEM, leaf first) and its key, for a server
+    /// that authenticates clients by certificate (pg_hba `cert`).
+    sslcert: ?[]const u8 = null,
+    sslkey: ?[]const u8 = null,
     /// `insecure_auth=true`: answer a cleartext or MD5 password request on
     /// an unverified connection (an old server); off, that's `error.InsecureAuth`.
     insecure_auth: bool = false,
@@ -77,6 +82,10 @@ pub const Config = struct {
                     c.channel_binding = std.meta.stringToEnum(ChannelBinding, pair["channel_binding=".len..]) orelse return error.InvalidDatabaseUrl;
                 } else if (std.mem.eql(u8, pair, "insecure_auth=true")) {
                     c.insecure_auth = true;
+                } else if (std.mem.startsWith(u8, pair, "sslcert=")) {
+                    c.sslcert = pair["sslcert=".len..];
+                } else if (std.mem.startsWith(u8, pair, "sslkey=")) {
+                    c.sslkey = pair["sslkey=".len..];
                 } else if (std.mem.startsWith(u8, pair, "sslrootcert=")) {
                     c.sslrootcert = pair["sslrootcert=".len..];
                 } else if (std.mem.startsWith(u8, pair, "application_name=")) {
@@ -84,6 +93,7 @@ pub const Config = struct {
                 }
             }
         }
+        if ((c.sslcert == null) != (c.sslkey == null)) return error.InvalidDatabaseUrl;
         // libpq: direct TLS can't fall back to plaintext.
         if (c.sslnegotiation == .direct and (c.sslmode == .disable or c.sslmode == .allow or c.sslmode == .prefer))
             return error.InvalidDatabaseUrl;
@@ -250,6 +260,20 @@ pub const Conn = struct {
                     return error.TlsConfig;
                 };
         }
+        // The client certificate, read for this handshake only.
+        var cert_arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer cert_arena.deinit();
+        const client_auth: ?tls.Client.ClientAuth = if (cfg.sslcert) |cert_path| blk: {
+            const ca = cert_arena.allocator();
+            const cwd = Io.Dir.cwd();
+            const cert_pem = cwd.readFileAlloc(c.io, cert_path, ca, .limited(1 << 20)) catch |err| return tlsConfig("sslcert", cert_path, err);
+            const key_pem = cwd.readFileAlloc(c.io, cfg.sslkey.?, ca, .limited(1 << 20)) catch |err| return tlsConfig("sslkey", cfg.sslkey.?, err);
+            break :blk .{
+                .chain = keys.parseChain(ca, cert_pem) catch |err| return tlsConfig("sslcert", cert_path, err),
+                .key = keys.PrivateKey.parsePem(ca, key_pem) catch |err| return tlsConfig("sslkey", cfg.sslkey.?, err),
+                .io = c.io,
+            };
+        } else null;
         var entropy: [tls.Client.Options.entropy_len]u8 = undefined;
         c.io.random(&entropy);
         c.tls = tls.Client.init(&c.reader.interface, &c.writer.interface, .{
@@ -259,6 +283,7 @@ pub const Conn = struct {
             .os_roots = plan.os_roots,
             // Direct TLS: the server only accepts it with ALPN `postgresql`.
             .alpn = if (cfg.sslnegotiation == .direct) "postgresql" else null,
+            .client_auth = client_auth,
             .ca = if (verify) .{ .bundle = .{ .gpa = c.gpa, .io = c.io, .lock = &lock, .bundle = &bundle } } else .no_verification,
             .read_buffer = &c.tls_rbuf,
             .write_buffer = &c.tls_wbuf,
@@ -272,6 +297,11 @@ pub const Conn = struct {
             return error.TlsHandshakeFailed;
         };
         c.tls_verified = verify;
+    }
+
+    fn tlsConfig(what: []const u8, path: []const u8, err: anyerror) error{TlsConfig} {
+        if (!builtin.is_test) std.log.err("postgres: {s} {s}: {t}", .{ what, path, err });
+        return error.TlsConfig;
     }
 
     fn isIp(host: []const u8) bool {
