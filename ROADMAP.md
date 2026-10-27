@@ -78,6 +78,7 @@ after M6.
 | libpq sends a cleartext or MD5 password whenever the server asks | Only over verified TLS (`verify-ca`/`verify-full`), else `error.InsecureAuth`; `insecure_auth=true` for old servers | A man in the middle can ask for either |
 | `verify-ca` against `sslrootcert=system` is refused by libpq | `verify-ca` without `sslrootcert` checks the host too (verify-full) | The system's CAs vouch for anyone's certificate |
 | `sslmode=allow` tries plaintext first | Treated as `prefer` (TLS first) | Encrypt when possible |
+| libpq links OpenSSL | std's TLS client, vendored with what Postgres needs | No C dependency |
 | A DB adapter always reports health | `onHealthCheck` may return null; no database configured, nothing on `/health/ready` | task-api runs without a database |
 
 Kept for parity even where Zig would allow otherwise: route middleware runs **after** validation.
@@ -399,8 +400,17 @@ after their exports.
 - [x] CI runs every database test over TLS (a throwaway CA) and checks verify-full, a wrong host
       and a wrong CA
 
-Not covered: SCRAM channel binding (`SCRAM-SHA-256-PLUS`), client certificates
-(`sslcert`/`sslkey`), `sslnegotiation=direct`.
+### M18 — Postgres TLS: direct, channel binding, client certificates
+
+- [x] `src/db/tls/Client.zig`: std's TLS client, vendored with ALPN, the server certificate's
+      hash, client authentication, SNI without host verification and no OS-store fallback
+- [x] `sslnegotiation=direct` (Postgres 17, ALPN `postgresql`)
+- [x] SCRAM-SHA-256-PLUS (`tls-server-end-point`); `channel_binding=disable|prefer|require`
+- [x] `sslcert`/`sslkey`: EC P-256/P-384 and RSA (RSA-PSS) keys in SEC1, PKCS#8 or PKCS#1 PEM;
+      an empty Certificate when asked and none is configured
+- [x] CI: a `cert` pg_hba user signs in with EC and RSA certificates, refused without one
+
+Not covered: encrypted private keys, client certificates on TLS 1.2, Ed25519 keys, CRLs.
 
 ### Later
 

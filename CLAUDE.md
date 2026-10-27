@@ -68,7 +68,8 @@ src/
   db/                  # db.zig (Pool, Tx), pg.zig (Postgres protocol, SCRAM), migrate.zig,
                        # schema.zig (tables), query.zig (builder), timestamp.zig,
                        # snapshot.zig, diff.zig, emit_pg.zig, generate.zig (kzig db generate),
-                       # relational.zig (query(.t).findMany with `with`)
+                       # relational.zig (query(.t).findMany with `with`), tls/ (std's TLS client
+                       # vendored with ALPN, channel binding, client certs; keys.zig)
   cli/                 # The `kzig` CLI: main.zig, dev.zig, names, templates/*.tpl, registry
 examples/task-api/     # The one example app; grows each milestone
 benchmarks/            # bench.zig servers + run.sh against KickJS

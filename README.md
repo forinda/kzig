@@ -283,6 +283,17 @@ clear. As in libpq, `require` with an `sslrootcert` checks the chain; unlike it,
 against the system's CAs checks the host name too, since any public certificate would pass
 otherwise. SNI names the host in every mode.
 
+More of libpq's options:
+
+- `sslnegotiation=direct` (Postgres 17): TLS from the first byte, without the SSLRequest round
+  trip; needs `sslmode=require` or stronger.
+- `channel_binding=prefer` (default) signs in with SCRAM-SHA-256-PLUS over TLS when the server
+  offers it, tying the sign-in to the server's certificate; `require` refuses anything else,
+  `disable` turns it off.
+- `sslcert=client.pem&sslkey=client.key`: a client certificate for a server that authenticates
+  by certificate (pg_hba `cert`). Keys: EC P-256/P-384 (SEC1 or PKCS#8) or RSA (PKCS#1 or
+  PKCS#8, signed with RSA-PSS); not encrypted.
+
 Passwords: SCRAM (Postgres's default) never sends one. A server asking for a cleartext or MD5
 password gets one only over verified TLS (`verify-ca`/`verify-full`); for an old server on a
 trusted network, `insecure_auth=true` allows it.
