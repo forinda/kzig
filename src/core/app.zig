@@ -211,7 +211,9 @@ pub fn App(comptime spec: anytype) type {
             if (@typeInfo(@TypeOf(overrides)).@"struct".field_names.len > 0 and !builtin.is_test)
                 @compileError("App overrides are only allowed in tests");
             // `kzig db generate` runs the app for its schema: print it, stop.
-            if (comptime schema != null and !builtin.is_test) if (env.get("KZIG_DB_SNAPSHOT") != null) {
+            if (!builtin.is_test) if (env.get("KZIG_DB_SNAPSHOT") != null) {
+                // No schema: say so and stop, rather than start serving.
+                if (comptime schema == null) std.process.exit(3);
                 const json = try snapshotJson(gpa);
                 var buf: [4096]u8 = undefined;
                 var out: std.Io.File.Writer = .init(.stdout(), io, &buf);
