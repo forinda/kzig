@@ -7,9 +7,8 @@ built on `comptime` instead of decorators, so a missing service or an unknown ha
 
 > **Status: pre-alpha.** Modules, compile-time DI, config and settings sections, middleware,
 > context contributors, typed and validated request bodies, list queries, adapters, plugins,
-> health checks, graceful shutdown, an HTTP server on `std.http` and an in-process test runtime
-> work (M1–M5). An http.zig runtime (M6) is next. APIs will change. See the
-> [roadmap](./ROADMAP.md).
+> health checks, graceful shutdown, two HTTP runtimes (`std.http`, and http.zig opt-in) and an
+> in-process test runtime work (M1–M6). APIs will change. See the [roadmap](./ROADMAP.md).
 
 Requires **Zig 0.17.0**. No dependencies.
 
@@ -263,6 +262,29 @@ Paths are percent-decoded per segment; `.` / `..` (also behind an encoded `/`), 
 UTF-8 and malformed escapes answer 400. A request with both `content-length` and
 `transfer-encoding` is refused and the connection closed.
 
+## Runtimes
+
+`kzig.runtime.std` (no dependencies) is the default. [http.zig](https://github.com/karlseguin/http.zig)
+is opt-in, KickJS's `runtime:` option in Zig:
+
+```zig
+// build.zig
+const kzig = b.dependency("kzig", .{ .target = target, .optimize = optimize, .httpz = true });
+exe.root_module.addImport("kzig_httpz", kzig.module("kzig_httpz"));
+
+// main.zig
+try @import("kzig_httpz").serve(App, &app, init.io, init.gpa, .{ .port = 3000 });
+```
+
+Both pass the same socket-level conformance suite; http.zig's known differences are listed in the
+roadmap. Against KickJS on Express, on one machine (see [benchmarks](./benchmarks)):
+
+| route | kzig std | kzig http.zig | KickJS / Express |
+| --- | ---: | ---: | ---: |
+| `GET /api/v1/hello` (minimal-api) | 115,930 req/s | 124,032 req/s | 5,292 req/s |
+| `GET /api/v1/json` | 74,808 req/s | 138,609 req/s | 9,296 req/s |
+| `POST /api/v1/validate` | 103,002 req/s | 58,799 req/s | 9,487 req/s |
+
 ## Coming from KickJS
 
 | KickJS | kzig |
@@ -281,6 +303,7 @@ UTF-8 and malformed escapes answer 400. A request with both `content-length` and
 | `defineAdapter({ beforeMount, onHealthCheck, … })` | a struct with those decls in `.adapters` |
 | `definePlugin({ modules, adapters, … })` | `kzig.Plugin(.{ … })` in `.plugins` |
 | `app.shutdown()` on SIGTERM | `kzig.runtime.std.serve(…)` + `defer app.deinit()` |
+| `bootstrap({ runtime: fastifyRuntime() })` | `@import("kzig_httpz").serve(…)` (`-Dhttpz`) |
 | `@Post('/', { body: zodSchema })` / `ctx.body` | `got: struct { body: CreateProject }` |
 | `ctx.qs(config)` / `ctx.paginate(…)` | `got.query: kzig.ListQuery(config)` / `query.paginate(…)` |
 | `defineSettings('FEATURES', schema)` | a struct with `pub const prefix = "FEATURES"` |

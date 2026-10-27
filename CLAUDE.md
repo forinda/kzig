@@ -29,7 +29,9 @@ table.
 
 ```bash
 zig build              # Build
-zig build test         # Run all tests
+zig build test         # Run all tests (std runtime)
+zig build test -Dhttpz # …plus the http.zig runtime (fetches http.zig)
+zig build bench -Dhttpz -Doptimize=ReleaseFast && ./benchmarks/run.sh
 zig fmt build.zig src examples tests              # Format
 zig fmt --check build.zig build.zig.zon src examples tests      # Check formatting
 zig build --watch      # Rebuild on change
@@ -54,9 +56,12 @@ src/
   middleware.zig       # Next chain; re-exports the built-ins
   middleware/          # requestId, requestLogger, cors, helmet
   runtime/std.zig      # std.http.Server engine
-  runtime/httpz.zig    # http.zig engine (M6)
+  runtime/httpz.zig    # http.zig engine (module kzig_httpz, -Dhttpz)
+  runtime/conformance.zig # Socket behaviour every runtime must pass
+  runtime/wire.zig     # Response rules every runtime applies
   testing.zig          # In-process runtime and assertions
 examples/task-api/     # The one example app; grows each milestone
+benchmarks/            # bench.zig servers + run.sh against KickJS
 tests/compile_errors/  # Fixtures that must fail to compile (listed in build.zig)
 ```
 

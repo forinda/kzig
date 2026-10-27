@@ -18,4 +18,4 @@ jobs:
         with:
           version: 0.17.0
       - run: zig fmt --check build.zig build.zig.zon src examples tests
-      - run: zig build test -Doptimize=${{ matrix.optimize }} --summary all
+      - run: zig build test -Dhttpz -Doptimize=${{ matrix.optimize }} --summary all

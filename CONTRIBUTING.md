@@ -39,7 +39,7 @@ the reference; a deliberate difference is listed in the roadmap.
 3. Run the checks:
 
    ```bash
-   zig build test
+   zig build test -Dhttpz
    zig fmt --check build.zig build.zig.zon src examples tests
    ```
 

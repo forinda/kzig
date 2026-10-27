@@ -9,8 +9,9 @@ its apps' behaviour and tests are ported, module by module, into one example app
 [`examples/task-api`](./examples/task-api), which grows with each milestone. Files keep KickJS's
 layout (`hello.module.zig`, `hello.controller.zig`, …).
 
-Engines come in this order: the standard library (`std.http.Server` on `std.Io`) first,
-[http.zig](https://github.com/karlseguin/http.zig) second, anything else is decided after that.
+Engines: the standard library (`std.http.Server` on `std.Io`) is the default and the reference;
+[http.zig](https://github.com/karlseguin/http.zig) is optional (`-Dhttpz`); anything else is decided
+after M6.
 
 ## Principles
 
@@ -186,10 +187,21 @@ Follow-ups:
 
 ### M6 — http.zig runtime
 
-- [ ] `kzig.runtime.httpz` behind the same seam, through its `dispatch` hook
-- [ ] The whole suite runs on both runtimes
-- [ ] Benchmark both runtimes against KickJS on Express and Fastify
-- [ ] **Acceptance:** every ported example passes on both runtimes
+- [x] `kzig_httpz` (built with `-Dhttpz`; a lazy dependency) behind the same `Server` / `serve`
+      surface, through http.zig's `handle` takeover
+- [x] One conformance suite (`runtime/conformance.zig`) over a real socket, run by both runtimes;
+      response rules shared in `runtime/wire.zig`; in-process tests (task-api included) are
+      engine-free
+- [x] Benchmark both runtimes against KickJS on Express (`benchmarks/`): 10–20× KickJS
+- [x] **Acceptance:** conformance passes on both runtimes, with http.zig's differences declared
+
+Follow-ups:
+
+- [ ] http.zig: a 431 for an oversized head is lost to a reset (declared difference)
+- [ ] http.zig: pipelined requests in one packet are dropped after the first
+- [ ] http.zig: requests in flight aren't cut at `shutdown_timeout_ms`
+- [ ] Benchmark with a load generator that isn't the bottleneck (wrk/oha, separate machine), and
+      against Fastify, before choosing a default between std and http.zig
 
 ### Later — decided after M6
 
