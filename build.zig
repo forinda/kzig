@@ -86,6 +86,7 @@ const examples = [_][]const u8{"task-api"};
 const compile_errors = [_][2][]const u8{
     .{ "missing_service", "repo: no service" },
     .{ "upload_and_body", "reads both 'body' and 'upload'" },
+    .{ "bad_cron", "invalid cron expression \"61 * * * *\"" },
     .{ "pointer_to_non_service", "alloc: no service" },
     .{ "field_without_default", "count needs a default or a service type" },
     .{ "dependency_cycle", "dependency cycle: " },

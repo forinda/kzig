@@ -17,6 +17,7 @@ const decode = @import("decode.zig");
 const adapter_mod = @import("adapter.zig");
 const openapi = @import("openapi.zig");
 const ws = @import("ws.zig");
+const cron = @import("cron.zig");
 
 /// Injectable as `*const kzig.Process`.
 pub const Process = struct {
@@ -120,7 +121,13 @@ pub fn App(comptime spec: anytype) type {
     const modules: []const type = di.unique(plugin_modules ++ @as([]const type, spec.modules)) ++
         (if (opt(spec, "health", true)) &[_]type{health.Module} else &[_]type{});
 
+    // Services, controllers and adapters may declare `pub const crons`.
+    comptime var job_hosts: []const type = adapters;
+    inline for (modules) |M| job_hosts = job_hosts ++ M.services ++ M.controllers;
+    const cron_defs = cron.defs(di.unique(job_hosts));
+
     comptime var section_list: []const type = &.{Config};
+    if (cron_defs.len > 0) section_list = section_list ++ &[_]type{cron.Settings};
     section_list = section_list ++ plugin_settings ++ opt(spec, "settings", @as([]const type, &.{}));
     inline for (modules) |M| section_list = section_list ++ M.settings;
     inline for (adapters) |A| {
@@ -128,7 +135,7 @@ pub fn App(comptime spec: anytype) type {
     }
     const sections = di.unique(section_list);
 
-    comptime var listed: []const type = sections ++ &[_]type{ Process, ConfigReport, health.Probe } ++ adapters;
+    comptime var listed: []const type = sections ++ &[_]type{ Process, ConfigReport, health.Probe, cron.Jobs } ++ adapters;
     comptime var adapter_contributors: []const type = plugin_contributors;
     inline for (adapters) |A| {
         if (@hasDecl(A, "contributors")) adapter_contributors = adapter_contributors ++ contributor.types(A.contributors, @typeName(A));
@@ -171,6 +178,8 @@ pub fn App(comptime spec: anytype) type {
         /// Each gateway's full path; runtimes upgrade requests to these.
         pub const ws_paths: []const []const u8 = ws.paths(gateways, ws_opts);
         pub const ws_options: ws.Options = ws_opts;
+        const cron_infos = cron.infosOf(cron_defs);
+        const cron_exprs = cron.exprsOf(cron_defs);
 
         pub const routes: []const router.Route = buildRoutes(Self, modules, api_prefix, default_version, .{ global_contributors, adapter_contributors });
         const Routes = router.Router(routes);
@@ -225,7 +234,14 @@ pub fn App(comptime spec: anytype) type {
             const process: Process = .{ .io = io, .gpa = gpa, .started_at = std.Io.Clock.awake.now(io), .dev_or_test = config.devOrTest(env) };
             self.ws_hub = .{ .io = io, .gpa = gpa, .opts = ws_opts };
             const probe: health.Probe = .{ .app = self, .checks = healthChecks };
-            try self.container.initWith(values ++ .{ process, ConfigReport{ .vars = origins.items }, probe } ++ overrides);
+            var jobs: cron.Jobs = .{ .io = io, .gpa = gpa, .infos = &cron_infos, .exprs = &cron_exprs, .app = self, .call = callCron, .allowed = cronAllowed, .report = reportCron };
+            if (cron_defs.len > 0) {
+                const settings: cron.Settings = values[comptime std.mem.findScalar(type, sections, cron.Settings).?];
+                jobs.scheduling = settings.enabled;
+                try jobs.load(settings.zoneinfo);
+            }
+            errdefer jobs.deinit();
+            try self.container.initWith(values ++ .{ process, ConfigReport{ .vars = origins.items }, probe, jobs } ++ overrides);
             errdefer self.container.deinit();
 
             // KickJS boot order, after services are built: beforeMount,
@@ -248,6 +264,8 @@ pub fn App(comptime spec: anytype) type {
         /// Adapter `shutdown` in reverse dependency order, then services'
         /// `deinit`. Not for an app whose `init` failed (that cleaned up).
         pub fn deinit(self: *Self) void {
+            // Jobs use services and adapters: they finish first.
+            self.get(cron.Jobs).deinit();
             self.shutdownAdapters();
             self.ws_hub.deinit();
             self.container.deinit();
@@ -257,9 +275,34 @@ pub fn App(comptime spec: anytype) type {
         /// Shutdown has begun: health answers `draining`.
         pub fn beginDrain(self: *Self) void {
             self.get(Process).draining.store(true, .release);
+            self.get(cron.Jobs).stop();
             if (gateways.len == 0) return;
             self.ws_hub.stopHeartbeat();
             inline for (gateways, 0..) |G, i| ws.drain(G, self.get(G), &self.ws_hub, i);
+        }
+
+        fn callCron(ptr: *anyopaque, index: usize, run: cron.Run) anyerror!void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            inline for (cron_defs, 0..) |D, i| if (i == index) {
+                const r = @field(D.S, D.handler)(self.get(D.S), run);
+                if (@typeInfo(@TypeOf(r)) == .error_union) try r;
+                return;
+            };
+        }
+
+        fn cronAllowed(ptr: *anyopaque, index: usize) bool {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            inline for (cron_defs, 0..) |D, i| if (i == index) {
+                return if (@hasDecl(D.S, "cronEnabled")) self.get(D.S).cronEnabled(D.info.name) else true;
+            };
+            return true;
+        }
+
+        fn reportCron(ptr: *anyopaque, err: anyerror, info: cron.ErrorInfo) void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            inline for (adapters) |A| {
+                if (@hasDecl(A, "onCronError")) self.get(A).onCronError(err, info);
+            }
         }
 
         /// The gateway for an upgrade request's path.
@@ -326,6 +369,7 @@ pub fn App(comptime spec: anytype) type {
 
         /// The server is listening: adapter `afterStart`.
         pub fn started(self: *Self, info: adapter_mod.StartInfo) void {
+            self.get(cron.Jobs).start();
             if (gateways.len > 0) self.ws_hub.startHeartbeat();
             inline for (adapters) |A| {
                 if (@hasDecl(A, "afterStart")) self.get(A).afterStart(info);

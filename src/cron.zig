@@ -1,6 +1,7 @@
 //! KickJS's `@Cron` (croner underneath): cron expressions, next-run times in
 //! a job's timezone, and the scheduler an App runs from `started`.
 const std = @import("std");
+const builtin = @import("builtin");
 
 /// A parsed expression: one bit per allowed value of each field.
 pub const Expr = struct {
@@ -319,6 +320,248 @@ pub const Rule = struct {
     };
 };
 
+pub const Trigger = enum { schedule, init, manual };
+
+/// What a job's handler gets (KickJS `CronRun`).
+pub const Run = struct {
+    name: []const u8,
+    expression: []const u8,
+    trigger: Trigger,
+    /// Unix seconds.
+    fired_at: i64,
+    /// Freed when the run ends.
+    arena: std.mem.Allocator,
+};
+
+/// For adapters' `onCronError(err, info)` (KickJS: `onError` with `source: 'cron'`).
+pub const ErrorInfo = struct { job: []const u8, expression: []const u8, trigger: Trigger };
+
+pub const Result = struct { ran: usize, failed: usize };
+
+/// `CRON_ENABLED` (false: this process schedules nothing, e.g. on all
+/// replicas but one), `CRON_ZONEINFO`.
+pub const Settings = struct {
+    pub const prefix = "CRON";
+    enabled: bool = true,
+    zoneinfo: []const u8 = "/usr/share/zoneinfo",
+};
+
+pub const Info = struct {
+    name: []const u8,
+    expression: []const u8,
+    description: ?[]const u8 = null,
+    timezone: ?[]const u8 = null,
+    run_on_init: bool = false,
+    /// Off (KickJS's default): a run while the last is going is skipped.
+    overlap: bool = false,
+};
+
+pub const Def = struct { S: type, handler: []const u8, info: Info };
+
+/// Every `pub const crons = .{ .{ .expression, .handler, … } }` of `hosts`.
+pub fn defs(comptime hosts: []const type) []const Def {
+    comptime {
+        @setEvalBranchQuota(1_000_000);
+        var out: []const Def = &.{};
+        for (hosts) |S| {
+            if (@typeInfo(S) != .@"struct" or !@hasDecl(S, "crons")) continue;
+            for (S.crons) |c| {
+                const handler: []const u8 = c.handler;
+                const where = @typeName(S) ++ "." ++ handler;
+                if (!@hasDecl(S, handler)) @compileError(@typeName(S) ++ ".crons: no handler " ++ handler);
+                const expression: []const u8 = c.expression;
+                _ = Expr.parse(expression) catch @compileError(where ++ ": invalid cron expression \"" ++ expression ++ "\"");
+                const name: []const u8 = if (@hasField(@TypeOf(c), "name")) c.name else shortName(@typeName(S)) ++ "." ++ handler;
+                for (out) |d| if (std.mem.eql(u8, d.info.name, name)) @compileError("two cron jobs named " ++ name);
+                out = out ++ .{Def{ .S = S, .handler = handler, .info = .{
+                    .name = name,
+                    .expression = expression,
+                    .description = if (@hasField(@TypeOf(c), "description")) c.description else null,
+                    .timezone = if (@hasField(@TypeOf(c), "timezone")) c.timezone else null,
+                    .run_on_init = if (@hasField(@TypeOf(c), "run_on_init")) c.run_on_init else false,
+                    .overlap = if (@hasField(@TypeOf(c), "overlap")) c.overlap else false,
+                } }};
+            }
+        }
+        const result = out;
+        return result;
+    }
+}
+
+fn shortName(comptime full: []const u8) []const u8 {
+    return full[if (std.mem.findScalarLast(u8, full, '.')) |i| i + 1 else 0..];
+}
+
+pub fn infosOf(comptime ds: []const Def) [ds.len]Info {
+    var out: [ds.len]Info = undefined;
+    for (ds, &out) |d, *o| o.* = d.info;
+    return out;
+}
+
+pub fn exprsOf(comptime ds: []const Def) [ds.len]Expr {
+    @setEvalBranchQuota(1_000_000);
+    var out: [ds.len]Expr = undefined;
+    for (ds, &out) |d, *o| o.* = Expr.parse(d.info.expression) catch unreachable;
+    return out;
+}
+
+/// The App's jobs (KickJS `listCronJobs` / `runCronJobs` / the scheduler of
+/// `KickCronAdapter`). Inject `*kzig.cron.Jobs` to list or run them.
+pub const Jobs = struct {
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    infos: []const Info,
+    exprs: []const Expr,
+    zones: []Zone = &.{},
+    running: []std.atomic.Value(bool) = &.{},
+    scheduling: bool = true,
+    /// Set by App (optional, with defaults below, so DI treats them as
+    /// plain fields).
+    app: ?*anyopaque = null,
+    call: *const fn (*anyopaque, usize, Run) anyerror!void = noCall,
+    allowed: *const fn (*anyopaque, usize) bool = noAllowed,
+    report: *const fn (*anyopaque, anyerror, ErrorInfo) void = noReport,
+    scheduler: ?std.Io.Future(std.Io.Cancelable!void) = null,
+    /// Runs in flight; shutdown waits for them.
+    group: std.Io.Group = .init,
+
+    /// Each job's timezone, from `zoneinfo`; an unknown one fails boot.
+    pub fn load(j: *Jobs, zoneinfo: []const u8) !void {
+        j.running = try j.gpa.alloc(std.atomic.Value(bool), j.infos.len);
+        @memset(j.running, .init(false));
+        j.zones = try j.gpa.alloc(Zone, j.infos.len);
+        @memset(j.zones, Zone.utc);
+        for (j.infos, j.zones) |info, *z| if (info.timezone) |tz| {
+            z.* = Zone.load(j.io, j.gpa, zoneinfo, tz) catch |err| {
+                if (!builtin.is_test) std.log.err("cron job {s}: timezone {s}: {t}", .{ info.name, tz, err });
+                return err;
+            };
+        };
+    }
+
+    /// Stops scheduling, waits for runs in flight, frees.
+    pub fn deinit(j: *Jobs) void {
+        j.stop();
+        j.group.await(j.io) catch {};
+        for (j.zones) |*z| z.deinit(j.gpa);
+        j.gpa.free(j.zones);
+        j.gpa.free(j.running);
+        j.zones = &.{};
+        j.running = &.{};
+    }
+
+    pub fn list(j: *const Jobs) []const Info {
+        return j.infos;
+    }
+
+    pub fn find(j: *const Jobs, name: []const u8) ?usize {
+        for (j.infos, 0..) |info, i| if (std.mem.eql(u8, info.name, name)) return i;
+        return null;
+    }
+
+    /// The service's `cronEnabled(name)`, asked on every tick and run.
+    pub fn enabled(j: *const Jobs, i: usize) bool {
+        return j.allowed(j.app.?, i);
+    }
+
+    /// The first run after `from` (unix seconds) in the job's timezone.
+    pub fn next(j: *const Jobs, i: usize, from: i64) ?i64 {
+        return j.exprs[i].nextIn(&j.zones[i], from);
+    }
+
+    /// Runs the job named `name` now (KickJS `runCronJobs`): skipped when
+    /// disabled or still running.
+    pub fn run(j: *Jobs, name: []const u8, trigger: Trigger) Result {
+        var result: Result = .{ .ran = 0, .failed = 0 };
+        for (j.infos, 0..) |info, i| {
+            if (!std.mem.eql(u8, info.name, name)) continue;
+            switch (j.runOne(i, trigger)) {
+                .ran => result.ran += 1,
+                .failed => result.failed += 1,
+                .skipped => {},
+            }
+        }
+        return result;
+    }
+
+    fn runOne(j: *Jobs, i: usize, trigger: Trigger) enum { ran, skipped, failed } {
+        const info = j.infos[i];
+        if (!j.allowed(j.app.?, i)) return .skipped;
+        if (!info.overlap and j.running[i].swap(true, .acq_rel)) {
+            if (!builtin.is_test) std.log.warn("{s} is still running — skipped this tick", .{info.name});
+            return .skipped;
+        }
+        defer if (!info.overlap) j.running[i].store(false, .release);
+        var arena: std.heap.ArenaAllocator = .init(j.gpa);
+        defer arena.deinit();
+        const run_info: Run = .{ .name = info.name, .expression = info.expression, .trigger = trigger, .fired_at = @divFloor(nowMs(j.io), 1000), .arena = arena.allocator() };
+        j.call(j.app.?, i, run_info) catch |err| {
+            if (!builtin.is_test) std.log.err("cron job {s} failed: {t}", .{ info.name, err });
+            j.report(j.app.?, err, .{ .job = info.name, .expression = info.expression, .trigger = trigger });
+            return .failed;
+        };
+        return .ran;
+    }
+
+    fn spawn(j: *Jobs, i: usize, trigger: Trigger) void {
+        j.group.concurrent(j.io, runTask, .{ j, i, trigger }) catch {
+            _ = j.runOne(i, trigger);
+        };
+    }
+
+    fn runTask(j: *Jobs, i: usize, trigger: Trigger) void {
+        _ = j.runOne(i, trigger);
+    }
+
+    /// The server is up: run-on-init jobs, then the schedule.
+    pub fn start(j: *Jobs) void {
+        if (!j.scheduling or j.infos.len == 0 or j.scheduler != null) return;
+        for (j.infos, 0..) |info, i| if (info.run_on_init) j.spawn(i, .init);
+        j.scheduler = j.io.concurrent(loop, .{j}) catch null;
+    }
+
+    /// No more ticks; runs in flight carry on (deinit waits for them).
+    pub fn stop(j: *Jobs) void {
+        if (j.scheduler) |*f| f.cancel(j.io) catch {};
+        j.scheduler = null;
+    }
+
+    fn loop(j: *Jobs) std.Io.Cancelable!void {
+        const due = j.gpa.alloc(?i64, j.infos.len) catch return;
+        defer j.gpa.free(due);
+        const start_s = @divFloor(nowMs(j.io), 1000);
+        for (due, 0..) |*d, i| d.* = j.next(i, start_s);
+        while (true) {
+            const now = nowMs(j.io);
+            var earliest: ?i64 = null;
+            for (due) |d| if (d) |t| {
+                if (earliest == null or t < earliest.?) earliest = t;
+            };
+            const wait = (earliest orelse return) * 1000 - now;
+            if (wait > 0) {
+                // Re-checked at least every minute: the wall clock can move.
+                try j.io.sleep(.fromMilliseconds(@min(wait, 60_000)), .awake);
+                continue;
+            }
+            const now_s = @divFloor(now, 1000);
+            for (due, 0..) |*d, i| if (d.*) |t| if (t <= now_s) {
+                j.spawn(i, .schedule);
+                d.* = j.next(i, now_s);
+            };
+        }
+    }
+};
+
+fn noCall(_: *anyopaque, _: usize, _: Run) anyerror!void {}
+fn noAllowed(_: *anyopaque, _: usize) bool {
+    return true;
+}
+fn noReport(_: *anyopaque, _: anyerror, _: ErrorInfo) void {}
+
+fn nowMs(io: std.Io) i64 {
+    return @intCast(@divTrunc(std.Io.Clock.real.now(io).toNanoseconds(), std.time.ns_per_ms));
+}
+
 const testing = std.testing;
 
 /// Seconds since the epoch of an ISO-ish UTC time, for tests.
@@ -406,4 +649,120 @@ test "next run in a zone (KickJS's cron.test: 02:00 Nairobi is 23:00 UTC)" {
     const noon = try Expr.parse("0 12 * * *");
     try testing.expectEqual(@as(?i64, at(2026, 1, 15, 11, 0, 0)), noon.nextIn(&berlin, at(2026, 1, 15, 0, 0, 0)));
     try testing.expectEqual(@as(?i64, at(2026, 7, 15, 10, 0, 0)), noon.nextIn(&berlin, at(2026, 7, 15, 0, 0, 0)));
+}
+
+const app_mod = @import("app.zig");
+
+const Ticker = struct {
+    ticks: std.atomic.Value(u32) = .init(0),
+    boots: std.atomic.Value(u32) = .init(0),
+
+    pub const crons = .{
+        .{ .expression = "* * * * * *", .handler = "tick", .name = "tick" },
+        .{ .expression = "0 0 1 1 *", .handler = "boot", .name = "boot", .run_on_init = true, .description = "At boot" },
+        .{ .expression = "0 2 * * *", .handler = "slow", .name = "slow", .timezone = "Africa/Nairobi" },
+        .{ .expression = "0 0 1 1 *", .handler = "broken" },
+        .{ .expression = "0 0 1 1 *", .handler = "off", .name = "off" },
+    };
+
+    pub fn cronEnabled(_: *Ticker, name: []const u8) bool {
+        return !std.mem.eql(u8, name, "off");
+    }
+    pub fn tick(self: *Ticker, _: Run) void {
+        _ = self.ticks.fetchAdd(1, .acq_rel);
+    }
+    pub fn boot(self: *Ticker, run: Run) void {
+        if (run.trigger == .init) _ = self.boots.fetchAdd(1, .acq_rel);
+    }
+    pub fn slow(_: *Ticker, _: Run) !void {
+        try testing.io.sleep(.fromMilliseconds(200), .awake);
+    }
+    pub fn broken(_: *Ticker, _: Run) !void {
+        return error.SupplierDown;
+    }
+    pub fn off(_: *Ticker, _: Run) void {}
+};
+
+const Reports = struct {
+    last: ?ErrorInfo = null,
+    err: ?anyerror = null,
+
+    pub fn onCronError(self: *Reports, err: anyerror, info: ErrorInfo) void {
+        self.err = err;
+        self.last = info;
+    }
+};
+
+const JobsApp = app_mod.App(.{
+    .modules = &.{app_mod.Module(.{ .name = "Jobs", .services = &.{Ticker} })},
+    .adapters = &.{Reports},
+});
+
+fn bootJobs(app: *JobsApp, vars: []const [2][]const u8) !void {
+    var env: std.process.Environ.Map = .init(testing.allocator);
+    defer env.deinit();
+    try env.put("NODE_ENV", "test");
+    for (vars) |v| try env.put(v[0], v[1]);
+    try app.init(testing.io, testing.allocator, &env);
+}
+
+test "jobs: listed with names, schedules and next runs" {
+    var app: JobsApp = undefined;
+    try bootJobs(&app, &.{});
+    defer app.deinit();
+    const jobs = app.get(Jobs);
+    try testing.expectEqual(5, jobs.list().len);
+    const slow = jobs.find("slow").?;
+    try testing.expectEqualStrings("Africa/Nairobi", jobs.list()[slow].timezone.?);
+    try testing.expectEqual(@as(?i64, at(2026, 1, 15, 23, 0, 0)), jobs.next(slow, at(2026, 1, 15, 10, 0, 0)));
+    // No name: the type's and the handler's.
+    try testing.expect(jobs.find("Ticker.broken") != null);
+    try testing.expectEqualStrings("At boot", jobs.list()[jobs.find("boot").?].description.?);
+}
+
+test "jobs: run by hand; disabled skipped; a failure reaches onCronError" {
+    var app: JobsApp = undefined;
+    try bootJobs(&app, &.{});
+    defer app.deinit();
+    const jobs = app.get(Jobs);
+    try testing.expectEqual(Result{ .ran = 1, .failed = 0 }, jobs.run("tick", .manual));
+    try testing.expectEqual(Result{ .ran = 0, .failed = 0 }, jobs.run("off", .manual));
+    try testing.expectEqual(Result{ .ran = 0, .failed = 1 }, jobs.run("Ticker.broken", .manual));
+    const info = app.get(Reports).last.?;
+    try testing.expectEqualStrings("Ticker.broken", info.job);
+    try testing.expectEqualStrings("0 0 1 1 *", info.expression);
+    try testing.expectEqual(Trigger.manual, info.trigger);
+    try testing.expectEqual(error.SupplierDown, app.get(Reports).err.?);
+}
+
+test "jobs: a run while the last is still going is skipped" {
+    var app: JobsApp = undefined;
+    try bootJobs(&app, &.{});
+    defer app.deinit();
+    const jobs = app.get(Jobs);
+    var first = try testing.io.concurrent(Jobs.run, .{ jobs, "slow", Trigger.manual });
+    try testing.io.sleep(.fromMilliseconds(50), .awake);
+    try testing.expectEqual(Result{ .ran = 0, .failed = 0 }, jobs.run("slow", .manual));
+    try testing.expectEqual(Result{ .ran = 1, .failed = 0 }, first.await(testing.io));
+}
+
+test "jobs: the scheduler runs on its schedule and at boot" {
+    var app: JobsApp = undefined;
+    try bootJobs(&app, &.{});
+    defer app.deinit();
+    app.started(.{ .port = 0 });
+    try testing.io.sleep(.fromMilliseconds(2100), .awake);
+    app.beginDrain();
+    try testing.expect(app.get(Ticker).ticks.load(.acquire) >= 1);
+    try testing.expectEqual(1, app.get(Ticker).boots.load(.acquire));
+}
+
+test "jobs: CRON_ENABLED=false schedules nothing" {
+    var app: JobsApp = undefined;
+    try bootJobs(&app, &.{.{ "CRON_ENABLED", "false" }});
+    defer app.deinit();
+    app.started(.{ .port = 0 });
+    try testing.io.sleep(.fromMilliseconds(100), .awake);
+    app.beginDrain();
+    try testing.expectEqual(0, app.get(Ticker).boots.load(.acquire));
 }
