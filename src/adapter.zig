@@ -288,3 +288,47 @@ test "onError sees handler errors and onResponse the final status" {
     defer ok.deinit();
     try testing.expectEqual(204, a.get(Observed).last_status);
 }
+
+const AuditController = struct {
+    pub const routes = .{.{ .method = .GET, .path = "/", .handler = "index" }};
+    pub fn index(_: *AuditController, _: *Ctx) []const u8 {
+        return "audit";
+    }
+};
+
+const AuditPlugin = app.Plugin(.{
+    .name = "AuditPlugin",
+    .modules = &.{app.Module(.{ .name = "Audit", .path = "/audit", .controllers = &.{AuditController}, .services = &.{ Pool, Trail } })},
+    .adapters = &.{DbAdapter},
+    .middleware = .{Marker("plugin")},
+    .contributors = .{Level("plugin")},
+});
+
+const PluginApp = app.App(.{
+    .modules = &.{app.Module(.{ .name = "P", .path = "/p", .controllers = &.{PhaseController}, .services = &.{Observed} })},
+    .plugins = &.{AuditPlugin},
+    .adapters = &.{DbAdapter},
+    .middleware = .{Marker("app")},
+    .health = false,
+});
+
+test "plugin bundles modules, adapters, middleware and contributors" {
+    var a: PluginApp = undefined;
+    try bootPlain(PluginApp, &a);
+    defer a.deinit();
+    var audit = try phaseGet(PluginApp, &a, "/api/v1/audit");
+    defer audit.deinit();
+    try testing.expectEqualStrings("audit", audit.body);
+    var hit = try phaseGet(PluginApp, &a, "/api/v1/p");
+    defer hit.deinit();
+    // Plugin middleware runs before the App's; its contributor is adapter-level.
+    try testing.expectEqualStrings("plugin,app,h,plugin", hit.header("x-trail").?);
+}
+
+test "an adapter listed twice is one instance" {
+    var a: PluginApp = undefined;
+    try bootPlain(PluginApp, &a);
+    // DbAdapter comes from the plugin and the app: mounted once.
+    try testing.expectEqualStrings("init:pool, mount:db, route:db:/api/v1/audit, route:db:/api/v1/p, route:db:/api/v1/p/boom, start:db", a.get(Trail).items());
+    a.deinit();
+}

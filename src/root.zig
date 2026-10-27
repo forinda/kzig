@@ -35,6 +35,7 @@ pub const normalizePath = router.normalizePath;
 pub const Container = di.Container;
 pub const Module = app.Module;
 pub const App = app.App;
+pub const Plugin = app.Plugin;
 pub const Process = app.Process;
 pub const ConfigReport = app.ConfigReport;
 pub const Version = app.Version;

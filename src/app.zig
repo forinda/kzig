@@ -65,23 +65,53 @@ pub fn Module(comptime spec: anytype) type {
     };
 }
 
+/// A bundle of modules, adapters, middleware, contributors and settings
+/// (KickJS `definePlugin`). `spec`: `.name`, and any of `.modules`,
+/// `.adapters`, `.middleware`, `.contributors`, `.settings`. Its modules and
+/// adapters come before the App's; its middleware runs after adapters'
+/// `before_global`; its contributors are adapter-level.
+pub fn Plugin(comptime spec: anytype) type {
+    checkFields(spec, &.{ "name", "modules", "adapters", "middleware", "contributors", "settings" }, "Plugin");
+    return struct {
+        pub const kzig_plugin = true;
+        pub const name: []const u8 = spec.name;
+        pub const modules: []const type = opt(spec, "modules", @as([]const type, &.{}));
+        pub const adapters: []const type = opt(spec, "adapters", @as([]const type, &.{}));
+        pub const settings: []const type = opt(spec, "settings", @as([]const type, &.{}));
+        pub const middleware = if (@hasField(@TypeOf(spec), "middleware")) spec.middleware else .{};
+        pub const contributors: []const type = contributor.types(if (@hasField(@TypeOf(spec), "contributors")) spec.contributors else .{}, spec.name);
+    };
+}
+
 /// `spec`: `.modules`, `.config = struct {}`, `.api_prefix = "/api"`,
 /// `.default_version = 1`, `.health = true` (mounts `/health/live` and
 /// `/health/ready`).
 pub fn App(comptime spec: anytype) type {
-    checkFields(spec, &.{ "modules", "config", "api_prefix", "default_version", "health", "middleware", "contributors", "settings", "adapters" }, "App");
-    const adapters = adapter_mod.order(di.unique(opt(spec, "adapters", @as([]const type, &.{}))));
+    checkFields(spec, &.{ "modules", "config", "api_prefix", "default_version", "health", "middleware", "contributors", "settings", "adapters", "plugins" }, "App");
+    const plugins: []const type = opt(spec, "plugins", @as([]const type, &.{}));
+    comptime var plugin_modules: []const type = &.{};
+    comptime var plugin_adapters: []const type = &.{};
+    comptime var plugin_settings: []const type = &.{};
+    comptime var plugin_contributors: []const type = &.{};
+    inline for (plugins) |Pl| {
+        if (!@hasDecl(Pl, "kzig_plugin")) @compileError(@typeName(Pl) ++ " is not a kzig.Plugin");
+        plugin_modules = plugin_modules ++ Pl.modules;
+        plugin_adapters = plugin_adapters ++ Pl.adapters;
+        plugin_settings = plugin_settings ++ Pl.settings;
+        plugin_contributors = plugin_contributors ++ Pl.contributors;
+    }
+    const adapters = adapter_mod.order(di.unique(plugin_adapters ++ opt(spec, "adapters", @as([]const type, &.{}))));
     const global_contributors: []const type = contributor.types(if (@hasField(@TypeOf(spec), "contributors")) spec.contributors else .{}, "App");
     const app_mw = if (@hasField(@TypeOf(spec), "middleware")) spec.middleware else .{};
     const Config = opt(spec, "config", struct {});
     const api_prefix: []const u8 = opt(spec, "api_prefix", @as([]const u8, "/api"));
     const default_version: u16 = opt(spec, "default_version", @as(u16, 1));
     if (api_prefix.len > 0 and api_prefix[0] != '/') @compileError("api_prefix must be empty or start with '/': \"" ++ api_prefix ++ "\"");
-    const modules: []const type = @as([]const type, spec.modules) ++
+    const modules: []const type = di.unique(plugin_modules ++ @as([]const type, spec.modules)) ++
         (if (opt(spec, "health", true)) &[_]type{health.Module} else &[_]type{});
 
     comptime var section_list: []const type = &.{Config};
-    section_list = section_list ++ opt(spec, "settings", @as([]const type, &.{}));
+    section_list = section_list ++ plugin_settings ++ opt(spec, "settings", @as([]const type, &.{}));
     inline for (modules) |M| section_list = section_list ++ M.settings;
     inline for (adapters) |A| {
         if (@hasDecl(A, "settings")) section_list = section_list ++ A.settings;
@@ -89,13 +119,14 @@ pub fn App(comptime spec: anytype) type {
     const sections = di.unique(section_list);
 
     comptime var listed: []const type = sections ++ &[_]type{ Process, ConfigReport } ++ adapters;
-    comptime var adapter_contributors: []const type = &.{};
+    comptime var adapter_contributors: []const type = plugin_contributors;
     inline for (adapters) |A| {
         if (@hasDecl(A, "contributors")) adapter_contributors = adapter_contributors ++ contributor.types(A.contributors, @typeName(A));
         if (@hasDecl(A, "middleware")) inline for (A.middleware) |entry| {
             listed = listed ++ mwTypes(.{entry.handler});
         };
     }
+    inline for (plugins) |Pl| listed = listed ++ mwTypes(Pl.middleware);
     listed = listed ++ mwTypes(app_mw) ++ global_contributors ++ adapter_contributors;
     inline for (modules) |M| {
         if (!@hasDecl(M, "kzig_module")) @compileError(@typeName(M) ++ " is not a kzig.Module");
@@ -124,7 +155,7 @@ pub fn App(comptime spec: anytype) type {
         const Routes = router.Router(routes);
         // KickJS order: adapters' before_global, the App's middleware,
         // adapters' after_global, then before_routes.
-        const global: []const mw.Fn = phase(Self, adapters, .before_global) ++ mwChain(Self, app_mw, "App") ++
+        const global: []const mw.Fn = phase(Self, adapters, .before_global) ++ pluginChain(Self, plugins) ++ mwChain(Self, app_mw, "App") ++
             phase(Self, adapters, .after_global) ++ phase(Self, adapters, .before_routes);
         const after_routes: []const mw.Fn = phase(Self, adapters, .after_routes);
 
@@ -294,6 +325,15 @@ fn phase(comptime AppT: type, comptime adapters: []const type, comptime p: mw.Ph
                 if (entry_phase == p) out = out ++ .{mwFn(AppT, entry.handler, @typeName(A))};
             }
         }
+        const result = out;
+        return result;
+    }
+}
+
+fn pluginChain(comptime AppT: type, comptime plugins: []const type) []const mw.Fn {
+    comptime {
+        var out: []const mw.Fn = &.{};
+        for (plugins) |Pl| out = out ++ mwChain(AppT, Pl.middleware, Pl.name);
         const result = out;
         return result;
     }
