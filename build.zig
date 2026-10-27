@@ -53,4 +53,10 @@ const compile_errors = [_][2][]const u8{
     .{ "unknown_module_option", "Module has no option .paths" },
     .{ "module_path_without_slash", "M: module path must be empty or start with '/'" },
     .{ "api_prefix_without_slash", "api_prefix must be empty or start with '/'" },
+    .{ "contributor_missing", "GET /api/v1/x: the handler needs 'a' but no contributor on this route provides it" },
+    .{ "contributor_cycle", "GET /api/v1/x: contributor cycle a -> b -> a" },
+    .{ "contributor_duplicate", "GET /api/v1/x: contributor key 'a' registered twice" },
+    .{ "contributor_optional_as_required", "'a' is optional; the handler must declare it as ?u32" },
+    .{ "contributor_wrong_type", "'a' is u32, not []const u8 (in the handler)" },
+    .{ "bad_middleware", "GET /api/v1/x: middleware must be fn (*Ctx, *Next) !void or a type with handle" },
 };

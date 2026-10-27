@@ -144,7 +144,10 @@ fn buildRoutes(comptime AppT: type, comptime modules: []const type, comptime api
                     const handler: []const u8 = r.handler;
                     if (!@hasDecl(C, handler)) @compileError(@typeName(C) ++ " has no handler " ++ handler);
                     if (r.path.len > 0 and r.path[0] != '/') @compileError(@typeName(C) ++ "." ++ handler ++ ": path must start with '/'");
-                    const full = if (mount.len + r.path.len == 0) "/" else mount ++ r.path;
+                    // `/` under a mount is the mount itself, as in KickJS's joinPaths.
+                    const full = if (mount.len > 0 and std.mem.eql(u8, r.path, "/"))
+                        mount
+                    else if (mount.len + r.path.len == 0) "/" else mount ++ r.path;
                     const method: std.http.Method = r.method;
                     const owner = @typeName(C) ++ "." ++ handler;
                     for (list, owners) |other, other_owner| {
