@@ -410,8 +410,12 @@ after their exports.
       an empty Certificate when asked and none is configured
 - [x] CI: a `cert` pg_hba user signs in with EC and RSA certificates, refused without one
 
-Not covered: encrypted private keys, client certificates on TLS 1.2 (a TLS 1.2 server that asks
-for one is refused, as std's client does), Ed25519 keys, CRLs, RSA blinding (the exponentiation is
+- [x] Encrypted keys and `sslpassword`: PKCS#8 PBES2 (PBKDF2-HMAC-SHA1/256/384/512, AES-128/256-CBC)
+      and OpenSSL's traditional `DEK-Info` PEM (AES-128/256-CBC)
+- [x] Client certificates on TLS 1.2 (RSA-PSS or PKCS#1 v1.5, ECDSA), and an empty Certificate when
+      a TLS 1.2 server asks and none is configured; CI runs a TLS 1.2-only server for it
+
+Not covered: scrypt- or DES-encrypted keys, Ed25519 keys, CRLs, RSA blinding (the exponentiation is
 constant-time), a check that `sslkey` matches `sslcert`, channel binding to SHA-224- or
 Ed25519-signed server certificates.
 

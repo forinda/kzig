@@ -490,9 +490,47 @@ test "TLS: a client certificate signs in (EC and RSA keys); without one the serv
         const who = (try db.queryOne(a, struct { u: []const u8 }, "SELECT current_user::text AS u", .{})).?;
         try testing.expectEqualStrings("certuser", who.u);
     }
+    // An encrypted key, unlocked by sslpassword; a wrong one is refused before connecting.
+    const enc = try std.fmt.allocPrint(a, "postgres://certuser@localhost:{d}/{s}?sslmode=verify-full&sslrootcert={s}&sslcert={s}/certuser-rsa.pem&sslkey={s}/certuser-rsa-enc.key&sslpassword=", .{ cfg.port, cfg.database, ca, dir, dir });
+    var locked: Pool = try .init(testing.io, testing.allocator, .{ .url = try std.fmt.allocPrint(a, "{s}kzig-test", .{enc}), .max_connections = 1 });
+    defer locked.deinit();
+    try locked.ping();
+    var wrong: Pool = try .init(testing.io, testing.allocator, .{ .url = try std.fmt.allocPrint(a, "{s}nope", .{enc}), .max_connections = 1 });
+    defer wrong.deinit();
+    try testing.expectError(error.TlsConfig, wrong.ping());
     var none: Pool = try .init(testing.io, testing.allocator, .{ .url = try std.fmt.allocPrint(a, "postgres://certuser@localhost:{d}/{s}?sslmode=verify-full&sslrootcert={s}", .{ cfg.port, cfg.database, ca }), .max_connections = 1 });
     defer none.deinit();
     try testing.expectError(error.DbAuthFailed, none.ping());
+}
+
+test "TLS 1.2: client certificates (EC, RSA), and an empty Certificate for a password user" {
+    var env: std.process.Environ.Map = undefined;
+    const url = testUrl(&env) catch |err| {
+        if (err == error.SkipZigTest) env.deinit();
+        return err;
+    };
+    defer env.deinit();
+    const ca = env.get("PG_TEST_ROOTCERT") orelse return error.SkipZigTest;
+    const dir = env.get("PG_TEST_CERT_DIR") orelse return error.SkipZigTest;
+    // A second server with ssl_max_protocol_version = TLSv1.2 (and a client CA).
+    const port = env.get("PG_TEST_TLS12_PORT") orelse return error.SkipZigTest;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cfg = try pg.Config.parse(a, url);
+    const Row = struct { u: []const u8, v: []const u8 };
+    const q = "SELECT current_user::text AS u, version AS v FROM pg_stat_ssl WHERE pid = pg_backend_pid()";
+    for ([_][]const u8{ "ec", "rsa" }) |kind| {
+        const cert_url = try std.fmt.allocPrint(a, "postgres://certuser@localhost:{s}/{s}?sslmode=verify-full&sslrootcert={s}&sslcert={s}/certuser-{s}.pem&sslkey={s}/certuser-{s}.key", .{ port, cfg.database, ca, dir, kind, dir, kind });
+        var db: Pool = try .init(testing.io, testing.allocator, .{ .url = cert_url, .max_connections = 1 });
+        defer db.deinit();
+        const r = (try db.queryOne(a, Row, q, .{})).?;
+        try testing.expectEqualStrings("certuser", r.u);
+        try testing.expectEqualStrings("TLSv1.2", r.v);
+    }
+    var pw: Pool = try .init(testing.io, testing.allocator, .{ .url = try std.fmt.allocPrint(a, "postgres://{s}:{s}@localhost:{s}/{s}?sslmode=verify-full&sslrootcert={s}", .{ cfg.user, cfg.password, port, cfg.database, ca }), .max_connections = 1 });
+    defer pw.deinit();
+    try testing.expectEqualStrings("TLSv1.2", (try pw.queryOne(a, Row, q, .{})).?.v);
 }
 
 test "Timestamp round-trips through timestamptz and timestamp" {

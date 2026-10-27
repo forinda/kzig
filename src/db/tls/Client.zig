@@ -385,6 +385,11 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
     // kzig: Certificate, CertificateVerify and Finished, and their record:
     // one pair of buffers for every cipher.
     var auth_clear: [tls.max_ciphertext_inner_record_len]u8 = undefined;
+    // kzig: TLS 1.2's CertificateVerify signs every handshake message with the
+    // key's hash, which needn't be the cipher's: running SHA-256 and SHA-384.
+    var aux256 = crypto.hash.sha2.Sha256.init(.{});
+    var aux384 = crypto.hash.sha2.Sha384.init(.{});
+    var tls12_scheme: ?tls.SignatureScheme = null;
     var auth_record: [@as(usize, tls.record_header_len) + tls.max_ciphertext_inner_record_len + 16]u8 = undefined;
     var req_ctx: [255]u8 = undefined;
     var req_ctx_len: usize = 0;
@@ -578,6 +583,10 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                 p.transcript_hash.update(host); // Client Hello part 2
                                 p.transcript_hash.update(alpn_ext); // kzig: part 3
                                 p.transcript_hash.update(wrapped_handshake);
+                                for ([_][]const u8{ cleartext_header[tls.record_header_len..], host, alpn_ext, wrapped_handshake }) |part| {
+                                    aux256.update(part);
+                                    aux384.update(part);
+                                }
                             },
 
                             else => return error.TlsIllegalParameter,
@@ -636,34 +645,61 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                     },
                     // kzig: the server wants a client certificate.
                     .certificate_request => {
-                        if (tls_version != .tls_1_3) return error.TlsClientAuthUnsupported;
-                        // Once, and before the server's Certificate (RFC 8446 §4.3.2).
-                        if (cipher_state != .handshake or handshake_state != .certificate or cert_requested or cert_index > 0) return error.TlsUnexpectedMessage;
-                        switch (handshake_cipher) {
-                            inline else => |*p| p.transcript_hash.update(wrapped_handshake),
-                        }
-                        try hsd.ensure(1);
-                        const ctx_len = hsd.decode(u8);
-                        try hsd.ensure(ctx_len);
-                        @memcpy(req_ctx[0..ctx_len], hsd.slice(ctx_len));
-                        req_ctx_len = ctx_len;
-                        try hsd.ensure(2);
-                        var exts = try hsd.sub(hsd.decode(u16));
-                        while (!exts.eof()) {
-                            try exts.ensure(4);
-                            const et = exts.decode(u16);
-                            var extd = try exts.sub(exts.decode(u16));
-                            if (et != @backingInt(tls.ExtensionType.signature_algorithms)) continue;
-                            const ca = options.client_auth orelse continue;
-                            try extd.ensure(2);
-                            const list_len = extd.decode(u16);
-                            try extd.ensure(list_len);
-                            var i: usize = 0;
-                            while (i + 2 <= list_len) : (i += 2) {
-                                if (extd.decode(u16) == @backingInt(ca.key.scheme())) scheme_ok = true;
+                        // kzig: TLS 1.2 (RFC 5246 §7.4.4): after ServerKeyExchange, in the clear.
+                        if (tls_version == .tls_1_2) {
+                            if (cipher_state != .cleartext or handshake_state != .server_hello_done or cert_requested) return error.TlsUnexpectedMessage;
+                            switch (handshake_cipher) {
+                                inline else => |*p| p.transcript_hash.update(wrapped_handshake),
                             }
+                            aux256.update(wrapped_handshake);
+                            aux384.update(wrapped_handshake);
+                            try hsd.ensure(1);
+                            const types_len = hsd.decode(u8);
+                            try hsd.ensure(types_len + 2);
+                            hsd.skip(types_len);
+                            const algs_len = hsd.decode(u16);
+                            try hsd.ensure(algs_len);
+                            var offered: [64]u16 = undefined;
+                            var n: usize = 0;
+                            var i: usize = 0;
+                            while (i + 2 <= algs_len) : (i += 2) {
+                                const sch = hsd.decode(u16);
+                                if (n < offered.len) {
+                                    offered[n] = sch;
+                                    n += 1;
+                                }
+                            }
+                            if (options.client_auth) |ca| tls12_scheme = ca.key.tls12Scheme(offered[0..n]);
+                            cert_requested = true;
+                        } else if (tls_version != .tls_1_3) return error.TlsClientAuthUnsupported else {
+                            // Once, and before the server's Certificate (RFC 8446 §4.3.2).
+                            if (cipher_state != .handshake or handshake_state != .certificate or cert_requested or cert_index > 0) return error.TlsUnexpectedMessage;
+                            switch (handshake_cipher) {
+                                inline else => |*p| p.transcript_hash.update(wrapped_handshake),
+                            }
+                            try hsd.ensure(1);
+                            const ctx_len = hsd.decode(u8);
+                            try hsd.ensure(ctx_len);
+                            @memcpy(req_ctx[0..ctx_len], hsd.slice(ctx_len));
+                            req_ctx_len = ctx_len;
+                            try hsd.ensure(2);
+                            var exts = try hsd.sub(hsd.decode(u16));
+                            while (!exts.eof()) {
+                                try exts.ensure(4);
+                                const et = exts.decode(u16);
+                                var extd = try exts.sub(exts.decode(u16));
+                                if (et != @backingInt(tls.ExtensionType.signature_algorithms)) continue;
+                                const ca = options.client_auth orelse continue;
+                                try extd.ensure(2);
+                                const list_len = extd.decode(u16);
+                                try extd.ensure(list_len);
+                                var i: usize = 0;
+                                while (i + 2 <= list_len) : (i += 2) {
+                                    if (extd.decode(u16) == @backingInt(ca.key.scheme())) scheme_ok = true;
+                                }
+                            }
+                            cert_requested = true;
                         }
-                        cert_requested = true;
                     },
                     .encrypted_extensions => {
                         if (tls_version != .tls_1_3) return error.TlsUnexpectedMessage;
@@ -707,6 +743,8 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                         switch (handshake_cipher) {
                             inline else => |*p| p.transcript_hash.update(wrapped_handshake),
                         }
+                        aux256.update(wrapped_handshake);
+                        aux384.update(wrapped_handshake);
 
                         switch (tls_version) {
                             .tls_1_3 => {
@@ -831,6 +869,8 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                         switch (handshake_cipher) {
                             inline else => |*p| p.transcript_hash.update(wrapped_handshake),
                         }
+                        aux256.update(wrapped_handshake);
+                        aux384.update(wrapped_handshake);
                         try hsd.ensure(1 + 2 + 1);
                         const curve_type = hsd.decode(u8);
                         if (curve_type != 0x03) return error.TlsIllegalParameter; // named_curve
@@ -865,12 +905,60 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                             int(u16, @backingInt(tls.ProtocolVersion.tls_1_2)) ++
                             array(u16, tls.ChangeCipherSpecType, .{.change_cipher_spec});
                         const pre_master_secret = key_share.getSharedSecret().?;
+                        // kzig: client authentication around ClientKeyExchange.
+                        var cert_record: []const u8 = &.{};
+                        var verify_record_buf: [5 + 4 + 4 + keys.max_signature_len]u8 = undefined;
+                        var verify_record: []const u8 = &.{};
                         switch (handshake_cipher) {
                             inline else => |*p| {
                                 const P = @TypeOf(p.*).A;
                                 p.transcript_hash.update(wrapped_handshake);
+                                aux256.update(wrapped_handshake);
+                                aux384.update(wrapped_handshake);
+                                if (cert_requested) {
+                                    cert_record = try tls12Certificate(&auth_clear, if (tls12_scheme != null) options.client_auth else null);
+                                    const msg = cert_record[tls.record_header_len..];
+                                    p.transcript_hash.update(msg);
+                                    aux256.update(msg);
+                                    aux384.update(msg);
+                                }
                                 p.transcript_hash.update(client_key_exchange_prefix[tls.record_header_len..]);
                                 p.transcript_hash.update(public_key_bytes);
+                                aux256.update(client_key_exchange_prefix[tls.record_header_len..]);
+                                aux256.update(public_key_bytes);
+                                aux384.update(client_key_exchange_prefix[tls.record_header_len..]);
+                                aux384.update(public_key_bytes);
+                                if (cert_requested) if (tls12_scheme) |scheme| {
+                                    // CertificateVerify: every handshake message so far, with the scheme's hash.
+                                    var digest_buf: [48]u8 = undefined;
+                                    const digest: []const u8 = switch (scheme) {
+                                        .ecdsa_secp384r1_sha384 => blk: {
+                                            const d = aux384.peek();
+                                            @memcpy(digest_buf[0..48], &d);
+                                            break :blk digest_buf[0..48];
+                                        },
+                                        else => blk: {
+                                            const d = aux256.peek();
+                                            @memcpy(digest_buf[0..32], &d);
+                                            break :blk digest_buf[0..32];
+                                        },
+                                    };
+                                    var sig_buf: [keys.max_signature_len]u8 = undefined;
+                                    const ca = options.client_auth.?;
+                                    const sig = ca.key.signDigest(ca.io, scheme, digest, &sig_buf) catch return error.TlsClientAuthFailed;
+                                    const body_len = 2 + 2 + sig.len;
+                                    var vw: Writer = .fixed(&verify_record_buf);
+                                    vw.writeByte(@backingInt(tls.ContentType.handshake)) catch unreachable;
+                                    vw.writeInt(u16, @backingInt(tls.ProtocolVersion.tls_1_2), .big) catch unreachable;
+                                    vw.writeInt(u16, @intCast(4 + body_len), .big) catch unreachable;
+                                    vw.writeByte(@backingInt(tls.HandshakeType.certificate_verify)) catch unreachable;
+                                    vw.writeInt(u24, @intCast(body_len), .big) catch unreachable;
+                                    vw.writeInt(u16, @backingInt(scheme), .big) catch unreachable;
+                                    vw.writeInt(u16, @intCast(sig.len), .big) catch unreachable;
+                                    vw.writeAll(sig) catch unreachable;
+                                    verify_record = vw.buffered();
+                                    p.transcript_hash.update(verify_record[tls.record_header_len..]);
+                                };
                                 const master_secret = hmacExpandLabel(P.Hmac, pre_master_secret, &.{
                                     "master secret",
                                     &client_hello_rand,
@@ -924,9 +1012,11 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                     nonce,
                                     pv.app_cipher.client_write_key,
                                 );
-                                var all_msgs_vec: [4][]const u8 = .{
+                                var all_msgs_vec: [6][]const u8 = .{
+                                    cert_record,
                                     &client_key_exchange_prefix,
                                     public_key_bytes,
+                                    verify_record,
                                     &client_change_cipher_spec_msg,
                                     &client_verify_msg,
                                 };
@@ -1777,6 +1867,29 @@ fn clientAuthMessages(out: []u8, transcript: anytype, auth: ?ClientAuth, scheme_
     w.writeAll(sig) catch return error.TlsClientCertTooLarge;
     transcript.update(out[start..w.end]);
     return w.end;
+}
+
+/// kzig: TLS 1.2's client Certificate (RFC 5246 §7.4.6) as a handshake
+/// record: the chain, or empty without `auth`.
+fn tls12Certificate(out: []u8, auth: ?ClientAuth) ![]const u8 {
+    var list_len: usize = 0;
+    if (auth) |a| for (a.chain) |der| {
+        list_len += 3 + der.len;
+    };
+    const body_len = 3 + list_len;
+    if (5 + 4 + body_len > out.len) return error.TlsClientCertTooLarge;
+    var w: Writer = .fixed(out);
+    w.writeByte(@backingInt(tls.ContentType.handshake)) catch unreachable;
+    w.writeInt(u16, @backingInt(tls.ProtocolVersion.tls_1_2), .big) catch unreachable;
+    w.writeInt(u16, @intCast(4 + body_len), .big) catch unreachable;
+    w.writeByte(@backingInt(tls.HandshakeType.certificate)) catch unreachable;
+    w.writeInt(u24, @intCast(body_len), .big) catch unreachable;
+    w.writeInt(u24, @intCast(list_len), .big) catch unreachable;
+    if (auth) |a| for (a.chain) |der| {
+        w.writeInt(u24, @intCast(der.len), .big) catch unreachable;
+        w.writeAll(der) catch unreachable;
+    };
+    return w.buffered();
 }
 
 fn tryDownloadRootCert(chain: *Certificate.Chain, options: *const Options) !void {

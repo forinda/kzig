@@ -48,22 +48,27 @@ jobs:
             openssl req -new -key certuser-$kind.key -out certuser-$kind.csr -subj "/CN=certuser"
             openssl x509 -req -in certuser-$kind.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 2 -out certuser-$kind.pem
           done
-          docker run -d --name pg -p 5432:5432 -e POSTGRES_USER=kzig -e POSTGRES_PASSWORD=kzigpass -e POSTGRES_DB=kzig_test postgres:17-alpine
-          ready() { for i in $(seq 60); do docker exec pg pg_isready -U kzig -h 127.0.0.1 >/dev/null 2>&1 && return 0; sleep 1; done; docker logs pg; return 1; }
-          ready
-          docker cp server.pem pg:/var/lib/postgresql/server.pem
-          docker cp server.key pg:/var/lib/postgresql/server.key
-          docker cp ca.pem pg:/var/lib/postgresql/ca.pem
-          docker exec pg sh -c 'chown postgres /var/lib/postgresql/server.* /var/lib/postgresql/ca.pem; chmod 600 /var/lib/postgresql/server.key'
-          for q in "ALTER SYSTEM SET ssl = on" "ALTER SYSTEM SET ssl_cert_file = '/var/lib/postgresql/server.pem'" "ALTER SYSTEM SET ssl_key_file = '/var/lib/postgresql/server.key'" "ALTER SYSTEM SET ssl_ca_file = '/var/lib/postgresql/ca.pem'" "CREATE ROLE certuser LOGIN"; do
-            docker exec pg psql -U kzig -d kzig_test -qtAc "$q"
-          done
-          hba=$(docker exec pg psql -U kzig -d kzig_test -tAc 'SHOW hba_file')
-          docker exec pg sh -c "sed -i '1i hostssl all certuser all cert' $hba"
-          # A restart, not a reload: SHOW ssl right after a reload can race it.
-          docker restart pg >/dev/null
-          ready
-          [ "$(docker exec pg psql -U kzig -d kzig_test -tAc 'SHOW ssl')" = on ]
+          openssl pkcs8 -topk8 -in certuser-rsa.key -v2 aes-256-cbc -v2prf hmacWithSHA256 -passout pass:kzig-test -out certuser-rsa-enc.key
+          # pg: TLS 1.3 (the tests' server); pg12: TLS 1.2 only, for its client-certificate path.
+          ready() { for i in $(seq 60); do docker exec $1 pg_isready -U kzig -h 127.0.0.1 >/dev/null 2>&1 && return 0; sleep 1; done; docker logs $1; return 1; }
+          setup() {
+            name=$1; port=$2; extra=$3
+            docker run -d --name $name -p $port:5432 -e POSTGRES_USER=kzig -e POSTGRES_PASSWORD=kzigpass -e POSTGRES_DB=kzig_test postgres:17-alpine
+            ready $name
+            for f in server.pem server.key ca.pem; do docker cp $f $name:/var/lib/postgresql/$f; done
+            docker exec $name sh -c 'chown postgres /var/lib/postgresql/*.pem /var/lib/postgresql/server.key; chmod 600 /var/lib/postgresql/server.key'
+            for q in "ALTER SYSTEM SET ssl = on" "ALTER SYSTEM SET ssl_cert_file = '/var/lib/postgresql/server.pem'" "ALTER SYSTEM SET ssl_key_file = '/var/lib/postgresql/server.key'" "ALTER SYSTEM SET ssl_ca_file = '/var/lib/postgresql/ca.pem'" "CREATE ROLE certuser LOGIN" ${extra:+"$extra"}; do
+              docker exec $name psql -U kzig -d kzig_test -qtAc "$q"
+            done
+            hba=$(docker exec $name psql -U kzig -d kzig_test -tAc 'SHOW hba_file')
+            docker exec $name sh -c "sed -i '1i hostssl all certuser all cert' $hba"
+            # A restart, not a reload: SHOW ssl right after a reload can race it.
+            docker restart $name >/dev/null
+            ready $name
+            [ "$(docker exec $name psql -U kzig -d kzig_test -tAc 'SHOW ssl')" = on ]
+          }
+          setup pg 5432 ""
+          setup pg12 5433 "ALTER SYSTEM SET ssl_max_protocol_version = 'TLSv1.2'"
       - name: S3 server
         run: |
           echo '{"identities":[{"name":"kzig","credentials":[{"accessKey":"kzigtest","secretKey":"kzigtestsecret"}],"actions":["Admin","Read","Write","List","Tagging"]}]}' > "$RUNNER_TEMP/s3.json"
@@ -80,6 +85,7 @@ jobs:
           DATABASE_URL: postgres://kzig:kzigpass@localhost:5432/kzig_test
           PG_TEST_ROOTCERT: ${{ runner.temp }}/pg/ca.pem
           PG_TEST_CERT_DIR: ${{ runner.temp }}/pg
+          PG_TEST_TLS12_PORT: "5433"
           S3_TEST_ENDPOINT: http://localhost:8333
           S3_TEST_BUCKET: kzig-test
           S3_TEST_ACCESS_KEY_ID: kzigtest
