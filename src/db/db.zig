@@ -15,6 +15,10 @@ const std = @import("std");
 pub const pg = @import("pg.zig");
 pub const migrate = @import("migrate.zig");
 pub const Timestamp = @import("timestamp.zig").Timestamp;
+const schema_ = @import("schema.zig");
+pub const table = schema_.table;
+pub const Schema = schema_.Schema;
+pub const Column = schema_.Column;
 
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -196,6 +200,7 @@ const testing = std.testing;
 test {
     _ = migrate;
     _ = @import("timestamp.zig");
+    _ = schema_;
     _ = pg;
 }
 
