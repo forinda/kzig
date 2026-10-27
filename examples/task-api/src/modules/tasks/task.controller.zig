@@ -11,17 +11,34 @@ pub const TaskController = struct {
     pub const docs = .{ .tags = &[_][]const u8{"Tasks"} };
 
     pub const routes = .{
-        .{ .method = .GET, .path = "/", .handler = "list", .docs = .{ .summary = "List tasks" } },
-        .{ .method = .GET, .path = "/:id", .handler = "get", .docs = .{ .summary = "Get a task" } },
+        .{ .method = .GET, .path = "/", .handler = "list", .docs = .{
+            .summary = "List tasks",
+            .responses = .{
+                .{ .status = 200, .description = "A page of tasks", .body = kzig.Paginated(repo.Task) },
+                .{ .status = 400, .description = "Unsupported filter operator" },
+            },
+        } },
+        .{ .method = .GET, .path = "/:id", .handler = "get", .docs = .{
+            .summary = "Get a task",
+            .responses = .{ .{ .status = 200, .description = "The task", .body = repo.Task }, not_found },
+        } },
         .{ .method = .POST, .path = "/", .handler = "create", .docs = .{
             .summary = "Create a task",
             .responses = .{.{ .status = 201, .description = "Created", .body = repo.Task }},
         } },
-        .{ .method = .PATCH, .path = "/:id", .handler = "update", .docs = .{ .summary = "Update a task" } },
-        .{ .method = .DELETE, .path = "/:id", .handler = "remove", .docs = .{ .summary = "Delete a task" } },
+        .{ .method = .PATCH, .path = "/:id", .handler = "update", .docs = .{
+            .summary = "Update a task",
+            .responses = .{ .{ .status = 200, .description = "The updated task", .body = repo.Task }, not_found },
+        } },
+        .{ .method = .DELETE, .path = "/:id", .handler = "remove", .docs = .{
+            .summary = "Delete a task",
+            .responses = .{ .{ .status = 204, .description = "Deleted" }, not_found },
+        } },
     };
+    const not_found = .{ .status = 404, .description = "No task with this id" };
 
     pub fn list(self: *TaskController, ctx: *kzig.Ctx, got: struct { query: constants.Query }) !kzig.Paginated(repo.Task) {
+        try constants.checkFilters(ctx, got.query);
         const page = try self.service.list(ctx.arena, got.query);
         return got.query.paginate(ctx, repo.Task, page.rows, page.total);
     }

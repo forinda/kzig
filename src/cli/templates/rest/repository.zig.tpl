@@ -119,7 +119,7 @@ pub const {{Pascal}}Repository = struct {
 };
 
 fn matches(row: {{Pascal}}, query: constants.Query) bool {
-    // `name` is the only filterable field (see Query).
+    // `name` is the only filterable field, with the operators checkFilters allows.
     for (query.filters) |f| {
         const ok = switch (f.operator) {
             .eq => std.mem.eql(u8, row.name, f.value),
@@ -127,7 +127,7 @@ fn matches(row: {{Pascal}}, query: constants.Query) bool {
             .contains => std.ascii.findIgnoreCase(row.name, f.value) != null,
             .starts => std.ascii.startsWithIgnoreCase(row.name, f.value),
             .ends => std.ascii.endsWithIgnoreCase(row.name, f.value),
-            else => true,
+            else => false,
         };
         if (!ok) return false;
     }

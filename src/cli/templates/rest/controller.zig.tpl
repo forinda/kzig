@@ -11,17 +11,34 @@ pub const {{Pascal}}Controller = struct {
     pub const docs = .{ .tags = &[_][]const u8{"{{PluralPascal}}"} };
 
     pub const routes = .{
-        .{ .method = .GET, .path = "/", .handler = "list", .docs = .{ .summary = "List {{plural}}" } },
-        .{ .method = .GET, .path = "/:id", .handler = "get", .docs = .{ .summary = "Get a {{kebab}}" } },
+        .{ .method = .GET, .path = "/", .handler = "list", .docs = .{
+            .summary = "List {{plural}}",
+            .responses = .{
+                .{ .status = 200, .description = "A page of {{plural}}", .body = kzig.Paginated(repo.{{Pascal}}) },
+                .{ .status = 400, .description = "Unsupported filter operator" },
+            },
+        } },
+        .{ .method = .GET, .path = "/:id", .handler = "get", .docs = .{
+            .summary = "Get a {{kebab}}",
+            .responses = .{ .{ .status = 200, .description = "The {{kebab}}", .body = repo.{{Pascal}} }, not_found },
+        } },
         .{ .method = .POST, .path = "/", .handler = "create", .docs = .{
             .summary = "Create a {{kebab}}",
             .responses = .{.{ .status = 201, .description = "Created", .body = repo.{{Pascal}} }},
         } },
-        .{ .method = .PATCH, .path = "/:id", .handler = "update", .docs = .{ .summary = "Update a {{kebab}}" } },
-        .{ .method = .DELETE, .path = "/:id", .handler = "remove", .docs = .{ .summary = "Delete a {{kebab}}" } },
+        .{ .method = .PATCH, .path = "/:id", .handler = "update", .docs = .{
+            .summary = "Update a {{kebab}}",
+            .responses = .{ .{ .status = 200, .description = "The updated {{kebab}}", .body = repo.{{Pascal}} }, not_found },
+        } },
+        .{ .method = .DELETE, .path = "/:id", .handler = "remove", .docs = .{
+            .summary = "Delete a {{kebab}}",
+            .responses = .{ .{ .status = 204, .description = "Deleted" }, not_found },
+        } },
     };
+    const not_found = .{ .status = 404, .description = "No {{kebab}} with this id" };
 
     pub fn list(self: *{{Pascal}}Controller, ctx: *kzig.Ctx, got: struct { query: constants.Query }) !kzig.Paginated(repo.{{Pascal}}) {
+        try constants.checkFilters(ctx, got.query);
         const page = try self.service.list(ctx.arena, got.query);
         return got.query.paginate(ctx, repo.{{Pascal}}, page.rows, page.total);
     }

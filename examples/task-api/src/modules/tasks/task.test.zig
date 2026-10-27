@@ -46,3 +46,52 @@ test "tasks: invalid input is 422" {
     defer res.deinit();
     try testing.expectEqual(.unprocessable_entity, res.status);
 }
+
+test "tasks: search, filter and sort over several rows" {
+    const t = try test_app.boot(&.{});
+    defer t.deinit();
+    for ([_][]const u8{ "Beta", "Alpha", "Alphabet" }) |name| {
+        const body = try std.fmt.allocPrint(testing.allocator, "{{\"name\":\"{s}\"}}", .{name});
+        defer testing.allocator.free(body);
+        var res = try t.request(.{ .method = .POST, .target = "/api/v1/tasks", .headers = &.{json}, .body = body });
+        defer res.deinit();
+        try testing.expectEqual(.created, res.status);
+    }
+    const ListBody = struct { data: []const Task, meta: struct { total: usize } };
+
+    var searched = try t.get("/api/v1/tasks?q=alpha");
+    defer searched.deinit();
+    try testing.expectEqual(2, (try searched.json(ListBody)).meta.total);
+
+    var filtered = try t.get("/api/v1/tasks?filter=name:eq:Beta");
+    defer filtered.deinit();
+    const one = try filtered.json(ListBody);
+    try testing.expectEqual(1, one.meta.total);
+    try testing.expectEqualStrings("Beta", one.data[0].name);
+
+    var sorted = try t.get("/api/v1/tasks?sort=-name");
+    defer sorted.deinit();
+    const rows = (try sorted.json(ListBody)).data;
+    try testing.expectEqual(3, rows.len);
+    for (rows, [_][]const u8{ "Beta", "Alphabet", "Alpha" }) |row, name| try testing.expectEqualStrings(name, row.name);
+}
+
+test "tasks: a filter operator name doesn't support is 400" {
+    const t = try test_app.boot(&.{});
+    defer t.deinit();
+    var res = try t.get("/api/v1/tasks?filter=name:gt:m");
+    defer res.deinit();
+    try testing.expectEqual(.bad_request, res.status);
+}
+
+test "tasks: the /:id routes document 404" {
+    const t = try test_app.boot(&.{});
+    defer t.deinit();
+    var res = try t.get("/openapi.json");
+    defer res.deinit();
+    const spec = try std.json.parseFromSlice(std.json.Value, testing.allocator, res.body, .{});
+    defer spec.deinit();
+    const item = spec.value.object.get("paths").?.object.get("/api/v1/tasks/{id}").?.object;
+    for ([_][]const u8{ "get", "patch", "delete" }) |method|
+        try testing.expect(item.get(method).?.object.get("responses").?.object.contains("404"));
+}
