@@ -6,6 +6,9 @@ const di = @import("di.zig");
 const app = @import("app.zig");
 pub const testing = @import("testing.zig");
 pub const config = @import("config.zig");
+pub const decode = @import("decode.zig");
+pub const Issues = decode.Issues;
+pub const FieldError = decode.FieldError;
 pub const middleware = @import("middleware.zig");
 pub const Next = middleware.Next;
 pub const contributor = @import("contributor.zig");
@@ -37,6 +40,7 @@ test {
     _ = app;
     _ = testing;
     _ = config;
+    _ = decode;
     _ = middleware;
     _ = runtime.std;
 }

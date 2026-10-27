@@ -4,6 +4,7 @@
 const std = @import("std");
 
 const builtin = @import("builtin");
+const decode = @import("decode.zig");
 
 pub const Issue = struct {
     key: []const u8,
@@ -62,40 +63,11 @@ fn envKey(comptime name: []const u8) []const u8 {
 }
 
 fn parseValue(comptime F: type, raw: []const u8) ?F {
-    return switch (@typeInfo(F)) {
-        .int => std.fmt.parseInt(F, raw, 10) catch null,
-        .float => std.fmt.parseFloat(F, raw) catch null,
-        .bool => if (std.mem.eql(u8, raw, "true") or std.mem.eql(u8, raw, "1"))
-            true
-        else if (std.mem.eql(u8, raw, "false") or std.mem.eql(u8, raw, "0"))
-            false
-        else
-            null,
-        .@"enum" => std.meta.stringToEnum(F, raw),
-        .optional => |o| if (parseValue(o.child, raw)) |v| @as(F, v) else null,
-        .pointer => if (F == []const u8) raw else @compileError("config field type " ++ @typeName(F) ++ " is not supported"),
-        else => @compileError("config field type " ++ @typeName(F) ++ " is not supported"),
-    };
+    return decode.scalar(F, raw);
 }
 
 fn typeLabel(comptime F: type) []const u8 {
-    return switch (@typeInfo(F)) {
-        .int => "an integer",
-        .float => "a number",
-        .bool => "true, false, 1 or 0",
-        .@"enum" => "one of " ++ enumNames(F),
-        .optional => |o| typeLabel(o.child),
-        else => @typeName(F),
-    };
-}
-
-fn enumNames(comptime E: type) []const u8 {
-    comptime {
-        var out: []const u8 = "";
-        for (@typeInfo(E).@"enum".field_names, 0..) |n, i| out = out ++ (if (i > 0) ", " else "") ++ n;
-        const result = out;
-        return result;
-    }
+    return comptime decode.label(F)["expected ".len..];
 }
 
 const testing = std.testing;
