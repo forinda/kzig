@@ -19,3 +19,4 @@ zig-out/
 # Design notes, specs and plans stay private
 .ignored/
 CLAUDE.local.md
+.superpowers/
