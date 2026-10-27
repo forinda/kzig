@@ -28,6 +28,13 @@ pub const Process = struct {
     }
 };
 
+/// Every config variable the app read, with where its value came from
+/// (KickJS `configOrigins()`); names only, never values. Injectable as
+/// `*const kzig.ConfigReport`.
+pub const ConfigReport = struct {
+    vars: []const config.Origin,
+};
+
 /// KickJS's `version: number | false`, with the app default as a third case.
 pub const Version = union(enum) {
     default,
@@ -39,7 +46,7 @@ pub const Version = union(enum) {
 /// `.version` (a number, or `false` for none; the app default otherwise),
 /// `.prefix = true` (false drops the api prefix) — KickJS's `routes()` options.
 pub fn Module(comptime spec: anytype) type {
-    checkFields(spec, &.{ "name", "path", "controllers", "services", "version", "prefix", "contributors" }, "Module");
+    checkFields(spec, &.{ "name", "path", "controllers", "services", "version", "prefix", "contributors", "settings" }, "Module");
     return struct {
         pub const kzig_module = true;
         pub const name: []const u8 = spec.name;
@@ -48,6 +55,8 @@ pub fn Module(comptime spec: anytype) type {
         pub const services: []const type = opt(spec, "services", @as([]const type, &.{}));
         pub const version: Version = if (@hasField(@TypeOf(spec), "version")) versionOf(spec.version) else .default;
         pub const prefix: bool = opt(spec, "prefix", true);
+        /// Settings sections, read and validated only when this module is mounted.
+        pub const settings: []const type = opt(spec, "settings", @as([]const type, &.{}));
         pub const contributors: []const type = contributor.types(if (@hasField(@TypeOf(spec), "contributors")) spec.contributors else .{}, spec.name);
     };
 }
@@ -56,7 +65,7 @@ pub fn Module(comptime spec: anytype) type {
 /// `.default_version = 1`, `.health = true` (mounts `/health/live` and
 /// `/health/ready`).
 pub fn App(comptime spec: anytype) type {
-    checkFields(spec, &.{ "modules", "config", "api_prefix", "default_version", "health", "middleware", "contributors" }, "App");
+    checkFields(spec, &.{ "modules", "config", "api_prefix", "default_version", "health", "middleware", "contributors", "settings" }, "App");
     const global_contributors: []const type = contributor.types(if (@hasField(@TypeOf(spec), "contributors")) spec.contributors else .{}, "App");
     const global_mw = if (@hasField(@TypeOf(spec), "middleware")) spec.middleware else .{};
     const Config = opt(spec, "config", struct {});
@@ -66,7 +75,12 @@ pub fn App(comptime spec: anytype) type {
     const modules: []const type = @as([]const type, spec.modules) ++
         (if (opt(spec, "health", true)) &[_]type{health.Module} else &[_]type{});
 
-    comptime var listed: []const type = &.{ Config, Process };
+    comptime var section_list: []const type = &.{Config};
+    section_list = section_list ++ opt(spec, "settings", @as([]const type, &.{}));
+    inline for (modules) |M| section_list = section_list ++ M.settings;
+    const sections = di.unique(section_list);
+
+    comptime var listed: []const type = sections ++ &[_]type{ Process, ConfigReport };
     listed = listed ++ mwTypes(global_mw) ++ global_contributors;
     inline for (modules) |M| {
         if (!@hasDecl(M, "kzig_module")) @compileError(@typeName(M) ++ " is not a kzig.Module");
@@ -106,9 +120,34 @@ pub fn App(comptime spec: anytype) type {
                 @compileError("App overrides are only allowed in tests");
             self.config_arena = .init(gpa);
             errdefer self.config_arena.deinit();
-            const cfg = try config.load(Config, self.config_arena.allocator(), env);
+            const arena = self.config_arena.allocator();
+
+            // Every section is read before failing, so one boot names every
+            // bad variable. An overridden section isn't read at all.
+            var values: @Tuple(sections) = undefined;
+            var origins: std.ArrayList(config.Origin) = .empty;
+            var failed = false;
+            inline for (sections, 0..) |S, i| {
+                if (comptime overrideOf(@TypeOf(overrides), S)) |f| {
+                    values[i] = @field(overrides, f);
+                    try config.providedOrigins(S, arena, &origins);
+                } else {
+                    var issues: std.ArrayList(config.Issue) = .empty;
+                    if (config.parseSection(S, arena, io, env, &issues, &origins)) |v| {
+                        values[i] = v;
+                    } else |err| switch (err) {
+                        error.InvalidConfig => {
+                            if (!builtin.is_test) config.logIssues(S, issues.items);
+                            failed = true;
+                        },
+                        else => return err,
+                    }
+                }
+            }
+            if (failed) return error.InvalidConfig;
+
             const process: Process = .{ .io = io, .gpa = gpa, .started_at = std.Io.Clock.awake.now(io) };
-            try self.container.initWith(.{ cfg, process } ++ overrides);
+            try self.container.initWith(values ++ .{ process, ConfigReport{ .vars = origins.items } } ++ overrides);
         }
 
         pub fn deinit(self: *Self) void {
@@ -336,6 +375,13 @@ const ParamSource = struct {
 
 fn appOf(comptime AppT: type, ctx: *Ctx) *AppT {
     return @ptrCast(@alignCast(ctx.app.?));
+}
+
+/// The field of `Overrides` holding a value of type `S`, if any.
+fn overrideOf(comptime Overrides: type, comptime S: type) ?[]const u8 {
+    const info = @typeInfo(Overrides).@"struct";
+    for (info.field_names, info.field_types) |f, T| if (T == S) return f;
+    return null;
 }
 
 fn versionOf(comptime v: anytype) Version {
@@ -851,4 +897,70 @@ test "a late contributor reads the body" {
     var a = try bodyReq(.POST, "/api/v1/owned", "application/json", "{\"title\":\"mine\"}");
     defer a.deinit();
     try testing.expectEqualStrings("mine", a.body);
+}
+
+const MailSettings = struct {
+    pub const prefix = "MAIL";
+    host: []const u8 = "localhost",
+    password: []const u8,
+};
+
+const AppLevelSettings = struct {
+    pub const prefix = "APP";
+    name: []const u8 = "task-api",
+};
+
+const MailController = struct {
+    mail: *const MailSettings,
+    app: *const AppLevelSettings,
+    report: *const ConfigReport,
+    pub const routes = .{.{ .method = .GET, .path = "/", .handler = "show" }};
+    pub fn show(self: *MailController, ctx: *Ctx) ![]const u8 {
+        return std.fmt.allocPrint(ctx.arena, "{s}@{s}/{s}/{d}", .{ self.mail.password, self.mail.host, self.app.name, self.report.vars.len });
+    }
+};
+
+const RequiredConfig = struct { database_url: []const u8 };
+
+const SettingsApp = App(.{
+    .modules = &.{Module(.{ .name = "MailModule", .path = "/mail", .controllers = &.{MailController}, .settings = &.{MailSettings} })},
+    .settings = &.{AppLevelSettings},
+    .config = RequiredConfig,
+});
+
+test "module and app settings are read from env and injectable" {
+    var env: std.process.Environ.Map = .init(testing.allocator);
+    defer env.deinit();
+    try env.put("MAIL_PASSWORD", "pw");
+    try env.put("APP_NAME", "demo");
+    try env.put("DATABASE_URL", "postgres://x");
+    const app = try testing.allocator.create(SettingsApp);
+    defer testing.allocator.destroy(app);
+    try app.init(testing.io, testing.allocator, &env);
+    defer app.deinit();
+    var a = try testing_rt.request(testing.allocator, app, .{ .target = "/api/v1/mail" });
+    defer a.deinit();
+    try testing.expectEqualStrings("pw@localhost/demo/4", a.body);
+    const report = app.get(ConfigReport);
+    try testing.expectEqualStrings("DATABASE_URL", report.vars[0].name);
+    try testing.expectEqual(config.Origin.Kind.env, report.vars[0].origin);
+}
+
+test "every section's problems fail boot together" {
+    var env: std.process.Environ.Map = .init(testing.allocator);
+    defer env.deinit();
+    const app = try testing.allocator.create(SettingsApp);
+    defer testing.allocator.destroy(app);
+    try testing.expectError(error.InvalidConfig, app.init(testing.io, testing.allocator, &env));
+}
+
+test "an overridden section or Config skips env" {
+    var env: std.process.Environ.Map = .init(testing.allocator);
+    defer env.deinit();
+    const app = try testing.allocator.create(SettingsApp);
+    defer testing.allocator.destroy(app);
+    try app.initWith(testing.io, testing.allocator, &env, .{ MailSettings{ .password = "fake" }, RequiredConfig{ .database_url = "mem" } });
+    defer app.deinit();
+    try testing.expectEqualStrings("fake", app.get(MailSettings).password);
+    try testing.expectEqual(config.Origin.Kind.provided, app.get(ConfigReport).vars[0].origin);
 }

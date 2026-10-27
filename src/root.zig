@@ -33,6 +33,7 @@ pub const Container = di.Container;
 pub const Module = app.Module;
 pub const App = app.App;
 pub const Process = app.Process;
+pub const ConfigReport = app.ConfigReport;
 pub const Version = app.Version;
 
 test {
