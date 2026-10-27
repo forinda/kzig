@@ -79,6 +79,10 @@ after M6.
 | `verify-ca` against `sslrootcert=system` is refused by libpq | `verify-ca` without `sslrootcert` checks the host too (verify-full) | The system's CAs vouch for anyone's certificate |
 | `sslmode=allow` tries plaintext first | Treated as `prefer` (TLS first) | Encrypt when possible |
 | libpq links OpenSSL | std's TLS client, vendored with what Postgres needs | No C dependency |
+| kysely's SQLite compiler writes `ILIKE` (a syntax error there) | `ilike` is `LIKE` on SQLite | SQLite's LIKE already ignores ASCII case |
+| A cell missing from a multi-row insert is NULL on SQLite (kysely) | The column's default | SQLite has no `DEFAULT` in `VALUES`; NULL loses the default |
+| Nested relation rows are JSON strings, re-parsed by a plugin | `json()` around them: real nested JSON | No guessing which strings were JSON |
+| A table rebuild of a referenced table is out of scope | Migrations run with foreign keys off, checked before commit | SQLite's own ALTER TABLE procedure; the rebuild would cascade |
 | A DB adapter always reports health | `onHealthCheck` may return null; no database configured, nothing on `/health/ready` | task-api runs without a database |
 
 Kept for parity even where Zig would allow otherwise: route middleware runs **after** validation.
@@ -433,6 +437,25 @@ Still to do:
 
 Not planned: channel binding to Ed25519-signed server certificates (no hash defined; Postgres can't
 bind them either).
+
+### M19 — SQLite
+
+- [x] `-Dsqlite`: SQLite's amalgamation as a lazy dependency; the default build has no C
+- [x] `sqlite:path` / `sqlite::memory:` pools: one handle, a busy timeout, WAL for files, `?n`
+      parameters (a canonical integer binds as INTEGER)
+- [x] `Schema(…, .{ .dialect = .sqlite })`: the builder, upsert/findOrCreate and relational
+      queries (`json_group_array`/`json_object`) on SQLite; a schema run on the other kind of
+      database is `error.DialectMismatch`
+- [x] `kzig db generate` / `migrate` on SQLite: kick/db's emitter and table rebuilds; foreign keys
+      off while a migration runs and checked before it commits
+- [x] task-api: tenants and projects on SQLite from multi-tenant-kickdb-api (its latest snapshot
+      byte for byte; tenancy done by hand in the repository)
+
+### M20 — Turso and Cloudflare D1
+
+- [ ] `libsql://` over HTTP (Hrana v2 pipeline), batches and baton transactions
+- [ ] `d1://` over Cloudflare's REST API; 100 parameters per statement, no transactions
+- [ ] Migrations on both as one batch
 
 ### Later
 

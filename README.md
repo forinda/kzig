@@ -409,6 +409,31 @@ start).
 task-api's `users` module and `DbAdapter` show the whole setup: migrations on boot in
 development, `postgres` on `/health/ready`, and 503s when `DATABASE_URL` isn't set.
 
+### SQLite
+
+The same schema, builder, relations and migrations on SQLite: give the schema
+`.dialect = .sqlite` and the pool a `sqlite:` URL. Local files need SQLite's C library, which
+kzig fetches and builds only with `-Dsqlite` (the default build stays C-free).
+
+```zig
+pub const Schema = kzig.db.Schema(.{ .projects = projects, .tenants = tenants }, .{ .dialect = .sqlite });
+var pool: kzig.db.Pool = try .init(io, gpa, .{ .url = "sqlite:data/app.db" }); // or sqlite::memory:
+```
+
+```console
+$ zig build test -Dsqlite
+```
+
+Values are stored as kick/db stores them there: timestamps as `YYYY-MM-DD HH:MM:SS.SSS` UTC
+text, booleans as 1/0, enums as text; `ilike` is SQLite's `LIKE` (case-insensitive for ASCII).
+`kzig db generate` writes kick/db's SQLite DDL, with its table rebuild for changes SQLite can't
+`ALTER`; `kzig db migrate` runs each migration with foreign keys off and checks them before it
+commits, so rebuilding a table others reference keeps their rows. A file has one connection;
+writers wait for each other (5 s busy timeout) instead of failing.
+
+task-api's `projects` module and `TenantDbAdapter` run on SQLite with multi-tenant-kickdb-api's
+schema and migrations, beside the Postgres `DbAdapter`.
+
 ## WebSockets
 
 KickJS's `@forinda/kickjs-ws`: a gateway in a module's `.gateways`, at `/ws` + its `path`.

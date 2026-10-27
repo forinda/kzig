@@ -31,6 +31,7 @@ table.
 zig build              # Build
 zig build test         # Run all tests (std runtime)
 zig build test -Dhttpz # …plus the http.zig runtime (fetches http.zig)
+zig build test -Dsqlite # …plus local SQLite (fetches SQLite's amalgamation)
 zig build bench -Dhttpz -Doptimize=ReleaseFast && ./benchmarks/run.sh
 ./scripts/scaffold-check.sh # kzig new + generators, built and tested (after CLI or template changes)
 zig fmt build.zig src examples tests benchmarks              # Format
@@ -67,7 +68,8 @@ src/
   storage/             # storage.zig (interface, memory, disk), s3.zig (SigV4, std.http.Client)
   db/                  # db.zig (Pool, Tx), pg.zig (Postgres protocol, SCRAM), migrate.zig,
                        # schema.zig (tables), query.zig (builder), timestamp.zig,
-                       # snapshot.zig, diff.zig, emit_pg.zig, generate.zig (kzig db generate),
+                       # snapshot.zig, diff.zig, emit_pg.zig, emit_sqlite.zig,
+                       # generate.zig (kzig db generate), sqlite.zig (local files, -Dsqlite),
                        # relational.zig (query(.t).findMany with `with`), tls/ (std's TLS client
                        # vendored with ALPN, channel binding, client certs; keys.zig)
   cli/                 # The `kzig` CLI: main.zig, dev.zig, names, templates/*.tpl, registry
