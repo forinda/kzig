@@ -105,7 +105,7 @@ test "cron: skips a run while the previous one is still going" {
     defer t.deinit();
     const jobs = t.app.get(kzig.cron.Jobs);
     var first = try testing.io.concurrent(kzig.cron.Jobs.run, .{ jobs, "sync-inventory", kzig.cron.Trigger.manual });
-    try testing.io.sleep(.fromMilliseconds(50), .awake);
+    while (!jobs.isRunning(jobs.find("sync-inventory").?)) try testing.io.sleep(.fromMilliseconds(1), .awake);
     try testing.expectEqual(kzig.cron.Result{ .ran = 0, .failed = 0 }, jobs.run("sync-inventory", .manual));
     try testing.expectEqual(kzig.cron.Result{ .ran = 1, .failed = 0 }, first.await(testing.io));
 }

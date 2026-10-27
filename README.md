@@ -298,7 +298,9 @@ pub const MaintenanceJobs = struct {
 
 Expressions have 5 fields or 6 (seconds first), with names, ranges, steps and lists; a bad one
 fails `zig build`. Timezones come from the system's zoneinfo (`CRON_ZONEINFO`). A run while the
-previous is still going is skipped unless `.overlap = true`. `CRON_ENABLED=false` schedules
+previous is still going is skipped unless `.overlap = true`. Across a daylight-saving change, a
+local time that doesn't exist is skipped, and in a repeated hour only jobs with `*` hours run
+again. `CRON_ENABLED=false` schedules
 nothing (one replica of several, say). Inject `*kzig.cron.Jobs` to list jobs, get their next run
 or run one now; a failure reaches adapters' `onCronError(err, info)`. Shutdown stops the
 schedule and waits for runs in flight. task-api's `crons` module is the archive's

@@ -14,6 +14,8 @@ pub const Expr = struct {
     /// Both day fields restricted: either may match (croner's legacy mode,
     /// as Vixie cron).
     either_day: bool,
+    /// Every hour: such a job also runs in a repeated (fall-back) hour.
+    every_hour: bool = false,
 
     /// 5 fields (`min hour dom mon dow`) or 6 (seconds first).
     pub fn parse(text: []const u8) error{InvalidCron}!Expr {
@@ -37,6 +39,7 @@ pub const Expr = struct {
             .seconds = if (n == 6) try field(f[0], 0, 59, null) else 1,
             .minutes = try field(f[off], 0, 59, null),
             .hours = try field(f[off + 1], 0, 23, null),
+            .every_hour = try field(f[off + 1], 0, 23, null) == (1 << 24) - 1,
             .days = try field(dom, 1, 31, null),
             .months = try field(f[off + 3], 1, 12, &month_names),
             .weekdays = weekdays & 0x7f,
@@ -78,16 +81,25 @@ pub const Expr = struct {
         return null;
     }
 
-    /// The first run after `after` (UTC) in `zone`'s wall-clock time.
-    // ponytail: in a DST gap a missing local time runs an hour late; in an
-    // overlap the earlier instant wins. croner skips/dedupes instead.
+    /// The first run after `after` (UTC) in `zone`'s wall-clock time,
+    /// walked between the zone's offset changes. A local time that doesn't
+    /// exist (spring forward) is skipped; in a repeated hour (fall back) a
+    /// job whose hour field is `*` keeps running, a fixed time runs once
+    /// (Vixie cron's rule).
     pub fn nextIn(e: Expr, zone: *const Zone, after: i64) ?i64 {
-        var local = after + zone.offsetAt(after);
-        for (0..4) |_| {
-            local = e.next(local) orelse return null;
-            const guess = local - zone.offsetAt(local - zone.offsetAt(local));
-            const t = local - zone.offsetAt(guess);
-            if (t > after) return t;
+        var t = after;
+        // Local time already covered before an offset fell back.
+        var covered: ?i64 = null;
+        for (0..64) |_| {
+            const offset = zone.offsetAt(t + 1);
+            const end = zone.nextChange(t + 1) orelse std.math.maxInt(i64);
+            var from = t + offset;
+            if (covered) |c| from = @max(from, c);
+            const local = e.next(from) orelse return null;
+            const u = local - offset;
+            if (u < end) return u;
+            if (!e.every_hour) covered = end - 1 + offset;
+            t = end - 1;
         }
         return null;
     }
@@ -200,6 +212,29 @@ pub const Zone = struct {
         gpa.free(z.transitions);
     }
 
+    /// The first offset change after `t`, if any.
+    pub fn nextChange(z: *const Zone, t: i64) ?i64 {
+        const ts = z.transitions;
+        if (ts.len > 0 and t < ts[ts.len - 1].at) {
+            // The first transition after `t`.
+            var lo: usize = 0;
+            var hi: usize = ts.len - 1;
+            while (lo < hi) {
+                const mid = (lo + hi) / 2;
+                if (ts[mid].at > t) hi = mid else lo = mid + 1;
+            }
+            return ts[lo].at;
+        }
+        const r = z.rule orelse return null;
+        if (r.dst == null) return null;
+        const year = fromCivil(@divFloor(t, 86400)).year;
+        var best: ?i64 = null;
+        for ([_]i32{ year - 1, year, year + 1 }) |y| for (r.changes(y)) |c| {
+            if (c > t and (best == null or c < best.?)) best = c;
+        };
+        return best;
+    }
+
     /// Seconds east of UTC at `t`.
     pub fn offsetAt(z: *const Zone, t: i64) i32 {
         const ts = z.transitions;
@@ -245,12 +280,17 @@ pub const Rule = struct {
         return .{ .std_offset = std_offset, .dst = .{ .offset = dst_offset, .start = start, .end = end } };
     }
 
+    /// `year`'s two changes, in UTC: into DST, out of it.
+    pub fn changes(r: Rule, year: i32) [2]i64 {
+        const d = r.dst.?;
+        // In local time: the start in standard time, the end in DST.
+        return .{ changeAt(year, d.start) - r.std_offset, changeAt(year, d.end) - d.offset };
+    }
+
     pub fn offsetAt(r: Rule, t: i64) i32 {
         const d = r.dst orelse return r.std_offset;
         const year = fromCivil(@divFloor(t + r.std_offset, 86400)).year;
-        // Changes are in local time: the start in standard time, the end in DST.
-        const start = changeAt(year, d.start) - r.std_offset;
-        const end = changeAt(year, d.end) - d.offset;
+        const start, const end = r.changes(year);
         const in_dst = if (start < end) t >= start and t < end else !(t >= end and t < start);
         return if (in_dst) d.offset else r.std_offset;
     }
@@ -290,17 +330,19 @@ pub const Rule = struct {
             while (!p.done() and std.ascii.isAlphabetic(p.peek())) p.i += 1;
             if (p.i - start < 3) return error.InvalidTimezone;
         }
-        /// `[+-]hh[:mm[:ss]]` in seconds.
+        /// `[+-]hh[:mm[:ss]]` in seconds (hours up to 167, RFC 8536).
         fn offset(p: *Parser) !i32 {
             const sign: i32 = if (p.eat('-')) -1 else if (p.eat('+')) 1 else 1;
-            var total: i32 = try p.number() * 3600;
+            const hours = try p.number();
+            if (hours > 167) return error.InvalidTimezone;
+            var total: i32 = hours * 3600;
             if (p.eat(':')) total += try p.number() * 60;
             if (p.eat(':')) total += try p.number();
             return sign * total;
         }
         fn number(p: *Parser) !i32 {
             const start = p.i;
-            while (!p.done() and std.ascii.isDigit(p.peek())) p.i += 1;
+            while (!p.done() and std.ascii.isDigit(p.peek()) and p.i - start < 4) p.i += 1;
             return std.fmt.parseInt(i32, p.s[start..p.i], 10) catch error.InvalidTimezone;
         }
         // ponytail: only the `M` form; `Jn` and `n` (Julian days) aren't used
@@ -422,6 +464,10 @@ pub const Jobs = struct {
     allowed: *const fn (*anyopaque, usize) bool = noAllowed,
     report: *const fn (*anyopaque, anyerror, ErrorInfo) void = noReport,
     scheduler: ?std.Io.Future(std.Io.Cancelable!void) = null,
+    /// `start` and `stop` may come from different threads (shutdown from a
+    /// signal); once stopped, `start` does nothing.
+    lifecycle: std.Io.Mutex = .init,
+    stopped: bool = false,
     /// Runs in flight; shutdown waits for them.
     group: std.Io.Group = .init,
 
@@ -431,6 +477,7 @@ pub const Jobs = struct {
         @memset(j.running, .init(false));
         j.zones = try j.gpa.alloc(Zone, j.infos.len);
         @memset(j.zones, Zone.utc);
+        errdefer j.deinit();
         for (j.infos, j.zones) |info, *z| if (info.timezone) |tz| {
             z.* = Zone.load(j.io, j.gpa, zoneinfo, tz) catch |err| {
                 if (!builtin.is_test) std.log.err("cron job {s}: timezone {s}: {t}", .{ info.name, tz, err });
@@ -504,6 +551,7 @@ pub const Jobs = struct {
     }
 
     fn spawn(j: *Jobs, i: usize, trigger: Trigger) void {
+        // No task to spare: run it here, holding the schedule up meanwhile.
         j.group.concurrent(j.io, runTask, .{ j, i, trigger }) catch {
             _ = j.runOne(i, trigger);
         };
@@ -515,15 +563,29 @@ pub const Jobs = struct {
 
     /// The server is up: run-on-init jobs, then the schedule.
     pub fn start(j: *Jobs) void {
-        if (!j.scheduling or j.infos.len == 0 or j.scheduler != null) return;
+        j.lifecycle.lockUncancelable(j.io);
+        defer j.lifecycle.unlock(j.io);
+        if (j.stopped or !j.scheduling or j.infos.len == 0 or j.scheduler != null) return;
         for (j.infos, 0..) |info, i| if (info.run_on_init) j.spawn(i, .init);
-        j.scheduler = j.io.concurrent(loop, .{j}) catch null;
+        j.scheduler = j.io.concurrent(loop, .{j}) catch |err| blk: {
+            if (!builtin.is_test) std.log.err("cron: can't start the scheduler: {t}", .{err});
+            break :blk null;
+        };
     }
 
-    /// No more ticks; runs in flight carry on (deinit waits for them).
+    /// No more ticks; runs in flight carry on (deinit waits for them, as
+    /// KickJS does: a job that never returns holds shutdown up).
     pub fn stop(j: *Jobs) void {
+        j.lifecycle.lockUncancelable(j.io);
+        defer j.lifecycle.unlock(j.io);
+        j.stopped = true;
         if (j.scheduler) |*f| f.cancel(j.io) catch {};
         j.scheduler = null;
+    }
+
+    /// The job's run is in progress (overlap is off).
+    pub fn isRunning(j: *const Jobs, i: usize) bool {
+        return j.running[i].load(.acquire);
     }
 
     fn loop(j: *Jobs) std.Io.Cancelable!void {
@@ -741,7 +803,7 @@ test "jobs: a run while the last is still going is skipped" {
     defer app.deinit();
     const jobs = app.get(Jobs);
     var first = try testing.io.concurrent(Jobs.run, .{ jobs, "slow", Trigger.manual });
-    try testing.io.sleep(.fromMilliseconds(50), .awake);
+    while (!jobs.isRunning(jobs.find("slow").?)) try testing.io.sleep(.fromMilliseconds(1), .awake);
     try testing.expectEqual(Result{ .ran = 0, .failed = 0 }, jobs.run("slow", .manual));
     try testing.expectEqual(Result{ .ran = 1, .failed = 0 }, first.await(testing.io));
 }
@@ -765,4 +827,31 @@ test "jobs: CRON_ENABLED=false schedules nothing" {
     try testing.io.sleep(.fromMilliseconds(100), .awake);
     app.beginDrain();
     try testing.expectEqual(0, app.get(Ticker).boots.load(.acquire));
+}
+
+test "DST: spring-forward never ends a schedule; a missing local time is skipped" {
+    const berlin: Zone = .{ .rule = try Rule.parse("CET-1CEST,M3.5.0,M10.5.0/3") };
+    const every = try Expr.parse("* * * * *");
+    try testing.expectEqual(@as(?i64, at(2030, 3, 31, 1, 0, 0)), every.nextIn(&berlin, at(2030, 3, 31, 0, 59, 0)));
+    // 02:30 doesn't exist that day: the next is the 1st's (CEST, 00:30 UTC).
+    const daily = try Expr.parse("30 2 * * *");
+    try testing.expectEqual(@as(?i64, at(2030, 4, 1, 0, 30, 0)), daily.nextIn(&berlin, at(2030, 3, 31, 0, 0, 0)));
+    const sydney: Zone = .{ .rule = try Rule.parse("AEST-10AEDT,M10.1.0,M4.1.0/3") };
+    // AEDT starts 2030-10-06 02:00 local (16:00 UTC the day before).
+    try testing.expectEqual(@as(?i64, at(2030, 10, 5, 16, 0, 0)), every.nextIn(&sydney, at(2030, 10, 5, 15, 59, 0)));
+}
+
+test "DST: the repeated hour runs wildcard-hour jobs, fixed times once" {
+    const berlin: Zone = .{ .rule = try Rule.parse("CET-1CEST,M3.5.0,M10.5.0/3") };
+    // CEST ends 2030-10-27 03:00 local (01:00 UTC); 02:00-03:00 repeats.
+    const every = try Expr.parse("* * * * *");
+    try testing.expectEqual(@as(?i64, at(2030, 10, 27, 1, 0, 0)), every.nextIn(&berlin, at(2030, 10, 27, 0, 59, 0)));
+    const daily = try Expr.parse("30 2 * * *");
+    try testing.expectEqual(@as(?i64, at(2030, 10, 27, 0, 30, 0)), daily.nextIn(&berlin, at(2030, 10, 27, 0, 0, 0)));
+    try testing.expectEqual(@as(?i64, at(2030, 10, 28, 1, 30, 0)), daily.nextIn(&berlin, at(2030, 10, 27, 0, 30, 0)));
+}
+
+test "jobs: an unknown timezone fails boot without leaking" {
+    var app: JobsApp = undefined;
+    try testing.expectError(error.UnknownTimezone, bootJobs(&app, &.{.{ "CRON_ZONEINFO", "/nonexistent-zoneinfo" }}));
 }
