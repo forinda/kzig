@@ -57,6 +57,8 @@ after M6.
 | `KickCronAdapter({ enabled })` | Built in; `CRON_ENABLED` | Jobs need no adapter to be found |
 | `onError(err, { source: 'cron' })` | `onCronError(err, info)` | A job has no request; the info is typed |
 | The serverless `/_kick/cron/:scheduleId` trigger | Not ported | kzig runs as a server |
+| `S3Settings` requires `S3_BUCKET` | Every `S3_*` field optional; `S3.fromSettings` names the missing one when S3 is chosen | Settings are listed at comptime, and a disk app must boot without them |
+| Streams, ranges, multipart uploads, upload forms, `compose`, tus, credential providers | Not ported: whole bodies, fixed keys | file-storage-api needs none of them |
 
 Kept for parity even where Zig would allow otherwise: route middleware runs **after** validation.
 
@@ -293,9 +295,20 @@ Follow-ups:
 - [x] `zig build bench-router`: 500 routes, about 100 ns wherever the route sits (the scan:
       80–680 ns), a 404 in 300–400 ns (was 3.6–4 µs); the benchmark compiles in a third of the time
 
+### M12 — Storage
+
+- [x] `kzig.storage.Storage` (put, get, stat, exists, delete, list with a cursor, url) with
+      memory, disk (written aside and renamed) and S3 drivers; one contract test for all three
+- [x] S3: SigV4 checked against AWS's published signatures, presigned GET links, ListObjectsV2,
+      path or virtual-host style; tested against a fake bucket that checks every signature and,
+      in CI, a real S3 API (SeaweedFS)
+- [x] task-api `files` on it: `STORAGE_DRIVER` (disk in development, S3 otherwise), presigned
+      links on S3, `storage:<driver>` on `/health/ready`
+- [x] HEAD answers carry the Content-Length a GET would send (found by the S3 driver's `stat`)
+
 ### Later
 
-SSE, S3 storage, a WebSocket broker (Redis), serverless cron triggers,
+SSE, a WebSocket broker (Redis), serverless cron triggers,
 queues, database layer, a third engine (`io_uring`, edge).
 
 ## Open questions

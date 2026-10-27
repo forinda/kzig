@@ -8,8 +8,8 @@ built on `comptime` instead of decorators, so a missing service or an unknown ha
 > **Status: pre-alpha.** Modules, compile-time DI, config and settings sections, middleware,
 > context contributors, typed and validated request bodies, list queries, adapters, plugins,
 > health checks, graceful shutdown, OpenAPI with Swagger UI, file uploads, WebSockets, scheduled
-> jobs, two HTTP runtimes (`std.http`, and http.zig opt-in), an in-process test runtime and a
-> `kzig` CLI work (M1–M10). APIs will change. See the [roadmap](./ROADMAP.md).
+> jobs, file storage (disk, S3), two HTTP runtimes (`std.http`, and http.zig opt-in), an
+> in-process test runtime and a `kzig` CLI work (M1–M12). APIs will change. See the [roadmap](./ROADMAP.md).
 
 Requires **Zig 0.17.0**. No dependencies (the optional http.zig runtime fetches http.zig).
 
@@ -234,6 +234,24 @@ A type outside `allowed_types` (extensions, MIME types, `image/*`) is 415, a fil
 bytes back with `ctx.bytes(content_type, data)`. task-api's `files` module is
 [file-storage-api](https://github.com/forinda/kickjs-examples-archive) on disk: API key, signed
 download links.
+
+## Storage
+
+KickJS's `@forinda/kickjs-storage`: one `kzig.storage.Storage` over memory, a disk folder or an S3
+bucket (AWS, R2, MinIO, SeaweedFS).
+
+```zig
+var s3: kzig.storage.S3 = try .fromSettings(io, gpa, settings); // S3_BUCKET, S3_ENDPOINT, …
+defer s3.deinit();
+const files = s3.storage();
+try files.put("files/a.png", bytes, .{ .content_type = "image/png" });
+const page = try files.list(arena, .{ .prefix = "files/", .limit = 100 });
+const link = try files.url(arena, "files/a.png", .{ .expires_in = 300 }); // presigned GET
+```
+
+`get` and `stat` answer null for a missing file, `delete` of one is fine, and `list` pages with a
+cursor. Requests are signed with SigV4 by kzig itself (no SDK). task-api's `files` module picks
+the driver from `STORAGE_DRIVER`.
 
 ## WebSockets
 
