@@ -80,16 +80,17 @@ Follow-ups:
 
 ### M2 — Modules and comptime DI
 
-- [ ] `kzig.Module(.{ .name, .path, .version, .prefix, .controllers, .services })`
-- [ ] `kzig.App(.{ .modules, .config, .api_prefix })` flattening modules into one route table
-- [ ] Singletons by `*Dep` field type; `init` hooks in dependency order; `deinit` in reverse;
+- [x] `kzig.Module(.{ .name, .path, .version, .prefix, .controllers, .services })`; `.version`
+      is a number or `false`, as in KickJS
+- [x] `kzig.App(.{ .modules, .config, .api_prefix })` flattening modules into one route table
+- [x] Singletons by `*Dep` field type; `init` hooks in dependency order; `deinit` in reverse;
       rollback when an `init` fails part way
-- [ ] Compile errors: missing service, unknown handler, duplicate route, dependency cycle
-- [ ] Test overrides (`kzig.testing.app(.{ .overrides })`), allowed only in test builds
-- [ ] Config: a struct with defaults, filled from env at boot, every bad key reported at once
-- [ ] Built-in health module (`/health`)
-- [ ] `examples` build step; example tests run under `zig build test`
-- [ ] **Acceptance:** `examples/minimal-api` ported with its three tests
+- [x] Compile errors: missing service, unknown handler, duplicate route, dependency cycle
+- [x] Test overrides (`app.initWith(io, gpa, env, .{FakeRepo{ … }})`), allowed only in test builds
+- [x] Config: a struct with defaults, filled from env at boot, every bad key reported at once
+- [x] Built-in health module (`/health/live`, `/health/ready`)
+- [x] `examples` build step; example tests run under `zig build test`
+- [x] **Acceptance:** `examples/minimal-api` ported with its three tests
 
 ### M3 — Middleware and contributors
 
@@ -140,4 +141,3 @@ Settled in the milestone that first needs them:
 
 - Cancelling the accept loop and signal handling under `std.Io` (M5)
 - How a route's context type is spelled in handler signatures (M3)
-- Dispatch by `*anyopaque` thunk or by a comptime `switch`, measured on compile time (M2)

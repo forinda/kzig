@@ -1,7 +1,6 @@
 //! KickJS's built-in health module: `GET /health/live` and `GET /health/ready`,
 //! mounted without the api prefix or version. Adapter checks and draining
 //! arrive with lifecycle (M5).
-const std = @import("std");
 const app = @import("app.zig");
 const Ctx = @import("context.zig").Ctx;
 
@@ -19,9 +18,7 @@ pub const HealthController = struct {
     };
 
     pub fn live(self: *HealthController, _: *Ctx) struct { status: []const u8, uptime: f64 } {
-        const p = self.process;
-        const ns = p.started_at.durationTo(std.Io.Clock.awake.now(p.io)).toNanoseconds();
-        return .{ .status = "ok", .uptime = @as(f64, @floatFromInt(ns)) / std.time.ns_per_s };
+        return .{ .status = "ok", .uptime = self.process.uptime() };
     }
 
     pub fn ready(_: *HealthController, _: *Ctx) struct { status: []const u8, checks: []const Check } {

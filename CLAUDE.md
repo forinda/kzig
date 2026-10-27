@@ -42,6 +42,8 @@ src/
   root.zig             # Public API — re-exports only, selective
   app.zig              # App(.{ … }), Module(.{ … }), boot and shutdown
   di.zig               # Comptime container
+  config.zig           # Config struct from env
+  health.zig           # Built-in /health/live, /health/ready
   context.zig          # Ctx, Request/Response views, return-value send
   router.zig           # Route table, matching, 404/405
   problem.zig          # RFC 9457 problem bodies, error-set → status
@@ -50,6 +52,7 @@ src/
   runtime/httpz.zig    # http.zig engine (M6)
   testing.zig          # In-process runtime and assertions
 examples/              # Ported kickjs-examples-archive apps
+tests/compile_errors/  # Fixtures that must fail to compile (listed in build.zig)
 ```
 
 Files appear as their milestone lands; don't scaffold ahead.

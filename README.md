@@ -5,67 +5,113 @@ middleware, context contributors and adapters, with KickJS's boot order and requ
 built on `comptime` instead of decorators, so a missing service or an unknown handler fails
 `zig build`, not the first request.
 
-> **Status: pre-alpha.** The core runtime (M1) works: router, request context, problem bodies,
-> an HTTP server on `std.http` and an in-process test runtime. Modules and dependency injection
-> (M2) are next. APIs will change. See the [roadmap](./ROADMAP.md).
+> **Status: pre-alpha.** Modules, compile-time DI, env config, the router, problem bodies, an
+> HTTP server on `std.http` and an in-process test runtime work (M1–M2). Middleware and context
+> contributors (M3) are next. APIs will change. See the [roadmap](./ROADMAP.md).
 
 Requires **Zig 0.17.0**. No dependencies.
 
 ## Example
 
+The [`minimal-api`](./examples/minimal-api) port of KickJS's smallest app, file for file:
+
 ```zig
-const std = @import("std");
-const kzig = @import("kzig");
+// hello.service.zig
+pub const HelloService = struct {
+    process: *const kzig.Process, // injected by type
 
-fn hello(_: *kzig.Ctx) struct { message: []const u8 } {
-    return .{ .message = "Hello World from kzig!" };
-}
+    pub fn greet(self: *HelloService, arena: std.mem.Allocator, name: []const u8) !Greeting { … }
+};
 
-fn user(ctx: *kzig.Ctx) !struct { id: []const u8 } {
-    const id = ctx.param("id").?;
-    if (std.mem.eql(u8, id, "0")) return error.NotFound; // 404 problem+json
-    return .{ .id = id };
-}
+// hello.controller.zig
+pub const HelloController = struct {
+    hello: *HelloService, // a missing service is a compile error
 
-const App = kzig.Router(&.{
-    kzig.route(.GET, "/api/v1/hello", hello),
-    kzig.route(.GET, "/api/v1/users/:id", user),
+    pub const routes = .{
+        .{ .method = .GET, .path = "/", .handler = "index" },
+        .{ .method = .GET, .path = "/health", .handler = "health" },
+    };
+
+    pub fn index(self: *HelloController, ctx: *kzig.Ctx) !HelloService.Greeting {
+        return self.hello.greet(ctx.arena, "World"); // sent as 200 JSON
+    }
+    …
+};
+
+// hello.module.zig
+pub const HelloModule = kzig.Module(.{
+    .name = "HelloModule",
+    .path = "/hello",
+    .controllers = &.{HelloController},
+    .services = &.{HelloService},
 });
 
+// config.zig — each field reads its upper-cased env var (PORT, NODE_ENV, LOG_LEVEL)
+pub const Config = struct {
+    port: u16 = 3000,
+    node_env: enum { development, production, @"test" } = .development,
+    log_level: []const u8 = "info",
+};
+
+// main.zig
+pub const App = kzig.App(.{ .modules = &.{HelloModule}, .config = Config });
+
 pub fn main(init: std.process.Init) !void {
-    var server: kzig.runtime.std.Server(App) = try .init(init.io, init.gpa, .{ .port = 3000 });
+    var app: App = undefined;
+    try app.init(init.io, init.gpa, init.environ_map);
+    defer app.deinit();
+
+    var server: kzig.runtime.std.Server(App) = try .init(init.io, init.gpa, &app, .{ .port = app.get(Config).port });
     defer server.deinit();
     try server.run();
 }
 ```
 
 ```console
+$ zig build examples && ./zig-out/bin/minimal-api
 $ curl localhost:3000/api/v1/hello
-{"message":"Hello World from kzig!"}
-$ curl localhost:3000/api/v1/users/0
+{"message":"Hello World from kzig!","timestamp":"2026-10-27T04:39:51.658Z"}
+$ curl localhost:3000/health/ready
+{"status":"ready","checks":[]}
+$ curl localhost:3000/api/v1/nope
 {"type":"about:blank","title":"Not Found","status":404}
-$ curl -X POST -i localhost:3000/api/v1/hello
-HTTP/1.1 405 Method Not Allowed
-allow: GET, HEAD
+$ PORT=abc ./zig-out/bin/minimal-api
+error: config: PORT: expected an integer
 ```
 
-A handler's return value is the response: a struct is 200 JSON, `void` is 204, a string is
-text, a type with `sendResponse` sends itself. Return `error.NotFound`, `error.Conflict`, …
-for an RFC 9457 problem body, or `ctx.fail(.unprocessable_entity, "detail")` to add details.
+Routes mount at `/api/v{version}{module.path}{route.path}`; a module takes `.version = 2` or
+`.version = false`, and `.prefix = false` drops `/api`. `/health/live` and `/health/ready` are
+built in. A handler's return value is the response: a struct is 200 JSON, `void` is 204, a
+string is text, a type with `sendResponse` sends itself. Return `error.NotFound`,
+`error.Conflict`, … for an RFC 9457 problem body, or `ctx.fail(.unprocessable_entity, "detail")`
+to add details.
+
+These fail `zig build`, not the first request: a service field pointing at an unlisted service, a
+dependency cycle, a route naming a missing handler, two routes with the same method and path,
+a misspelt `Module`/`App` option.
 
 ## Testing
 
 `kzig.testing.request` runs the full pipeline in-process, no socket:
 
 ```zig
-test "GET /api/v1/hello" {
-    var res = try kzig.testing.request(std.testing.allocator, App, .{ .target = "/api/v1/hello" });
+test "GET /api/v1/hello returns a greeting" {
+    var env: std.process.Environ.Map = .init(testing.allocator);
+    defer env.deinit();
+    var app: App = undefined;
+    try app.init(testing.io, testing.allocator, &env);
+    defer app.deinit();
+
+    var res = try kzig.testing.request(testing.allocator, &app, .{ .target = "/api/v1/hello" });
     defer res.deinit();
-    try std.testing.expectEqual(.ok, res.status);
+    try testing.expectEqual(.ok, res.status);
     const body = try res.json(struct { message: []const u8 });
-    try std.testing.expectEqualStrings("Hello World from kzig!", body.message);
+    try testing.expectEqualStrings("Hello World from kzig!", body.message);
 }
 ```
+
+Replace a service in a test with `app.initWith(io, gpa, &env, .{FakeRepo{ … }})` — KickJS's
+`createTestApp({ overrides })`; outside tests it doesn't compile.
 
 ## Install
 
@@ -97,11 +143,14 @@ UTF-8 and malformed escapes answer 400. A request with both `content-length` and
 
 | KickJS | kzig |
 | --- | --- |
-| `@Controller()` / `@Get('/')` | `pub const routes = .{ … }` on a struct (M2) |
-| `@Service()` / `@Autowired()` | a `*Dep` field, wired at compile time (M2) |
-| `defineModule({ routes })` | `kzig.Module(.{ .path, .controllers })` (M2) |
+| `@Controller()` / `@Get('/')` | `pub const routes = .{ … }` on a struct |
+| `@Service()` / `@Autowired()` | a `*Dep` field, wired at compile time |
+| `defineModule({ routes })` | `kzig.Module(.{ .path, .controllers, .services })` |
+| `bootstrap({ modules })` | `kzig.App(.{ .modules, .config })` |
+| `loadEnv(zodSchema)` / `@Value('PORT')` | a `Config` struct; inject `*const Config` |
+| `@PostConstruct` / `@PreDestroy` | `pub fn init(self: *S) !void` / `pub fn deinit(self: *S) void` |
 | `throw new HttpException(422, …)` | `return ctx.fail(.unprocessable_entity, …)` |
-| `createTestApp` + supertest | `kzig.testing.request` |
+| `createTestApp` + supertest | `app.init` / `initWith` + `kzig.testing.request` |
 
 The full list of deliberate differences is in the [roadmap](./ROADMAP.md).
 

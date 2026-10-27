@@ -16,6 +16,12 @@ pub const Process = struct {
     io: std.Io,
     gpa: std.mem.Allocator,
     started_at: std.Io.Timestamp,
+
+    /// Seconds since the app started, like Node's `process.uptime()`.
+    pub fn uptime(self: *const Process) f64 {
+        const ns = self.started_at.durationTo(std.Io.Clock.awake.now(self.io)).toNanoseconds();
+        return @as(f64, @floatFromInt(ns)) / std.time.ns_per_s;
+    }
 };
 
 /// KickJS's `version: number | false`, with the app default as a third case.

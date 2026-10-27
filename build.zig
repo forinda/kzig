@@ -14,6 +14,20 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&b.addRunArtifact(tests).step);
 
+    // Apps ported from kickjs-examples-archive; their tests run with ours.
+    const examples_step = b.step("examples", "Build the example apps");
+    for (examples) |name| {
+        const root = b.createModule(.{
+            .root_source_file = b.path(b.fmt("examples/{s}/src/main.zig", .{name})),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "kzig", .module = mod }},
+        });
+        const exe = b.addExecutable(.{ .name = name, .root_module = root });
+        examples_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
+        test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = root })).step);
+    }
+
     // Each fixture must fail to compile with its message: the "compile error,
     // not boot error" guarantees.
     for (compile_errors) |case| {
@@ -25,6 +39,8 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run.step);
     }
 }
+
+const examples = [_][]const u8{"minimal-api"};
 
 const compile_errors = [_][2][]const u8{
     .{ "missing_service", "repo: no service" },
