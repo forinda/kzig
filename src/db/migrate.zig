@@ -280,29 +280,67 @@ pub fn rollback(pool: *db.Pool, a: Allocator, list: []const Migration, o: Option
     return count;
 }
 
-/// A migration's SQL and its record, in one transaction. On SQLite foreign
-/// keys are off while it runs (a table rebuild drops a table others
-/// reference; with them on, the drop deletes or cascades) and checked
-/// before it commits, as SQLite's ALTER TABLE procedure says.
+/// A migration's SQL and its record, in one transaction. On SQLite a
+/// migration with table rebuilds (kick/db's `_kick_new_` tables) runs with
+/// foreign keys off, as SQLite's ALTER TABLE procedure says (dropping the
+/// old table would delete or cascade the rows referencing it); before it
+/// commits the rebuilt tables' keys are checked and their triggers, dropped
+/// with the old table, made again. As kick/db's SQLite adapter.
 fn applyOne(pool: *db.Pool, a: Allocator, id: []const u8, sql: []const u8, record: []const u8, args: anytype) !void {
-    const sqlite = pool.dialect() == .sqlite;
-    if (sqlite) try pool.execScript("PRAGMA foreign_keys = OFF");
-    defer if (sqlite) pool.execScript("PRAGMA foreign_keys = ON") catch {};
-    var tx = try pool.begin();
+    const rebuilt = if (pool.dialect() == .sqlite) try rebuiltTables(a, sql) else &.{};
+    var triggers: []const []const u8 = &.{};
+    if (rebuilt.len > 0) {
+        var list: std.ArrayList([]const u8) = .empty;
+        for (rebuilt) |t| for (try pool.query(a, struct { sql: []const u8 }, "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ?1", .{t})) |r|
+            try list.append(a, r.sql);
+        triggers = list.items;
+    }
+    var tx = if (rebuilt.len > 0)
+        try pool.beginWith(.{ .before = "PRAGMA foreign_keys = OFF", .after = "PRAGMA foreign_keys = ON" })
+    else
+        try pool.begin();
     defer tx.deinit();
+    // Rows already broken before the migration aren't its doing.
+    const Broken = struct { table: []const u8, rowid: ?i64, parent: []const u8 };
+    const check = "PRAGMA foreign_key_check";
+    const before = if (rebuilt.len > 0) try tx.query(a, Broken, check, .{}) else &.{};
     tx.execScript(sql) catch |err| {
         if (!builtin.is_test) std.log.err("migration {s} failed; rolled back", .{id});
         return err;
     };
+    for (triggers) |t| try tx.execScript(t);
     _ = try tx.exec(record, args);
-    if (sqlite) {
-        const broken = try tx.query(a, struct { table: []const u8 }, "PRAGMA foreign_key_check", .{});
-        if (broken.len > 0) {
-            if (!builtin.is_test) std.log.err("migration {s} leaves rows in {s} whose foreign key matches nothing; rolled back", .{ id, broken[0].table });
+    if (rebuilt.len > 0) {
+        for (try tx.query(a, Broken, check, .{})) |r| for (rebuilt) |t| {
+            if (!std.mem.eql(u8, r.table, t) and !std.mem.eql(u8, r.parent, t)) continue;
+            if (for (before) |b| {
+                if (std.mem.eql(u8, b.table, r.table) and std.mem.eql(u8, b.parent, r.parent) and b.rowid == r.rowid) break true;
+            } else false) continue;
+            if (!builtin.is_test) std.log.err("migration {s} leaves rows in {s} whose foreign key to {s} matches nothing; rolled back", .{ id, r.table, r.parent });
             return error.ForeignKeyViolation;
-        }
+        };
     }
     try tx.commit();
+}
+
+/// The tables a migration rebuilds: `ALTER TABLE "_kick_new_<t>" RENAME TO`.
+fn rebuiltTables(a: Allocator, sql: []const u8) ![]const []const u8 {
+    const marker = "ALTER TABLE \"_kick_new_";
+    var out: std.ArrayList([]const u8) = .empty;
+    var i: usize = 0;
+    while (std.mem.findPos(u8, sql, i, marker)) |at| {
+        var name: std.ArrayList(u8) = .empty;
+        var j = at + marker.len;
+        while (j < sql.len) : (j += 1) {
+            if (sql[j] == '"') {
+                if (j + 1 < sql.len and sql[j + 1] == '"') j += 1 else break;
+            }
+            try name.append(a, sql[j]);
+        }
+        try out.append(a, name.items);
+        i = j;
+    }
+    return out.items;
 }
 
 /// What an app does at boot (KickJS's `kickDbAdapter`): apply pending
@@ -589,6 +627,44 @@ test "SQLite: a migration that breaks a foreign key is rolled back" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    try testing.expectError(error.ForeignKeyViolation, latest(&pool, a, try load(testing.io, a, m.path), opts));
+    // Foreign keys are on for a migration without rebuilds: the insert fails.
+    try testing.expectError(error.DbError, latest(&pool, a, try load(testing.io, a, m.path), opts));
     try testing.expectError(error.DbError, pool.exec("SELECT * FROM posts", .{}));
+}
+
+test "SQLite: foreign keys stay on for migrations that don't rebuild; old orphans don't block; triggers survive a rebuild" {
+    if (!@import("kzig_options").sqlite) return error.SkipZigTest;
+    var pool: db.Pool = try .init(testing.io, testing.allocator, .{ .url = "sqlite::memory:" });
+    defer pool.deinit();
+    try pool.execScript(
+        \\CREATE TABLE "users" ("id" INTEGER PRIMARY KEY, "name" TEXT);
+        \\CREATE TABLE "posts" ("id" INTEGER PRIMARY KEY, "authorId" INTEGER REFERENCES "users" ("id") ON DELETE CASCADE);
+        \\CREATE TABLE "audit" ("n" INTEGER);
+        \\CREATE TRIGGER "users_audit" AFTER INSERT ON "users" BEGIN INSERT INTO "audit" VALUES (1); END;
+        \\INSERT INTO "users" VALUES (1, 'Ada'), (2, 'Bo');
+        \\INSERT INTO "posts" VALUES (1, 1), (2, 2);
+        \\PRAGMA foreign_keys = OFF; INSERT INTO "posts" VALUES (3, 99); PRAGMA foreign_keys = ON;
+    );
+    var m = try TmpMigrations.init();
+    defer m.deinit();
+    // A data migration: the delete cascades as it would outside a migration.
+    try m.add("20260101_000000_a", "DELETE FROM \"users\" WHERE id = 1;", "");
+    // Unrelated to the old orphan in posts.
+    try m.add("20260102_000000_b", "CREATE TABLE \"other\" (\"id\" INTEGER);", "");
+    // A rebuild of users: its trigger comes back.
+    try m.add("20260103_000000_c",
+        \\CREATE TABLE "_kick_new_users" ("id" INTEGER PRIMARY KEY, "name" TEXT NOT NULL);
+        \\INSERT INTO "_kick_new_users" ("id", "name") SELECT "id", "name" FROM "users";
+        \\DROP TABLE "users";
+        \\ALTER TABLE "_kick_new_users" RENAME TO "users";
+    , "");
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqual(3, (try latest(&pool, a, try load(testing.io, a, m.path), opts)).applied);
+    const N = struct { n: i64 };
+    try testing.expectEqual(2, (try pool.queryOne(a, N, "SELECT count(*) AS n FROM posts", .{})).?.n);
+    try testing.expectEqual(1, (try pool.queryOne(a, N, "SELECT count(*) AS n FROM sqlite_master WHERE type = 'trigger' AND name = 'users_audit'", .{})).?.n);
+    _ = try pool.exec("INSERT INTO users VALUES (3, 'Cy')", .{});
+    try testing.expectEqual(3, (try pool.queryOne(a, N, "SELECT count(*) AS n FROM audit", .{})).?.n); // two at setup, one now
 }
