@@ -221,3 +221,20 @@ test "files: production defaults to S3 and won't boot without S3_BUCKET" {
     defer testing.allocator.destroy(app);
     try testing.expectError(error.MissingS3Settings, app.init(testing.io, testing.allocator, &env));
 }
+
+test "files: disk storage stays healthy once it holds files" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer testing.allocator.free(dir);
+    const t = try test_app.boot(&.{ .{ "STORAGE_DRIVER", "disk" }, .{ "UPLOAD_DIR", dir }, .{ "API_KEY", key } });
+    defer t.deinit();
+    const body = try form("pic.png", "image/png", png);
+    defer testing.allocator.free(body);
+    var up = try t.request(.{ .method = .POST, .target = "/api/v1/files", .headers = &.{ bearer, multipart }, .body = body });
+    defer up.deinit();
+    try testing.expectEqual(.created, up.status);
+    var res = try t.get("/health/ready");
+    defer res.deinit();
+    try testing.expect(std.mem.find(u8, res.body, "{\"name\":\"storage:disk\",\"status\":\"up\"}") != null);
+}

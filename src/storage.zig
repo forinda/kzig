@@ -1,6 +1,7 @@
 //! KickJS's `@forinda/kickjs-storage`: one `Storage` over memory, a disk
 //! folder or an S3 bucket (`storage/s3.zig`). Whole bodies, not streams.
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
@@ -143,12 +144,20 @@ pub const Memory = struct {
         errdefer m.gpa.free(copy);
         const ct = if (options.content_type) |c| try m.gpa.dupe(u8, c) else null;
         errdefer if (ct) |c| m.gpa.free(c);
-        const owned_key = try m.gpa.dupe(u8, key);
-        errdefer m.gpa.free(owned_key);
         m.mutex.lockUncancelable(m.io);
         defer m.mutex.unlock(m.io);
-        if (m.files.fetchSwapRemove(key)) |old| m.free(old.key, old.value);
-        try m.files.put(m.gpa, owned_key, .{ .data = copy, .content_type = ct, .at = nowS(m.io) });
+        // The old file stays until the new one is in.
+        const slot = try m.files.getOrPut(m.gpa, key);
+        if (slot.found_existing) {
+            m.gpa.free(slot.value_ptr.data);
+            if (slot.value_ptr.content_type) |c| m.gpa.free(c);
+        } else {
+            slot.key_ptr.* = m.gpa.dupe(u8, key) catch |err| {
+                m.files.swapRemoveAt(slot.index);
+                return err;
+            };
+        }
+        slot.value_ptr.* = .{ .data = copy, .content_type = ct, .at = nowS(m.io) };
     }
 
     fn get(ptr: *anyopaque, a: Allocator, key: []const u8) anyerror!?[]u8 {
@@ -229,22 +238,51 @@ pub const Disk = struct {
         };
     }
 
+    /// Every part of `key` that exists must be a real folder or file, not a
+    /// symbolic link that could lead outside the root (KickJS's `inside`).
+    // ponytail: checked, then used: a link swapped in between still gets
+    // through, as with KickJS's realpath check.
+    fn noLinks(d: *Disk, root: Io.Dir, key: []const u8) !void {
+        // `C:x` is a drive on Windows, `a:b` an alternate stream.
+        if (builtin.os.tag == .windows and std.mem.findScalar(u8, key, ':') != null) return error.InvalidKey;
+        var end: usize = 0;
+        while (true) {
+            const next = std.mem.findScalarPos(u8, key, end, '/') orelse key.len;
+            const st = root.statFile(d.io, key[0..next], .{ .follow_symlinks = false }) catch |err| switch (err) {
+                error.FileNotFound, error.NotDir => return,
+                else => return err,
+            };
+            if (st.kind == .sym_link) return error.InvalidKey;
+            if (next == key.len) return;
+            end = next + 1;
+        }
+    }
+
     fn put(ptr: *anyopaque, key: []const u8, data: []const u8, _: PutOptions) anyerror!void {
         const d: *Disk = @ptrCast(@alignCast(ptr));
         var root = (try d.open(true)).?;
         defer root.close(d.io);
+        try d.noLinks(root, key);
         if (std.fs.path.dirname(key)) |parent| try root.createDirPath(d.io, parent);
         var buf: [std.fs.max_path_bytes]u8 = undefined;
         const temp = try std.mem.print(&buf, "{s}.{s}.tmp", .{ key, &@import("multipart.zig").uuid(d.io) });
-        try root.writeFile(d.io, .{ .sub_path = temp, .data = data });
         errdefer root.deleteFile(d.io, temp) catch {};
+        try root.writeFile(d.io, .{ .sub_path = temp, .data = data });
         try root.rename(temp, root, key, d.io);
+    }
+
+    /// `put`'s `<key>.<uuid>.tmp`.
+    fn isTemp(key: []const u8) bool {
+        if (key.len < 41 or !std.mem.endsWith(u8, key, ".tmp") or key[key.len - 41] != '.') return false;
+        for (key[key.len - 40 .. key.len - 4]) |c| if (!std.ascii.isHex(c) and c != '-') return false;
+        return true;
     }
 
     fn get(ptr: *anyopaque, a: Allocator, key: []const u8) anyerror!?[]u8 {
         const d: *Disk = @ptrCast(@alignCast(ptr));
         var root = try d.open(false) orelse return null;
         defer root.close(d.io);
+        try d.noLinks(root, key);
         return root.readFileAlloc(d.io, key, a, .unlimited) catch |err| switch (err) {
             error.FileNotFound, error.NotDir, error.IsDir => null,
             else => err,
@@ -255,6 +293,7 @@ pub const Disk = struct {
         const d: *Disk = @ptrCast(@alignCast(ptr));
         var root = try d.open(false) orelse return null;
         defer root.close(d.io);
+        try d.noLinks(root, key);
         const st = root.statFile(d.io, key, .{}) catch |err| switch (err) {
             error.FileNotFound, error.NotDir => return null,
             else => return err,
@@ -267,6 +306,7 @@ pub const Disk = struct {
         const d: *Disk = @ptrCast(@alignCast(ptr));
         var root = try d.open(false) orelse return;
         defer root.close(d.io);
+        try d.noLinks(root, key);
         root.deleteFile(d.io, key) catch |err| switch (err) {
             error.FileNotFound, error.NotDir => {},
             else => return err,
@@ -283,7 +323,7 @@ pub const Disk = struct {
         var walker = try root.walk(a);
         defer walker.deinit();
         while (try walker.next(d.io)) |entry| {
-            if (entry.kind != .file or std.mem.endsWith(u8, entry.path, ".tmp")) continue;
+            if (entry.kind != .file or isTemp(entry.path)) continue;
             const key = try a.dupe(u8, entry.path);
             if (std.fs.path.sep != '/') std.mem.replaceScalar(u8, key, std.fs.path.sep, '/');
             if (inPage(key, options)) try keys.append(a, key);
@@ -378,4 +418,39 @@ test "disk storage keeps the contract" {
     defer dir.close(testing.io);
     var it = dir.iterate();
     while (try it.next(testing.io)) |e| try testing.expect(!std.mem.endsWith(u8, e.name, ".tmp"));
+}
+
+test "disk refuses keys that lead out through a symbolic link" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "root");
+    try tmp.dir.createDirPath(testing.io, "outside");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "outside/secret", .data = "s3cr3t" });
+    try tmp.dir.symLink(testing.io, "../outside", "root/link", .{ .is_directory = true });
+    const root = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/root", .{tmp.sub_path});
+    defer testing.allocator.free(root);
+    var d: Disk = .{ .io = testing.io, .root = root };
+    const s = d.storage();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(error.InvalidKey, s.get(arena.allocator(), "link/secret"));
+    try testing.expectError(error.InvalidKey, s.stat(arena.allocator(), "link/secret"));
+    try testing.expectError(error.InvalidKey, s.put("link/new", "x", .{}));
+    try testing.expectError(error.InvalidKey, s.delete("link/secret"));
+    try tmp.dir.access(testing.io, "outside/secret", .{});
+    try testing.expectError(error.FileNotFound, tmp.dir.access(testing.io, "outside/new", .{}));
+}
+
+test "disk lists a key that ends in .tmp; only its own temporary files are hidden" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer testing.allocator.free(root);
+    var d: Disk = .{ .io = testing.io, .root = root };
+    try d.storage().put("notes.tmp", "n", .{});
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const page = try d.storage().list(arena.allocator(), .{});
+    try testing.expectEqual(1, page.files.len);
+    try testing.expectEqualStrings("notes.tmp", page.files[0].key);
 }

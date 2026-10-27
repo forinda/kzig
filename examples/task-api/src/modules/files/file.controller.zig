@@ -71,7 +71,7 @@ pub const FilesController = struct {
     }
 
     pub fn url(self: *FilesController, ctx: *kzig.Ctx, got: struct { params: FileId, query: UrlQuery }) !FilesService.Link {
-        if (!self.files.exists(got.params.id)) return ctx.fail(.not_found, null);
+        if (!try self.files.exists(ctx.arena, got.params.id)) return ctx.fail(.not_found, null);
         const origin = self.settings.public_url orelse try ctx.arena.print("http://{s}", .{ctx.header("host") orelse "localhost"});
         return self.files.signedUrl(ctx.arena, got.params.id, got.query.expiresIn, origin);
     }

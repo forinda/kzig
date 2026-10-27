@@ -6,9 +6,10 @@ pub const StorageAdapter = struct {
     files: *FileStorage,
 
     pub fn onHealthCheck(self: *StorageAdapter) kzig.HealthCheck {
-        var buf: [4096]u8 = undefined;
-        var fba: @import("std").heap.FixedBufferAllocator = .init(&buf);
-        const up = if (self.files.storage().list(fba.allocator(), .{ .limit = 1 })) |_| true else |_| false;
+        // Not a small fixed buffer: the disk driver walks its folder to list.
+        var arena: @import("std").heap.ArenaAllocator = .init(self.files.process.gpa);
+        defer arena.deinit();
+        const up = if (self.files.storage().list(arena.allocator(), .{ .limit = 1 })) |_| true else |_| false;
         return .{ .name = switch (self.files.driver) {
             .disk => "storage:disk",
             .s3 => "storage:s3",

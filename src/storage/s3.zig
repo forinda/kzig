@@ -185,7 +185,7 @@ pub fn httpDate(buf: *[29]u8, t: i64) []const u8 {
 
 pub fn parseHttpDate(s: []const u8) ?i64 {
     // `Fri, 24 May 2013 00:00:00 GMT`
-    if (s.len != 29) return null;
+    if (s.len != 29 or s[3] != ',' or s[4] != ' ' or s[7] != ' ' or s[11] != ' ' or s[16] != ' ' or s[19] != ':' or s[22] != ':' or !std.mem.eql(u8, s[25..], " GMT")) return null;
     const month = for (months, 1..) |m, i| {
         if (std.mem.eql(u8, s[8..11], m)) break i;
     } else return null;
@@ -194,12 +194,13 @@ pub fn parseHttpDate(s: []const u8) ?i64 {
 
 /// `2013-05-24T00:00:00.000Z`.
 fn parseIso(s: []const u8) ?i64 {
-    if (s.len < 19) return null;
+    if (s.len < 19 or s[4] != '-' or s[7] != '-' or s[10] != 'T' or s[13] != ':' or s[16] != ':') return null;
     const month = std.fmt.parseInt(u8, s[5..7], 10) catch return null;
     return civilTime(s[0..4], month, s[8..10], s[11..13], s[14..16], s[17..19]);
 }
 
 fn civilTime(y: []const u8, month: usize, d: []const u8, h: []const u8, mi: []const u8, sec: []const u8) ?i64 {
+    for ([_][]const u8{ y, d, h, mi, sec }) |part| for (part) |c| if (!std.ascii.isDigit(c)) return null;
     const year = std.fmt.parseInt(i32, y, 10) catch return null;
     const day = std.fmt.parseInt(u8, d, 10) catch return null;
     const hh = std.fmt.parseInt(i64, h, 10) catch return null;
@@ -369,8 +370,10 @@ pub const S3 = struct {
     fn send(s: *S3, a: Allocator, method: std.http.Method, key: ?[]const u8, query: []const [2][]const u8, body: ?[]const u8, content_type: ?[]const u8) !Reply {
         const path = try s.pathOf(a, key);
         const payload_hash = if (body) |b| try a.dupe(u8, &hexSha256(b)) else empty_hash;
+        // One clock read: the date header and the signature must agree.
+        const now = s.nowS();
         var stamp_buf: [16]u8 = undefined;
-        const stamp = amzDate(&stamp_buf, s.nowS());
+        const stamp = amzDate(&stamp_buf, now);
         var amz: std.ArrayList([2][]const u8) = .empty;
         try amz.appendSlice(a, &.{ .{ "x-amz-content-sha256", payload_hash }, .{ "x-amz-date", try a.dupe(u8, stamp) } });
         if (s.credentials.session_token) |t| try amz.append(a, .{ "x-amz-security-token", t });
@@ -383,7 +386,7 @@ pub const S3 = struct {
             .payload_hash = payload_hash,
             .region = s.region,
             .credentials = s.credentials,
-            .time = s.nowS(),
+            .time = now,
         });
         var headers: std.ArrayList(std.http.Header) = .empty;
         for (amz.items) |h| try headers.append(a, .{ .name = h[0], .value = h[1] });
@@ -625,6 +628,7 @@ const FakeS3 = struct {
         const path = ctx.req.path[0 .. std.mem.findScalar(u8, ctx.req.path, '?') orelse ctx.req.path.len];
         if (param(q, "X-Amz-Signature")) |given| {
             const date = param(q, "X-Amz-Date") orelse return deny(ctx);
+            if (date.len != 16 or given.len != 64) return deny(ctx);
             var t = civilTime(date[0..4], std.fmt.parseInt(u8, date[4..6], 10) catch 0, date[6..8], date[9..11], date[11..13], date[13..15]) orelse return deny(ctx);
             const expires = std.fmt.parseInt(u32, param(q, "X-Amz-Expires") orelse "0", 10) catch 0;
             const now: i64 = @intCast(@divFloor(Io.Clock.real.now(ctx.io.?).toNanoseconds(), std.time.ns_per_s));
@@ -647,6 +651,7 @@ const FakeS3 = struct {
         const payload = ctx.header("x-amz-content-sha256") orelse return deny(ctx);
         if (!std.mem.eql(u8, payload, &hexSha256(ctx.req.body))) return deny(ctx);
         const date = ctx.header("x-amz-date") orelse return deny(ctx);
+        if (date.len != 16) return deny(ctx);
         const t = civilTime(date[0..4], std.fmt.parseInt(u8, date[4..6], 10) catch 0, date[6..8], date[9..11], date[11..13], date[13..15]) orelse return deny(ctx);
         const want = try sign(ctx.arena, .{ .method = @tagName(ctx.req.method), .host = host, .path = path, .query = q, .headers = headers.items, .payload_hash = payload, .region = "us-east-1", .credentials = example, .time = t });
         if (!std.mem.eql(u8, &want.signature, given)) return deny(ctx);

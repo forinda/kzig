@@ -74,14 +74,13 @@ pub const FilesService = struct {
         return .{ .data = data, .content_type = typeOf(id) };
     }
 
-    pub fn exists(self: *FilesService, id: []const u8) bool {
-        var buf: [128]u8 = undefined;
-        const key = std.mem.print(&buf, prefix ++ "{s}", .{id}) catch return false;
-        return self.files.storage().exists(key) catch false;
+    /// A storage failure is an error (500), not "no such file".
+    pub fn exists(self: *FilesService, arena: std.mem.Allocator, id: []const u8) !bool {
+        return self.files.storage().exists(try keyOf(arena, id));
     }
 
     pub fn remove(self: *FilesService, arena: std.mem.Allocator, id: []const u8) !bool {
-        if (!self.exists(id)) return false;
+        if (!try self.exists(arena, id)) return false;
         try self.files.storage().delete(try keyOf(arena, id));
         return true;
     }
