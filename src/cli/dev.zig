@@ -116,20 +116,23 @@ fn binName(io: Io, arena: Allocator, cwd: Io.Dir) !?[]const u8 {
     while (std.mem.findPos(u8, source, pos, "addExecutable(")) |at| {
         pos = at + "addExecutable(".len;
         const line = if (std.mem.findScalarLast(u8, source[0..at], '\n')) |n| n + 1 else 0;
-        if (std.mem.find(u8, source[line..at], "//") != null) continue;
-        const call = source[pos..closing(source, pos)];
+        if (std.mem.startsWith(u8, std.mem.trimStart(u8, source[line..at], " \t"), "//")) continue;
+        const call = source[pos .. closing(source, pos) orelse return null];
         const name_at = std.mem.find(u8, call, ".name = ") orelse return null;
         const value = call[name_at + ".name = ".len ..];
         if (value.len == 0 or value[0] != '"') return null;
         const end = std.mem.findScalarPos(u8, value, 1, '"') orelse return null;
+        // `"app" ++ suffix` is computed too.
+        const after = std.mem.trimStart(u8, value[end + 1 ..], " \t\n");
+        if (after.len == 0 or (after[0] != ',' and after[0] != '}')) return null;
         return value[1..end];
     }
     return null;
 }
 
 /// The `)` closing a call whose arguments start at `from` (strings holding
-/// parentheses aside).
-fn closing(source: []const u8, from: usize) usize {
+/// parentheses aside); null while the call is half-written.
+fn closing(source: []const u8, from: usize) ?usize {
     var depth: usize = 1;
     for (source[from..], from..) |c, i| switch (c) {
         '(' => depth += 1,
@@ -139,7 +142,7 @@ fn closing(source: []const u8, from: usize) usize {
         },
         else => {},
     };
-    return source.len;
+    return null;
 }
 
 /// A hash of every watched file's path, size and modification time.
@@ -165,7 +168,13 @@ fn snapshot(io: Io, gpa: Allocator, cwd: Io.Dir) ?u64 {
 }
 
 fn hashFile(io: Io, gpa: Allocator, dir: Io.Dir, path: []const u8, h: *std.hash.Wyhash) void {
-    const bytes = dir.readFileAlloc(io, path, gpa, .limited(16 << 20)) catch return;
+    const bytes = dir.readFileAlloc(io, path, gpa, .limited(16 << 20)) catch {
+        // Too big to read each tick (generated code): its size and time will do.
+        const st = dir.statFile(io, path, .{}) catch return;
+        h.update(std.mem.asBytes(&st.size));
+        h.update(std.mem.asBytes(&st.mtime.nanoseconds));
+        return;
+    };
     defer gpa.free(bytes);
     h.update(bytes);
 }
@@ -218,6 +227,25 @@ test "binName skips commented-out calls and doesn't read past the call" {
         \\const t = b.addTest(.{ .name = "unit", .root_module = mod });
     });
     try std.testing.expectEqual(null, try binName(io, a, tmp.dir));
+
+    for ([_][]const u8{
+        // Computed, though it starts with a literal.
+        \\const exe = b.addExecutable(.{ .name = "app" ++ suffix });
+        ,
+        // Half-written: the call never closes.
+        \\const exe = b.addExecutable(.{ .root_module = mod,
+        \\const t = b.addTest(.{ .name = "unit" });
+        ,
+    }) |source| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "build.zig", .data = source });
+        try std.testing.expectEqual(null, try binName(io, a, tmp.dir));
+    }
+
+    // `//` in a string isn't a comment.
+    try tmp.dir.writeFile(io, .{ .sub_path = "build.zig", .data =
+        \\const u = "http://x"; const exe = b.addExecutable(.{ .name = "demo-app" });
+    });
+    try std.testing.expectEqualStrings("demo-app", (try binName(io, a, tmp.dir)).?);
 }
 
 test "snapshot sees an edit that keeps the size and modification time" {
