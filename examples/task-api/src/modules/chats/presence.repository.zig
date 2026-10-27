@@ -21,8 +21,13 @@ pub const Presence = struct {
         self.mutex.lockUncancelable(self.process.io);
         defer self.mutex.unlock(self.process.io);
         for (self.entries.items) |e| if (std.mem.eql(u8, e.room, room) and std.mem.eql(u8, e.socket, socket)) return;
-        const entry: Entry = .{ .room = try gpa.dupe(u8, room), .socket = try gpa.dupe(u8, socket), .name = try gpa.dupe(u8, name) };
-        try self.entries.append(gpa, entry);
+        const r = try gpa.dupe(u8, room);
+        errdefer gpa.free(r);
+        const id = try gpa.dupe(u8, socket);
+        errdefer gpa.free(id);
+        const n = try gpa.dupe(u8, name);
+        errdefer gpa.free(n);
+        try self.entries.append(gpa, .{ .room = r, .socket = id, .name = n });
     }
 
     pub fn remove(self: *Presence, room: []const u8, socket: []const u8) void {

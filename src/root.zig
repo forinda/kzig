@@ -21,6 +21,8 @@ pub const openapi = @import("openapi.zig");
 pub const multipart = @import("multipart.zig");
 /// WebSocket gateways (KickJS `@forinda/kickjs-ws`).
 pub const ws = @import("ws.zig");
+/// A WebSocket connection's loop, for runtimes (std, http.zig).
+pub const ws_serve = @import("ws/serve.zig");
 pub const Upload = multipart.Upload;
 pub const UploadedFile = multipart.File;
 pub const swagger = @import("swagger.zig");
@@ -59,6 +61,7 @@ pub const Version = app.Version;
 
 test {
     _ = @import("ws/frame.zig");
+    _ = @import("ws/serve.zig");
     _ = ws;
     _ = multipart;
     _ = context;

@@ -83,7 +83,7 @@ pub fn Upload(comptime cfg: Config) type {
                 try files.append(ctx.arena, .{
                     .field = p.name,
                     .original_name = original,
-                    .filename = try serverName(ctx.arena, uuid(ctx.io.?), original, p.content_type),
+                    .filename = try serverName(ctx.arena, uuid(ctx.io orelse return error.NoIo), original, p.content_type),
                     .content_type = p.content_type,
                     .data = p.data,
                 });
@@ -363,7 +363,11 @@ const UploadController = struct {
     pub const routes = .{
         .{ .method = .POST, .path = "/one", .handler = "one" },
         .{ .method = .POST, .path = "/many", .handler = "many" },
+        .{ .method = .POST, .path = "/typed/:n", .handler = "typed" },
     };
+    pub fn typed(_: *UploadController, _: *@import("context.zig").Ctx, got: struct { params: struct { n: u8 }, upload: Doc }) void {
+        _ = got;
+    }
     pub fn one(_: *UploadController, _: *@import("context.zig").Ctx, got: struct { upload: Doc }) !struct { name: []const u8, size: usize, title: ?[]const u8, stored: []const u8 } {
         const f = got.upload.file() orelse return error.BadRequest;
         return .{ .name = f.original_name, .size = f.data.len, .title = got.upload.field("title"), .stored = f.filename };
@@ -437,4 +441,10 @@ test "upload route docs: a multipart body with the file as binary, 413 and 415" 
     try testing.expect(std.mem.find(u8, doc.operation, "\"requestBody\":{\"required\":true,\"content\":{\"multipart/form-data\":{\"schema\":{\"type\":\"object\",\"properties\":{\"file\":{\"type\":\"string\",\"format\":\"binary\"}}}}}}") != null);
     try testing.expect(std.mem.find(u8, doc.operation, "\"413\"") != null);
     try testing.expect(std.mem.find(u8, doc.operation, "\"415\"") != null);
+}
+
+test "upload route: params are validated before the upload is read (KickJS order)" {
+    var res = try post("/api/v1/up/typed/abc", form(&.{.{ "file", "x.html", "text/html" }}));
+    defer res.deinit();
+    try testing.expectEqual(.unprocessable_entity, res.status);
 }

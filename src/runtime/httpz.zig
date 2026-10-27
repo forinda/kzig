@@ -14,7 +14,7 @@ const httpz = @import("httpz");
 const Io = std.Io;
 const Options = kzig.runtime.Options;
 const ws = kzig.ws;
-const websocket = httpz.websocket;
+const ws_serve = kzig.ws_serve;
 
 pub fn Server(comptime App: type) type {
     return struct {
@@ -23,49 +23,32 @@ pub fn Server(comptime App: type) type {
         const Handler = struct {
             server: *Self,
 
-            pub const WebsocketHandler = if (wsEnabled(App)) WsHandler else httpz.DummyWebsocketHandler;
-
             pub fn handle(h: Handler, req: *httpz.Request, res: *httpz.Response) void {
                 h.server.serve(req, res);
             }
         };
 
-        /// http.zig frames and answers pings and closes; kzig gets messages.
-        const WsHandler = struct {
+        /// A WebSocket after the 101: the socket is disowned from http.zig
+        /// and served like the std runtime's, closed only after the App let go.
+        const WsJob = struct {
             server: *Self,
-            conn: *websocket.Conn,
+            arena: std.heap.ArenaAllocator,
             gateway: usize,
             upgrade: ws.Upgrade,
-            session: ?*ws.Session = null,
+            stream: Io.net.Stream,
+            rbuf: [8192]u8 = undefined,
+            wbuf: [8192]u8 = undefined,
 
-            const Init = struct { server: *Self, gateway: usize, upgrade: ws.Upgrade };
-
-            pub fn init(conn: *websocket.Conn, ctx: *const Init) !WsHandler {
-                return .{ .server = ctx.server, .conn = conn, .gateway = ctx.gateway, .upgrade = ctx.upgrade };
-            }
-
-            /// After the handshake: the gateway's `connect` may send, or close.
-            pub fn afterInit(self: *WsHandler) !void {
-                self.session = try self.server.app.wsOpen(self.gateway, .{ .ptr = self.conn, .vtable = &conn_vtable }, self.upgrade);
-            }
-
-            pub fn clientMessage(self: *WsHandler, data: []const u8, kind: enum { text, binary }) !void {
-                const s = self.session orelse return;
-                if (kind == .binary) return s.close(1003, "Binary frames are not supported");
-                // http.zig's own cap is twice this and drops the socket silently.
-                if (data.len > App.ws_max_payload) return s.close(1009, "");
-                if (s.closed.load(.acquire)) return;
-                self.server.app.wsMessage(s, data);
-            }
-
-            pub fn clientPong(self: *WsHandler, _: []const u8) !void {
-                if (self.session) |s| self.server.app.wsPong(s);
-            }
-
-            pub fn close(self: *WsHandler) void {
-                const s = self.session orelse return;
-                self.session = null;
-                self.server.app.wsClose(s);
+            fn run(job: *WsJob) void {
+                const srv = job.server;
+                defer {
+                    job.stream.close(srv.io);
+                    job.arena.deinit();
+                    srv.gpa.destroy(job);
+                }
+                var sr = job.stream.reader(srv.io, &job.rbuf);
+                var sw = job.stream.writer(srv.io, &job.wbuf);
+                ws_serve.serve(App, srv.app, srv.io, srv.gpa, job.stream, &sr.interface, &sw.interface, job.gateway, job.upgrade);
             }
         };
 
@@ -78,6 +61,8 @@ pub fn Server(comptime App: type) type {
         /// `self` has its final address.
         gpa: std.mem.Allocator,
         built: std.atomic.Value(bool) = .init(false),
+        /// WebSocket connections, which outlive their request.
+        ws_group: Io.Group = .init,
 
         pub fn init(io: Io, gpa: std.mem.Allocator, app: *App, options: Options) !Self {
             var o = options;
@@ -89,6 +74,8 @@ pub fn Server(comptime App: type) type {
         }
 
         pub fn deinit(self: *Self) void {
+            // Drain closed them; this ends any still open.
+            self.ws_group.cancel(self.io);
             if (self.built.load(.acquire)) self.engine.deinit();
         }
 
@@ -99,9 +86,7 @@ pub fn Server(comptime App: type) type {
         /// Serves until `shutdown`; requests in flight finish first.
         pub fn run(self: *Self) !void {
             if (!self.built.load(.acquire)) {
-                var cfg = config(self.options, self.io);
-                if (comptime wsEnabled(App)) cfg.websocket = .{ .max_message_size = App.ws_max_payload * 2 };
-                self.engine = try .init(self.io, self.gpa, cfg, .{ .server = self });
+                self.engine = try .init(self.io, self.gpa, config(self.options, self.io), .{ .server = self });
                 self.built.store(true, .release);
             }
             var announce = try self.io.concurrent(announceStarted, .{self});
@@ -137,15 +122,48 @@ pub fn Server(comptime App: type) type {
         }
 
         fn upgradeTo(self: *Self, req: *httpz.Request, res: *httpz.Response, gateway: usize) void {
-            const headers = req.arena.alloc(kzig.Header, req.headers.len) catch return internalError(res);
+            const key = req.header("sec-websocket-key");
+            if (ws_serve.check(key, req.header("sec-websocket-version"))) |refusal| {
+                res.header("content-type", "application/problem+json");
+                switch (refusal) {
+                    .bad_request => {
+                        res.status = 400;
+                        res.body = "{\"type\":\"about:blank\",\"title\":\"Bad Request\",\"status\":400}";
+                    },
+                    .upgrade_required => {
+                        res.status = 426;
+                        res.header("sec-websocket-version", "13");
+                        res.body = "{\"type\":\"about:blank\",\"title\":\"Upgrade Required\",\"status\":426}";
+                    },
+                }
+                return;
+            }
+            const job = self.gpa.create(WsJob) catch return internalError(res);
+            job.* = .{ .server = self, .arena = .init(self.gpa), .gateway = gateway, .upgrade = undefined, .stream = res.conn.stream };
+            // The request's memory goes back to http.zig when this returns.
+            job.upgrade = copyUpgrade(job.arena.allocator(), req) catch {
+                job.arena.deinit();
+                self.gpa.destroy(job);
+                return internalError(res);
+            };
+            res.conn.blockingMode() catch {};
+            res.disown() catch {};
+            var buf: [256]u8 = undefined;
+            var w = job.stream.writer(self.io, &buf);
+            w.interface.print("HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: upgrade\r\nsec-websocket-accept: {s}\r\n\r\n", .{&ws_serve.acceptKey(key.?)}) catch {};
+            w.interface.flush() catch {};
+            self.ws_group.concurrent(self.io, WsJob.run, .{job}) catch {
+                job.stream.close(self.io);
+                job.arena.deinit();
+                self.gpa.destroy(job);
+            };
+        }
+
+        fn copyUpgrade(a: std.mem.Allocator, req: *httpz.Request) !ws.Upgrade {
+            const headers = try a.alloc(kzig.Header, req.headers.len);
             for (req.headers.keys[0..req.headers.len], req.headers.values[0..req.headers.len], headers) |k, v, *h|
-                h.* = .{ .name = k, .value = v };
-            const init_ctx: WsHandler.Init = .{ .server = self, .gateway = gateway, .upgrade = .{ .path = req.url.path, .query = req.url.query, .headers = headers } };
-            if (httpz.upgradeWebsocket(WsHandler, req, res, &init_ctx) catch false) return;
-            // No key, or not version 13.
-            res.status = 400;
-            res.header("content-type", "application/problem+json");
-            res.body = "{\"type\":\"about:blank\",\"title\":\"Bad Request\",\"status\":400}";
+                h.* = .{ .name = try a.dupe(u8, k), .value = try a.dupe(u8, v) };
+            return .{ .path = try a.dupe(u8, req.url.path), .query = try a.dupe(u8, req.url.query), .headers = headers };
         }
 
         fn serve(self: *Self, req: *httpz.Request, res: *httpz.Response) void {
@@ -218,40 +236,6 @@ const max_request_headers = 100;
 
 fn wsEnabled(comptime App: type) bool {
     return @hasDecl(App, "ws_paths") and App.ws_paths.len > 0;
-}
-
-const conn_vtable: ws.Conn.VTable = .{ .send = wsSend, .ping = wsPing, .close = wsClose };
-
-fn wsSend(ptr: *anyopaque, data: []const u8) anyerror!void {
-    const c: *websocket.Conn = @ptrCast(@alignCast(ptr));
-    try c.writeText(data);
-}
-
-fn wsPing(ptr: *anyopaque) anyerror!void {
-    const c: *websocket.Conn = @ptrCast(@alignCast(ptr));
-    var empty: [0]u8 = .{};
-    try c.writePing(&empty);
-}
-
-/// A close frame, then no more sending (code 0: drop the socket). The
-/// socket itself stays http.zig's to close, when the client hangs up.
-fn wsClose(ptr: *anyopaque, code: u16, reason: []const u8) void {
-    const c: *websocket.Conn = @ptrCast(@alignCast(ptr));
-    // http.zig closes a socket before telling the handler; until then a
-    // broadcast can reach a closed one, which websocket.zig's writes report
-    // as an error.
-    if (c.isClosed()) return;
-    if (code != 0) {
-        var payload: [125]u8 = undefined;
-        std.mem.writeInt(u16, payload[0..2], code, .big);
-        const n = @min(reason.len, payload.len - 2);
-        @memcpy(payload[2..][0..n], reason[0..n]);
-        c.writeFrame(.close, payload[0 .. 2 + n]) catch {};
-    }
-    // ponytail: the raw call, as `Io` panics on a closed descriptor; the
-    // descriptor closing (and being reused) between the check above and here
-    // is the race websocket.zig's own writes accept.
-    _ = std.posix.system.shutdown(c.stream.socket.handle, if (code == 0) std.posix.SHUT.RDWR else std.posix.SHUT.WR);
 }
 
 fn config(o: Options, io: Io) httpz.Config {

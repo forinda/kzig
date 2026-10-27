@@ -377,10 +377,17 @@ const Echo = struct {
     pub const events = .{
         .{ .event = "join", .handler = "join" },
         .{ .event = "say", .handler = "say" },
+        .{ .event = "shout", .handler = "shout" },
+        .{ .event = "blast", .handler = "blast" },
         .{ .event = "*", .handler = "unknown" },
     };
 
     pub fn connect(_: *Echo, ctx: *WsCtx) !void {
+        // A slow sign-in that fails: nothing may reach the socket meanwhile.
+        if (try ctx.query("slow") != null) {
+            try testing.io.sleep(.fromMilliseconds(300), .awake);
+            return ctx.close(4401, "Unauthorized");
+        }
         const name = try ctx.query("name") orelse return ctx.close(4401, "Unauthorized");
         ctx.state.name = try ctx.conn_arena.dupe(u8, name);
         try ctx.send("welcome", .{ .name = name });
@@ -396,6 +403,17 @@ const Echo = struct {
         try ctx.to(data.room).send("said", .{ .from = ctx.state.name, .text = data.text });
     }
 
+    pub fn shout(_: *Echo, ctx: *WsCtx) !void {
+        try ctx.broadcastAll("shouted", .{});
+    }
+
+    /// Megabytes to the room: a member that doesn't read fills its socket.
+    pub fn blast(_: *Echo, ctx: *WsCtx, data: struct { room: []const u8 }) !void {
+        const chunk: [60_000]u8 = @splat('x');
+        for (0..80) |_| try ctx.to(data.room).send("blast", @as([]const u8, &chunk));
+        try ctx.send("blasted", .{});
+    }
+
     pub fn unknown(_: *Echo, ctx: *WsCtx, _: std.json.Value) !void {
         try ctx.send("error", .{ .message = try std.fmt.allocPrint(ctx.arena, "unknown event: {s}", .{ctx.event}) });
     }
@@ -407,7 +425,7 @@ const Echo = struct {
 
 pub const WsApp = app_mod.App(.{
     .modules = &.{app_mod.Module(.{ .name = "Chat", .gateways = &.{Echo} })},
-    .ws = .{ .heartbeat_ms = 150, .max_payload = 1024 },
+    .ws = .{ .heartbeat_ms = 150, .max_payload = 1024, .write_timeout_ms = 300 },
 });
 
 fn WsHarness(comptime ServerFn: fn (type) type) type {
@@ -457,6 +475,30 @@ fn webSockets(comptime ServerFn: fn (type) type) !void {
         const anon = try h.client("/ws/echo");
         defer anon.deinit();
         if (try anon.closeCode() != 4401) return fail("ws: connect can close the socket (4401)", "");
+        // While `connect` runs, broadcasts skip the socket.
+        const slow = try h.client("/ws/echo?slow=1");
+        defer slow.deinit();
+        try a.emit("shout", .{});
+        _ = try a.expect("shouted");
+        const f = try slow.next();
+        if (f.op != 8 or f.closeCode() != 4401) return fail("ws: a socket isn't broadcast to before connect accepts it", f.data);
+    }
+    {
+        // A member that stops reading is cut after the write timeout; the
+        // rest of the room carries on.
+        var h: H = .{};
+        try h.start();
+        defer h.stop();
+        const stuck = try h.client("/ws/echo?name=stu");
+        defer stuck.deinit();
+        try stuck.emit("join", .{ .room = "r" });
+        const b = try h.client("/ws/echo?name=bea");
+        defer b.deinit();
+        try b.emit("join", .{ .room = "r" });
+        _ = try b.expect("joined");
+        try b.emit("blast", .{ .room = "r" });
+        // b reads its own share as it comes.
+        _ = b.expect("blasted") catch return fail("ws: a client that stops reading doesn't stall the others", "");
     }
     {
         var h: H = .{};
@@ -512,6 +554,10 @@ fn webSockets(comptime ServerFn: fn (type) type) !void {
         defer polite.deinit();
         try polite.sendFrame(8, "\x03\xe8");
         if (try polite.closeCode() != 1000) return fail("ws: a client's close is answered", "");
+        const odd = try h.client("/ws/echo?name=ann");
+        defer odd.deinit();
+        try odd.sendFrame(8, "\x03\xed"); // 1005 may not be sent
+        if (try odd.closeCode() != 1002) return fail("ws: an invalid close code is a protocol error", "");
     }
     {
         // Pings come every heartbeat; a socket that doesn't answer is dropped.
@@ -522,11 +568,14 @@ fn webSockets(comptime ServerFn: fn (type) type) !void {
         defer quiet.deinit();
         _ = try quiet.next(); // welcome
         if ((try quiet.next()).op != 9) return fail("ws: the heartbeat pings", "");
-        // Dropped: the socket ends, with or without a close frame.
+        // Dropped within a couple of beats (the client's own 5 s guard
+        // would end it too, so count the pings).
+        var unanswered: usize = 1;
         while (true) {
             const f = quiet.next() catch break;
             if (f.op == 8) break;
-            if (f.op != 9) return fail("ws: a socket that misses a pong is dropped", f.data);
+            unanswered += 1;
+            if (f.op != 9 or unanswered > 3) return fail("ws: a socket that misses a pong is dropped", f.data);
         }
         const lively = try h.client("/ws/echo?name=bo");
         defer lively.deinit();

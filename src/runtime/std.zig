@@ -5,8 +5,7 @@ const builtin = @import("builtin");
 const context = @import("../context.zig");
 const router = @import("../router.zig");
 const wire = @import("wire.zig");
-const ws = @import("../ws.zig");
-const frame = @import("../ws/frame.zig");
+const ws_serve = @import("../ws/serve.zig");
 
 const Io = std.Io;
 const Ctx = context.Ctx;
@@ -219,59 +218,31 @@ pub fn Server(comptime App: type) type {
         /// The handshake, then frames until either side closes. The heartbeat
         /// watches the client from here; the shutdown cutoff still applies.
         fn serveWebSocket(self: *Self, req: *http.Server.Request, gateway: usize, arena: std.mem.Allocator, stream: Io.net.Stream, r: *Io.Reader, w: *Io.Writer, deadline: *std.atomic.Value(i64)) void {
-            const io = self.io;
             deadline.store(std.math.maxInt(i64), .monotonic);
             const target = arena.dupe(u8, req.head.target) catch return;
             var headers: std.ArrayList(context.Header) = .empty;
             var key: ?[]const u8 = null;
-            var version_13 = false;
+            var version: ?[]const u8 = null;
             var it = req.iterateHeaders();
             while (it.next()) |h| {
                 const header: context.Header = .{ .name = arena.dupe(u8, h.name) catch return, .value = arena.dupe(u8, h.value) catch return };
                 headers.append(arena, header) catch return;
                 if (std.ascii.eqlIgnoreCase(h.name, "sec-websocket-key")) key = header.value;
-                if (std.ascii.eqlIgnoreCase(h.name, "sec-websocket-version")) version_13 = std.mem.eql(u8, std.mem.trim(u8, h.value, " "), "13");
+                if (std.ascii.eqlIgnoreCase(h.name, "sec-websocket-version")) version = header.value;
             }
-            if (key == null or !version_13 or req.head.expect != null) return writeRaw(w, .bad_request);
+            if (req.head.expect != null) return writeRaw(w, .bad_request);
+            if (ws_serve.check(key, version)) |refusal| return switch (refusal) {
+                .bad_request => writeRaw(w, .bad_request),
+                .upgrade_required => writeUpgradeRequired(w),
+            };
             var handshake = req.respondWebSocket(.{ .key = key.? }) catch return;
             handshake.flush() catch return;
-
-            var conn: WsConn = .{ .io = io, .stream = stream, .w = w };
             const q = std.mem.findScalar(u8, target, '?');
-            const upgrade: ws.Upgrade = .{
+            ws_serve.serve(App, self.app, self.io, self.gpa, stream, r, w, gateway, .{
                 .path = if (q) |i| target[0..i] else target,
                 .query = if (q) |i| target[i + 1 ..] else "",
                 .headers = headers.items,
-            };
-            // The app's hooks run whole even when `run` is canceled.
-            var prev = io.swapCancelProtection(.blocked);
-            const opened = self.app.wsOpen(gateway, conn.conn(), upgrade) catch null;
-            _ = io.swapCancelProtection(prev);
-            const session = opened orelse return;
-            defer {
-                prev = io.swapCancelProtection(.blocked);
-                self.app.wsClose(session);
-                _ = io.swapCancelProtection(prev);
-            }
-
-            var reader: frame.Reader = .{};
-            defer reader.deinit(self.gpa);
-            while (true) {
-                const msg = reader.next(r, self.gpa, App.ws_max_payload) catch |err| switch (err) {
-                    error.EndOfStream, error.ReadFailed, error.OutOfMemory => return,
-                    error.ProtocolError, error.TooBig, error.InvalidUtf8 => |e| return session.close(frame.closeCode(e), ""),
-                };
-                prev = io.swapCancelProtection(.blocked);
-                defer _ = io.swapCancelProtection(prev);
-                switch (msg) {
-                    // After a close was sent, wait for the client's.
-                    .text => |text| if (!session.closed.load(.acquire)) self.app.wsMessage(session, text),
-                    .binary => session.close(1003, "Binary frames are not supported"),
-                    .ping => |payload| conn.pong(payload),
-                    .pong => self.app.wsPong(session),
-                    .close => |code| return session.close(code orelse 1000, ""),
-                }
-            }
+            });
         }
 
         /// Answers before the body was read, then lingers and closes.
@@ -294,52 +265,6 @@ pub fn Server(comptime App: type) type {
 fn wsEnabled(comptime App: type) bool {
     return @hasDecl(App, "ws_paths") and App.ws_paths.len > 0;
 }
-
-/// The connection's writer, shared by its own task and broadcasts from others.
-const WsConn = struct {
-    io: Io,
-    stream: Io.net.Stream,
-    w: *Io.Writer,
-    mutex: Io.Mutex = .init,
-
-    const vtable: ws.Conn.VTable = .{ .send = WsConn.send, .ping = WsConn.ping, .close = WsConn.close };
-
-    fn conn(self: *WsConn) ws.Conn {
-        return .{ .ptr = self, .vtable = &vtable };
-    }
-
-    fn send(ptr: *anyopaque, data: []const u8) anyerror!void {
-        const self: *WsConn = @ptrCast(@alignCast(ptr));
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        try frame.write(self.w, .text, data);
-    }
-
-    fn ping(ptr: *anyopaque) anyerror!void {
-        const self: *WsConn = @ptrCast(@alignCast(ptr));
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        try frame.write(self.w, .ping, "");
-    }
-
-    fn pong(self: *WsConn, payload: []const u8) void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        frame.write(self.w, .pong, payload) catch {};
-    }
-
-    /// A close frame, then no more sending; the client answers and hangs up.
-    /// Code 0 drops the socket.
-    fn close(ptr: *anyopaque, code: u16, reason: []const u8) void {
-        const self: *WsConn = @ptrCast(@alignCast(ptr));
-        {
-            self.mutex.lockUncancelable(self.io);
-            defer self.mutex.unlock(self.io);
-            if (code != 0) frame.writeClose(self.w, code, reason) catch {};
-        }
-        self.stream.shutdown(self.io, if (code == 0) .both else .send) catch {};
-    }
-};
 
 /// Runs `app` until SIGINT or SIGTERM, then shuts down gracefully: the
 /// server drains (see `Server.shutdown`) and `serve` returns, so the caller's
@@ -480,6 +405,12 @@ fn acceptRetryable(err: anyerror) bool {
 
 const problem_400 = "{\"type\":\"about:blank\",\"title\":\"Bad Request\",\"status\":400}";
 const problem_413 = "{\"type\":\"about:blank\",\"title\":\"Payload Too Large\",\"status\":413}";
+
+/// RFC 6455 §4.2.2: a version other than 13.
+fn writeUpgradeRequired(w: *Io.Writer) void {
+    w.writeAll("HTTP/1.1 426 Upgrade Required\r\nsec-websocket-version: 13\r\ncontent-length: 0\r\nconnection: close\r\n\r\n") catch return;
+    w.flush() catch return;
+}
 
 /// For errors before there is a request to respond through; the connection closes after.
 fn writeRaw(w: *Io.Writer, status: http.Status) void {

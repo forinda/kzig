@@ -170,7 +170,7 @@ pub fn App(comptime spec: anytype) type {
 
         /// Each gateway's full path; runtimes upgrade requests to these.
         pub const ws_paths: []const []const u8 = ws.paths(gateways, ws_opts);
-        pub const ws_max_payload = ws_opts.max_payload;
+        pub const ws_options: ws.Options = ws_opts;
 
         pub const routes: []const router.Route = buildRoutes(Self, modules, api_prefix, default_version, .{ global_contributors, adapter_contributors });
         const Routes = router.Router(routes);
@@ -547,10 +547,9 @@ fn thunk(comptime AppT: type, comptime C: type, comptime name: []const u8, compt
 }
 
 /// KickJS's `validate()`: body, then query, then params; the first that
-/// fails answers 422 with every field error. An upload is read first.
+/// fails answers 422 with every field error. Then an upload is read, as
+/// KickJS runs its upload middleware after validation.
 fn decodeRequest(comptime P: type, ctx: *Ctx, store: *P.Store) !void {
-    // Before validation, as KickJS's upload middleware runs first.
-    if (P.Upload) |T| store.upload = try T.parse(ctx);
     if (P.Body) |T| {
         var issues: decode.Issues = .init(ctx.arena);
         store.body = try decode.json(T, ctx.arena, try jsonBody(ctx), &issues) orelse
@@ -568,6 +567,7 @@ fn decodeRequest(comptime P: type, ctx: *Ctx, store: *P.Store) !void {
         store.params = try decode.strings(T, ctx.arena, ParamSource{ .ctx = ctx }, &issues) orelse
             return invalid(ctx, "Invalid path parameters", issues);
     }
+    if (P.Upload) |T| store.upload = try T.parse(ctx);
 }
 
 fn invalid(ctx: *Ctx, detail: []const u8, issues: decode.Issues) error{HttpProblem} {

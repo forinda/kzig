@@ -153,11 +153,16 @@ pub const WsClient = struct {
         try w.flush();
         const r = &c.reader.interface;
         const status_line = try r.takeDelimiterInclusive('\n');
-        c.status = std.fmt.parseInt(u16, status_line[9..12], 10) catch 0;
+        c.status = if (status_line.len >= 12) std.fmt.parseInt(u16, status_line[9..12], 10) catch 0 else 0;
+        var accepted = false;
         while (true) {
-            const line = try r.takeDelimiterInclusive('\n');
-            if (std.mem.trimEnd(u8, line, "\r\n").len == 0) break;
+            const line = std.mem.trimEnd(u8, try r.takeDelimiterInclusive('\n'), "\r\n");
+            if (line.len == 0) break;
+            // RFC 6455's example key, so the expected answer is fixed.
+            if (std.ascii.startsWithIgnoreCase(line, "sec-websocket-accept:"))
+                accepted = std.mem.eql(u8, std.mem.trim(u8, line["sec-websocket-accept:".len..], " "), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
         }
+        if (c.status == 101 and !accepted) return error.BadHandshake;
         return c;
     }
 

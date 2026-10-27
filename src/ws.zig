@@ -35,6 +35,9 @@ pub const Options = struct {
     heartbeat_ms: u32 = 30_000,
     /// A larger message closes the socket with 1009.
     max_payload: usize = 64 * 1024,
+    /// A socket whose client stops reading is cut once a write has waited
+    /// this long, so it can't hold up broadcasts. 0 disables.
+    write_timeout_ms: u32 = 10_000,
 };
 
 pub fn options(comptime spec: anytype) Options {
@@ -76,7 +79,10 @@ pub const Session = struct {
     msg_arena: std.heap.ArenaAllocator,
     state: *anyopaque,
     upgrade: Upgrade,
+    /// Room names, owned by the hub's allocator.
     rooms: std.ArrayList([]const u8) = .empty,
+    /// `connect` let it in; until then broadcasts, pings and drain skip it.
+    accepted: bool = false,
     alive: std.atomic.Value(bool) = .init(true),
     closed: std.atomic.Value(bool) = .init(false),
 
@@ -97,12 +103,15 @@ pub const Session = struct {
     }
 };
 
+// ponytail: thread identity stands in for task identity, right while every
+// task has its own thread (Io.Threaded); an evented Io needs a task-local.
 /// Set while this thread holds a hub lock, so a hook that broadcasts while
 /// the hub calls it (`draining`) doesn't lock it again.
 threadlocal var holding = false;
 
 // ponytail: one lock over every socket, held while a broadcast writes; a
-// client that stops reading stalls the others. Per-socket send queues fix it.
+// client that stops reading stalls the others until its write times out
+// (`write_timeout_ms`). Per-socket send queues would remove the stall.
 /// Every open socket of an App, its rooms, and the heartbeat.
 pub const Hub = struct {
     io: Io,
@@ -149,14 +158,14 @@ pub const Hub = struct {
     fn toRoom(hub: *Hub, room: []const u8, frame: []const u8) void {
         const l = hub.lock();
         defer hub.unlock(l);
-        for (hub.sessions.items) |s| if (s.inRoom(room)) s.send(frame);
+        for (hub.sessions.items) |s| if (s.accepted and s.inRoom(room)) s.send(frame);
     }
 
     /// To the gateway's sockets, `except` one.
     fn toGateway(hub: *Hub, gateway: usize, except: ?*Session, frame: []const u8) void {
         const l = hub.lock();
         defer hub.unlock(l);
-        for (hub.sessions.items) |s| if (s.gateway == gateway and s != except) s.send(frame);
+        for (hub.sessions.items) |s| if (s.accepted and s.gateway == gateway and s != except) s.send(frame);
     }
 
     pub fn startHeartbeat(hub: *Hub) void {
@@ -175,6 +184,7 @@ pub const Hub = struct {
             const l = hub.lock();
             defer hub.unlock(l);
             for (hub.sessions.items) |s| {
+                if (!s.accepted) continue;
                 // Missed the last pong: drop it without a close frame.
                 if (!s.alive.swap(false, .acq_rel)) {
                     s.close(0, "");
@@ -203,6 +213,9 @@ pub fn Ctx(comptime State: type) type {
         /// Freed when the socket closes: for what `state` keeps.
         conn_arena: Allocator,
         state: *State,
+        /// In `draining`, which runs on another task than the socket's own:
+        /// only `send` (and reading `state`).
+        draining: bool = false,
 
         pub fn send(self: *Self, event: []const u8, data: anytype) !void {
             self.session.send(try frameOf(self.arena, event, data));
@@ -214,17 +227,21 @@ pub fn Ctx(comptime State: type) type {
         }
 
         pub fn join(self: *Self, room: []const u8) !void {
+            if (self.draining) return error.Draining;
             const l = self.hub.lock();
             defer self.hub.unlock(l);
             if (self.session.inRoom(room)) return;
-            try self.session.rooms.append(self.conn_arena, try self.conn_arena.dupe(u8, room));
+            const name = try self.hub.gpa.dupe(u8, room);
+            errdefer self.hub.gpa.free(name);
+            try self.session.rooms.append(self.hub.gpa, name);
         }
 
         pub fn leave(self: *Self, room: []const u8) void {
+            if (self.draining) return;
             const l = self.hub.lock();
             defer self.hub.unlock(l);
             for (self.session.rooms.items, 0..) |r, i| if (std.mem.eql(u8, r, room)) {
-                _ = self.session.rooms.swapRemove(i);
+                self.hub.gpa.free(self.session.rooms.swapRemove(i));
                 return;
             };
         }
@@ -351,11 +368,14 @@ pub fn open(comptime G: type, gateway: *G, hub: *Hub, index: usize, conn: Conn, 
         var ctx = ctxOf(G, hub, s);
         report(G, "connect", gateway.connect(&ctx));
     }
+    // Refused: `disconnect` still runs, for whatever `connect` set up.
     if (s.closed.load(.acquire)) {
-        hub.remove(s);
-        free(hub, s);
+        close(G, gateway, hub, s);
         return null;
     }
+    const l = hub.lock();
+    defer hub.unlock(l);
+    s.accepted = true;
     return s;
 }
 
@@ -405,13 +425,15 @@ pub fn drain(comptime G: type, gateway: *G, hub: *Hub, index: usize) void {
     const l = hub.lock();
     defer hub.unlock(l);
     for (hub.sessions.items) |s| {
-        if (s.gateway != index) continue;
+        if (s.gateway != index or !s.accepted) continue;
         if (@hasDecl(G, "draining")) {
-            // Not the socket's own arena: its task may be handling a message.
+            // Not the socket's arenas: its task may be handling a message.
             var tmp: std.heap.ArenaAllocator = .init(hub.gpa);
             defer tmp.deinit();
             var ctx = ctxOf(G, hub, s);
             ctx.arena = tmp.allocator();
+            ctx.conn_arena = tmp.allocator();
+            ctx.draining = true;
             report(G, "draining", gateway.draining(&ctx));
         }
         s.close(1001, "Server shutting down");
@@ -419,6 +441,8 @@ pub fn drain(comptime G: type, gateway: *G, hub: *Hub, index: usize) void {
 }
 
 fn free(hub: *Hub, s: *Session) void {
+    for (s.rooms.items) |r| hub.gpa.free(r);
+    s.rooms.deinit(hub.gpa);
     s.arena.deinit();
     s.msg_arena.deinit();
     hub.gpa.destroy(s);

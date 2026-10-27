@@ -267,8 +267,10 @@ pub const ChatGateway = struct {
 `ws.Ctx` has `send`, `close`, `join`, `leave`, `rooms`, `to(room).send`, `broadcast`,
 `broadcastAll`, and the upgrade request's `header` and `query`. Optional hooks: `connect`,
 `disconnect`, `draining` (on shutdown, before every socket closes with 1001). The App's
-`.ws = .{ .path, .heartbeat_ms, .max_payload }` sets the mount, the ping interval (a socket that
-misses a pong is dropped) and the message limit (1009 over it). Both runtimes serve gateways.
+`.ws = .{ .path, .heartbeat_ms, .max_payload, .write_timeout_ms }` sets the mount, the ping
+interval (a socket that misses a pong is dropped), the message limit (1009 over it) and how long
+a write may wait on a client that stopped reading before its socket is cut. Both runtimes serve
+gateways with the same loop (http.zig hands the socket over after the handshake).
 task-api's `chat` module is the archive's ws-chat without Redis.
 
 ## CLI
