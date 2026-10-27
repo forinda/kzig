@@ -420,11 +420,19 @@ after their exports.
 - [x] `sslcrl`: CRLs verified against their CA, every server certificate checked (one whose issuer
       has no CRL is refused, as libpq); CI revokes the test server's certificate
 
-Not covered: Ed25519 client keys on TLS 1.2 (they sign the handshake itself, not a hash), channel
-binding to Ed25519-signed server certificates (no hash defined; Postgres can't bind them either),
-CRLs issued by an intermediate CA unless it's in `sslrootcert` (the chain then ends there, so the
-intermediate itself isn't checked against its root's CRL), delta and indirect CRLs (refused),
-issuer names matched byte for byte rather than canonically, and fetching CRL distribution points.
+Still to do:
+
+- [ ] Ed25519 client keys on TLS 1.2 (they sign the handshake itself, not a hash)
+- [ ] CRLs issued by an intermediate CA the server presents (today only CAs in `sslrootcert`
+      sign CRLs; an intermediate there ends the chain, so it isn't checked against its root's CRL)
+- [ ] Issuer names compared canonically (OpenSSL's `X509_NAME_cmp`), not byte for byte
+- [ ] A CRL's signer must have `cRLSign` in its key usage
+- [ ] Delta and indirect CRLs (refused today), and fetching CRL distribution points
+- [ ] Malformed certificates (`sslrootcert`, the server's) are errors, not a panic in std's
+      `Certificate.parse`: guard it or fix it upstream
+
+Not planned: channel binding to Ed25519-signed server certificates (no hash defined; Postgres can't
+bind them either).
 
 ### Later
 
