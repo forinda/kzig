@@ -168,6 +168,8 @@ fn resolveCol(comptime sc: Scope, comptime ref: []const u8) ColRef {
     comptime {
         const S = sc.S;
         const dot = std.mem.findScalar(u8, ref, '.');
+        if (dot != null and sc.alias != null)
+            @compileError(ref ++ ": a relational query names its own table's columns unqualified");
         const tag = if (dot) |i| (tableTag(S, ref[0..i]) orelse @compileError(ref ++ ": no table " ++ ref[0..i])) else sc.from;
         const key = if (dot) |i| ref[i + 1 ..] else ref;
         const T = S.Table(@field(S.Tag, tag));

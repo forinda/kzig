@@ -391,16 +391,19 @@ fn resolveRelations(comptime tables: anytype, comptime decls: anytype, comptime 
             const target_tag = @tagName(r.one);
             const Target = tableByTag(tables, target_tag, at);
             if (!@hasField(R, "fields") or !@hasField(R, "references")) @compileError(at ++ ": a one needs .fields and .references");
+            if (r.fields.len != r.references.len) @compileError(at ++ ": .fields and .references must be as long");
             out = out ++ [_]RelationInfo{.{ .name = rk, .kind = .one, .target_tag = target_tag, .target = Target.name_, .source_columns = keyList(T, r.fields, at), .target_columns = keyList(Target, r.references, at), .relation_name = rel_name }};
             continue;
         }
         const target_tag = @tagName(r.many);
         const Target = tableByTag(tables, target_tag, at);
+        if (@hasField(R, "fields") or @hasField(R, "references")) @compileError(at ++ ": a many takes no .fields or .references");
         if (@hasField(R, "through")) {
             const Th = @TypeOf(r.through);
             const j_tag = if (Th == @TypeOf(.x)) @tagName(r.through) else @tagName(r.through.table);
             const J = tableByTag(tables, j_tag, at);
             const explicit = Th != @TypeOf(.x);
+            if (explicit and (r.through.from.len != 1 or r.through.to.len != 1)) @compileError(at ++ ": through .from and .to take one column each");
             if (!explicit and std.mem.eql(u8, tag, target_tag)) @compileError(at ++ ": a through joining a table to itself needs .from and .to");
             const to_source = pickKey(J, T.name_, if (explicit) keyList(J, r.through.from, at) else null, at ++ " (to the source)");
             const to_target = pickKey(J, Target.name_, if (explicit) keyList(J, r.through.to, at) else null, at ++ " (to the target)");

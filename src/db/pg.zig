@@ -593,7 +593,8 @@ fn decodeValue(comptime F: type, a: Allocator, value: ?[]const u8) !F {
     if (@typeInfo(F) == .@"struct" and @hasDecl(F, "fromPg")) return F.fromPg(v);
     // A relational read's nested row(s): JSON from to_json / json_agg.
     if (@typeInfo(F) == .@"struct" or (@typeInfo(F) == .pointer and @typeInfo(F).pointer.size == .slice)) {
-        const j = std.json.parseFromSliceLeaky(std.json.Value, a, v, .{ .allocate = .alloc_always }) catch return error.DbDecode;
+        // Numbers as Postgres wrote them: a numeric's digits survive.
+        const j = std.json.parseFromSliceLeaky(std.json.Value, a, v, .{ .allocate = .alloc_always, .parse_numbers = false }) catch return error.DbDecode;
         return fromJson(F, a, j);
     }
     return switch (@typeInfo(F)) {
@@ -752,6 +753,19 @@ test "Timestamp and JSON columns read and write" {
     const args = try encodeArgs(a, .{ Timestamp{ .us = 0 }, std.json.Value{ .bool = true } });
     try testing.expectEqualStrings("1970-01-01T00:00:00Z", args[0].?);
     try testing.expectEqualStrings("true", args[1].?);
+}
+
+test "nested rows keep numbers exactly as Postgres wrote them" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Child = struct { price: []const u8, big: []const u8, n: i64, f: f64 };
+    const R = struct { child: ?Child };
+    const r = try decodeRow(R, a, &.{"child"}, &.{"{\"price\":12.50,\"big\":1234567890123456789012.34,\"n\":9007199254740993,\"f\":0.5}"});
+    try testing.expectEqualStrings("12.50", r.child.?.price);
+    try testing.expectEqualStrings("1234567890123456789012.34", r.child.?.big);
+    try testing.expectEqual(9007199254740993, r.child.?.n);
+    try testing.expectEqual(0.5, r.child.?.f);
 }
 
 test "command tags give the affected rows" {

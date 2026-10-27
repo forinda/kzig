@@ -85,6 +85,8 @@ pub const Session = struct {
     accepted: bool = false,
     alive: std.atomic.Value(bool) = .init(true),
     closed: std.atomic.Value(bool) = .init(false),
+    /// Drained once: claimed under the hub's lock by whoever drains it.
+    drained: bool = false,
 
     fn send(s: *Session, frame: []const u8) void {
         if (s.closed.load(.acquire)) return;
@@ -379,7 +381,9 @@ pub fn open(comptime G: type, gateway: *G, hub: *Hub, index: usize, conn: Conn, 
         const l = hub.lock();
         defer hub.unlock(l);
         s.accepted = true;
-        break :blk hub.draining;
+        if (!hub.draining or s.drained) break :blk false;
+        s.drained = true;
+        break :blk true;
     };
     // Shutdown drained while `connect` ran, and skipped this socket.
     if (late) drainOne(G, gateway, hub, s);
@@ -433,7 +437,8 @@ pub fn drain(comptime G: type, gateway: *G, hub: *Hub, index: usize) void {
     defer hub.unlock(l);
     hub.draining = true;
     for (hub.sessions.items) |s| {
-        if (s.gateway != index or !s.accepted) continue;
+        if (s.gateway != index or !s.accepted or s.drained) continue;
+        s.drained = true;
         drainOne(G, gateway, hub, s);
     }
 }
@@ -543,4 +548,30 @@ test "a socket still in connect when shutdown drains is drained as it's let in" 
     defer close(G, &g, &hub, s);
     try testing.expect(std.mem.find(u8, fake.sent.items, "server:draining") != null);
     try testing.expectEqual(1001, fake.close_code);
+}
+
+test "with several gateways, a socket let in late is drained once" {
+    const Counted = struct {
+        hub: ?*Hub = null,
+        drained: usize = 0,
+        pub const path = "/b";
+        pub const events = .{};
+        pub fn connect(self: *@This(), _: anytype) !void {
+            // Shutdown has drained gateway 0 while this one's socket connects.
+            drain(@This(), self, self.hub.?, 0);
+        }
+        pub fn draining(self: *@This(), _: anytype) !void {
+            self.drained += 1;
+        }
+    };
+    var hub: Hub = .{ .io = testing.io, .gpa = testing.allocator, .opts = .{} };
+    defer hub.deinit();
+    var g: Counted = .{ .hub = &hub };
+    var fake: FakeConn = .{};
+    defer fake.sent.deinit(testing.allocator);
+    const s = (try open(Counted, &g, &hub, 1, fake.conn(), .{ .path = "/ws/b", .query = "", .headers = &.{} })).?;
+    defer close(Counted, &g, &hub, s);
+    // Then shutdown reaches gateway 1.
+    drain(Counted, &g, &hub, 1);
+    try testing.expectEqual(1, g.drained);
 }

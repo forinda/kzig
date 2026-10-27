@@ -43,7 +43,7 @@ pub fn Relational(comptime S: type, comptime tag: []const u8) type {
                 try w.raw(" WHERE ");
                 try opts.where.render(scopeOf(S, tag, alias), &w);
             }
-            try renderTail(S, tag, alias, opts, &w, if (first) 1 else null);
+            try renderTail(S, tag, alias, opts, &w, if (first) 1 else null, false);
             return w.done();
         }
     };
@@ -89,15 +89,18 @@ fn columnKeys(comptime S: type, comptime tag: []const u8, comptime Opts: type) [
             return out;
         }
         var any_true = false;
+        var any_false = false;
         for (names) |n| {
             if (!has(all, n)) @compileError(T.name_ ++ ": no column " ++ n);
-            if (valueOf(C, n)) any_true = true;
+            if (valueOf(C, n)) any_true = true else any_false = true;
         }
+        if (any_true and any_false) @compileError(T.name_ ++ ": columns mixes true and false");
         for (all) |k| {
             const listed = has(names, k);
             const keep = if (any_true) listed and valueOf(C, k) else !(listed and !valueOf(C, k));
             if (keep) out = out ++ [_][]const u8{k};
         }
+        if (out.len == 0) @compileError(T.name_ ++ ": columns leaves out every column");
         return out;
     }
 }
@@ -157,12 +160,21 @@ fn Shape(comptime S: type, comptime tag: []const u8, comptime C: type, comptime 
 
 fn colName(comptime S: type, comptime tag: []const u8, comptime key: []const u8) []const u8 {
     for (S.info(@field(S.Tag, tag)).columns) |c| if (std.mem.eql(u8, c.key, key)) return c.name;
-    unreachable;
+    @compileError(S.Table(@field(S.Tag, tag)).name_ ++ ": no column " ++ key);
+}
+
+const query_options: []const []const u8 = &.{ "columns", "where", "orderBy", "limit", "offset", "with" };
+
+/// A misspelt option would read every row; it's a compile error instead.
+fn checkOpts(comptime S: type, comptime tag: []const u8, comptime Opts: type) void {
+    for (@typeInfo(Opts).@"struct".field_names) |f| if (!has(query_options, f))
+        @compileError(S.Table(@field(S.Tag, tag)).name_ ++ ": no query option ." ++ f ++ " (columns, where, orderBy, limit, offset, with)");
 }
 
 /// `SELECT cols, (relations) FROM "table" AS "alias"`.
 fn renderSelect(comptime S: type, comptime tag: []const u8, comptime depth: usize, opts: anytype, w: *Writer) !void {
     const Opts = @TypeOf(opts);
+    comptime checkOpts(S, tag, Opts);
     const alias = comptime aliasOf(S, tag, depth);
     const keys = comptime columnKeys(S, tag, Opts);
     try w.raw("SELECT ");
@@ -201,25 +213,26 @@ fn renderRelation(comptime S: type, comptime src_tag: []const u8, comptime r: sc
     try w.raw(if (r.kind == .many) "SELECT coalesce(json_agg(agg), '[]') FROM (" else "SELECT to_json(obj) FROM (");
     try renderSelect(S, r.target_tag, depth, opts, w);
     if (r.through) |th| {
-        const j = comptime aliasOf(S, th.table_tag, depth);
-        try w.raw(" INNER JOIN ");
+        // kick/db: EXISTS, so a pair in the junction twice is one row.
+        const j = child ++ "_j";
+        try w.raw(" WHERE EXISTS (SELECT 1 FROM ");
         try w.ident(S.info(@field(S.Tag, th.table_tag)).name);
         try w.raw(" AS ");
         try w.ident(j);
-        try w.raw(" ON ");
+        try w.raw(" WHERE ");
         inline for (th.target_columns, r.target_columns, 0..) |jc, tc, i| {
             if (i > 0) try w.raw(" AND ");
             try qcol(w, j, comptime colName(S, th.table_tag, jc));
             try w.raw(" = ");
             try qcol(w, child, comptime colName(S, r.target_tag, tc));
         }
-        try w.raw(" WHERE ");
-        inline for (th.source_columns, r.source_columns, 0..) |jc, sc, i| {
-            if (i > 0) try w.raw(" AND ");
+        inline for (th.source_columns, r.source_columns) |jc, sc| {
+            try w.raw(" AND ");
             try qcol(w, j, comptime colName(S, th.table_tag, jc));
             try w.raw(" = ");
             try qcol(w, parent, comptime colName(S, src_tag, sc));
         }
+        try w.raw(")");
     } else {
         try w.raw(" WHERE ");
         inline for (r.target_columns, r.source_columns, 0..) |tc, sc, i| {
@@ -233,8 +246,9 @@ fn renderRelation(comptime S: type, comptime src_tag: []const u8, comptime r: sc
         try w.raw(" AND ");
         try opts.where.render(scopeOf(S, r.target_tag, child), w);
     }
-    try renderTail(S, r.target_tag, child, opts, w, if (r.kind == .one) @as(?u64, null) else null);
-    if (r.kind == .one and !@hasField(@TypeOf(opts), "limit")) try w.raw(" LIMIT 1");
+    // A one is one row, whatever limit it's given (kick/db's limit(1)).
+    try renderTail(S, r.target_tag, child, opts, w, null, r.kind == .one);
+    if (r.kind == .one) try w.raw(" LIMIT 1");
     try w.raw(if (r.kind == .many) ") AS agg" else ") AS obj");
 }
 
@@ -245,7 +259,7 @@ fn qcol(w: *Writer, alias: []const u8, name: []const u8) !void {
 }
 
 /// ORDER BY, LIMIT, OFFSET; `forced` (findFirst's 1) wins over the caller's `limit`.
-fn renderTail(comptime S: type, comptime tag: []const u8, comptime alias: []const u8, opts: anytype, w: *Writer, forced: ?u64) !void {
+fn renderTail(comptime S: type, comptime tag: []const u8, comptime alias: []const u8, opts: anytype, w: *Writer, forced: ?u64, comptime no_limit: bool) !void {
     const Opts = @TypeOf(opts);
     if (@hasField(Opts, "orderBy")) {
         const O = @FieldType(Opts, "orderBy");
@@ -257,10 +271,16 @@ fn renderTail(comptime S: type, comptime tag: []const u8, comptime alias: []cons
             if (i > 0) try w.raw(", ");
             const item = comptime valueOf(O, f);
             try qcol(w, alias, comptime colName(S, tag, @tagName(item[0])));
-            try w.raw(if (item.len > 1 and item[1] == .desc) " DESC" else " ASC");
+            const desc = comptime item.len > 1 and blk: {
+                const dir = @tagName(item[1]);
+                if (!std.mem.eql(u8, dir, "asc") and !std.mem.eql(u8, dir, "desc"))
+                    @compileError(S.Table(@field(S.Tag, tag)).name_ ++ ": orderBy direction is .asc or .desc, not ." ++ dir);
+                break :blk std.mem.eql(u8, dir, "desc");
+            };
+            try w.raw(if (desc) " DESC" else " ASC");
         }
     }
-    if (forced) |n| {
+    if (no_limit) {} else if (forced) |n| {
         try w.raw(" LIMIT ");
         try w.param(n);
     } else if (@hasField(Opts, "limit")) {
@@ -337,8 +357,12 @@ test "relational SQL: columns, nested many/one/through, correlation, where/order
         .orderBy = .{.{ .id, .desc }},
         .limit = 10,
     }, true,
-        \\SELECT "rq_posts_0"."title", (SELECT to_json(obj) FROM (SELECT "rq_users_1"."id", "rq_users_1"."name", "rq_users_1"."role" FROM "rq_users" AS "rq_users_1" WHERE "rq_users_1"."id" = "rq_posts_0"."authorId" LIMIT 1) AS obj) AS "author", (SELECT coalesce(json_agg(agg), '[]') FROM (SELECT "rq_tags_1"."name" FROM "rq_tags" AS "rq_tags_1" INNER JOIN "rq_post_tags" AS "rq_post_tags_1" ON "rq_post_tags_1"."tagId" = "rq_tags_1"."id" WHERE "rq_post_tags_1"."postId" = "rq_posts_0"."id" AND "rq_tags_1"."name" <> $1 LIMIT $2) AS agg) AS "tags", (SELECT to_json(obj) FROM (SELECT "rq_posts_1"."title", (SELECT to_json(obj) FROM (SELECT "rq_posts_2"."id" FROM "rq_posts" AS "rq_posts_2" WHERE "rq_posts_2"."id" = "rq_posts_1"."parentId" LIMIT 1) AS obj) AS "parent" FROM "rq_posts" AS "rq_posts_1" WHERE "rq_posts_1"."id" = "rq_posts_0"."parentId" LIMIT 1) AS obj) AS "parent" FROM "rq_posts" AS "rq_posts_0" WHERE "rq_posts_0"."title" = $3 ORDER BY "rq_posts_0"."id" DESC LIMIT $4
+        \\SELECT "rq_posts_0"."title", (SELECT to_json(obj) FROM (SELECT "rq_users_1"."id", "rq_users_1"."name", "rq_users_1"."role" FROM "rq_users" AS "rq_users_1" WHERE "rq_users_1"."id" = "rq_posts_0"."authorId" LIMIT 1) AS obj) AS "author", (SELECT coalesce(json_agg(agg), '[]') FROM (SELECT "rq_tags_1"."name" FROM "rq_tags" AS "rq_tags_1" WHERE EXISTS (SELECT 1 FROM "rq_post_tags" AS "rq_tags_1_j" WHERE "rq_tags_1_j"."tagId" = "rq_tags_1"."id" AND "rq_tags_1_j"."postId" = "rq_posts_0"."id") AND "rq_tags_1"."name" <> $1 LIMIT $2) AS agg) AS "tags", (SELECT to_json(obj) FROM (SELECT "rq_posts_1"."title", (SELECT to_json(obj) FROM (SELECT "rq_posts_2"."id" FROM "rq_posts" AS "rq_posts_2" WHERE "rq_posts_2"."id" = "rq_posts_1"."parentId" LIMIT 1) AS obj) AS "parent" FROM "rq_posts" AS "rq_posts_1" WHERE "rq_posts_1"."id" = "rq_posts_0"."parentId" LIMIT 1) AS obj) AS "parent" FROM "rq_posts" AS "rq_posts_0" WHERE "rq_posts_0"."title" = $3 ORDER BY "rq_posts_0"."id" DESC LIMIT $4
     , &.{ "y", "2", "x", "1" });
+    // A one reads one row whatever limit it's given.
+    try expectSql(test_client.query(.posts), .{ .columns = .{.id}, .with = .{ .author = .{ .columns = .{.id}, .limit = 5 } } }, false,
+        \\SELECT "rq_posts_0"."id", (SELECT to_json(obj) FROM (SELECT "rq_users_1"."id" FROM "rq_users" AS "rq_users_1" WHERE "rq_users_1"."id" = "rq_posts_0"."authorId" LIMIT 1) AS obj) AS "author" FROM "rq_posts" AS "rq_posts_0"
+    , &.{});
     // Row types: one is optional, many a slice; excluded columns are gone.
     const R = @TypeOf(test_client.query(.posts)).Row(.{ .columns = .{.title}, .with = .{ .author = .{ .columns = .{ .secret = false } }, .tags = true } });
     try testing.expect(@FieldType(R, "title") == []const u8);
@@ -367,7 +391,7 @@ test "relational reads on Postgres: nested rows, null one, empty many, timestamp
         \\INSERT INTO rq_users (name, secret, role, joined) VALUES ('Ada', 's1', 'admin', '2026-10-27 12:00:00.5'), ('Linus', NULL, 'member', '2026-10-27 13:00:00');
         \\INSERT INTO rq_posts ("authorId", "parentId", title) VALUES (1, NULL, 'Hello'), (1, 1, 'Re: Hello');
         \\INSERT INTO rq_tags (name) VALUES ('intro'), ('sql');
-        \\INSERT INTO rq_post_tags VALUES (1, 1), (1, 2);
+        \\INSERT INTO rq_post_tags VALUES (1, 1), (1, 2), (1, 2);
     );
     defer pool.execScript("DROP TABLE IF EXISTS rq_post_tags, rq_tags, rq_posts, rq_users; DROP TYPE IF EXISTS rq_role;") catch {};
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
