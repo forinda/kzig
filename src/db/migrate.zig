@@ -110,8 +110,12 @@ fn quoted(a: Allocator, name: []const u8) ![]const u8 {
 
 const Tables = struct { t: []const u8, lock: []const u8 };
 
+fn tablesOf(a: Allocator, o: Options) !Tables {
+    return .{ .t = try quoted(a, o.table), .lock = try quoted(a, try std.mem.concat(a, u8, &.{ o.table, "_lock" })) };
+}
+
 fn ensure(pool: *db.Pool, a: Allocator, o: Options) !Tables {
-    const tables: Tables = .{ .t = try quoted(a, o.table), .lock = try quoted(a, try std.mem.concat(a, u8, &.{ o.table, "_lock" })) };
+    const tables = try tablesOf(a, o);
     const schema = if (std.mem.findScalar(u8, o.table, '.')) |i| try std.fmt.allocPrint(a, "CREATE SCHEMA IF NOT EXISTS \"{s}\";\n", .{o.table[0..i]}) else "";
     try pool.execScript(try std.fmt.allocPrint(a,
         \\{s}CREATE TABLE IF NOT EXISTS {s} (
@@ -144,9 +148,12 @@ fn find(rows: []const Applied, id: []const u8) ?Applied {
 }
 
 /// Each migration: applied, pending, or applied but edited since (`changed`).
+/// Only reads: a production role without CREATE can check at boot, and
+/// replicas booting together don't race to make the tables.
 pub fn status(pool: *db.Pool, a: Allocator, list: []const Migration, o: Options) ![]Status {
-    const tables = try ensure(pool, a, o);
-    const rows = try appliedRows(pool, a, tables);
+    const tables = try tablesOf(a, o);
+    const exists = try pool.queryOne(a, struct { t: ?[]const u8 }, "SELECT to_regclass($1)::text AS t", .{tables.t});
+    const rows = if (exists.?.t == null) &.{} else try appliedRows(pool, a, tables);
     const out = try a.alloc(Status, list.len);
     for (list, out) |m, *s| {
         s.* = .{ .id = m.id, .name = m.name, .state = .pending };
@@ -155,23 +162,48 @@ pub fn status(pool: *db.Pool, a: Allocator, list: []const Migration, o: Options)
     return out;
 }
 
-const owner = "kzig";
+/// One run's hold on the lock table. Each run has its own name, so a run
+/// whose stale lock was taken over can tell, and can't release the new one.
+const Lock = struct {
+    pool: *db.Pool,
+    tables: Tables,
+    owner: []const u8,
+    keep_sql: []const u8,
 
-fn lock(pool: *db.Pool, a: Allocator, tables: Tables, o: Options) !void {
-    const taken = try pool.exec(try std.fmt.allocPrint(a,
-        \\UPDATE {s} SET locked_at = CURRENT_TIMESTAMP, locked_by = $1
-        \\WHERE id = 1 AND (locked_at IS NULL OR locked_at < CURRENT_TIMESTAMP - make_interval(secs => $2))
-    , .{tables.lock}), .{ owner, o.stale_lock_s });
-    if (taken != 1) {
+    fn take(pool: *db.Pool, a: Allocator, tables: Tables, o: Options) !Lock {
+        var id: [8]u8 = undefined;
+        pool.io.random(&id);
+        const l: Lock = .{
+            .pool = pool,
+            .tables = tables,
+            .owner = try std.fmt.allocPrint(a, "kzig:{x}", .{id}),
+            .keep_sql = try std.fmt.allocPrint(a, "UPDATE {s} SET locked_at = CURRENT_TIMESTAMP WHERE id = 1 AND locked_by = $1", .{tables.lock}),
+        };
+        const taken = try pool.exec(try std.fmt.allocPrint(a,
+            \\UPDATE {s} SET locked_at = CURRENT_TIMESTAMP, locked_by = $1
+            \\WHERE id = 1 AND (locked_at IS NULL OR locked_at < CURRENT_TIMESTAMP - make_interval(secs => $2))
+        , .{tables.lock}), .{ l.owner, o.stale_lock_s });
+        if (taken != 1) return held(tables);
+        return l;
+    }
+
+    /// Before each migration: still ours, and fresh again.
+    fn keep(l: Lock) !void {
+        // ponytail: refreshed between migrations, not during one; a single
+        // migration longer than stale_lock_s can still be taken over.
+        if (try l.pool.exec(l.keep_sql, .{l.owner}) != 1) return held(l.tables);
+    }
+
+    fn release(l: Lock, a: Allocator) void {
+        const sql = std.fmt.allocPrint(a, "UPDATE {s} SET locked_at = NULL, locked_by = NULL WHERE id = 1 AND locked_by = $1", .{l.tables.lock}) catch return;
+        _ = l.pool.exec(sql, .{l.owner}) catch {};
+    }
+
+    fn held(tables: Tables) error{MigrationLocked} {
         if (!builtin.is_test) std.log.err("migrations: another run holds {s}", .{tables.lock});
         return error.MigrationLocked;
     }
-}
-
-fn unlock(pool: *db.Pool, a: Allocator, tables: Tables) void {
-    const sql = std.fmt.allocPrint(a, "UPDATE {s} SET locked_at = NULL, locked_by = NULL WHERE id = 1 AND locked_by = $1", .{tables.lock}) catch return;
-    _ = pool.exec(sql, .{owner}) catch {};
-}
+};
 
 fn refuseChanged(list: []const Migration, rows: []const Applied) !void {
     for (list) |m| if (find(rows, m.id)) |r| if (!std.mem.eql(u8, r.hash, m.hash)) {
@@ -186,8 +218,8 @@ pub const Result = struct { applied: usize, batch: i32 };
 /// latest`). A failure stops the run; what it changed is rolled back.
 pub fn latest(pool: *db.Pool, a: Allocator, list: []const Migration, o: Options) !Result {
     const tables = try ensure(pool, a, o);
-    try lock(pool, a, tables, o);
-    defer unlock(pool, a, tables);
+    const l: Lock = try .take(pool, a, tables, o);
+    defer l.release(a);
     const rows = try appliedRows(pool, a, tables);
     try refuseChanged(list, rows);
     var batch: i32 = 0;
@@ -197,6 +229,7 @@ pub fn latest(pool: *db.Pool, a: Allocator, list: []const Migration, o: Options)
     var count: usize = 0;
     for (list) |m| {
         if (find(rows, m.id) != null) continue;
+        try l.keep();
         var tx = try pool.begin();
         defer tx.deinit();
         tx.execScript(m.up) catch |err| {
@@ -214,8 +247,8 @@ pub fn latest(pool: *db.Pool, a: Allocator, list: []const Migration, o: Options)
 /// The last batch, newest first, through each `down.sql`.
 pub fn rollback(pool: *db.Pool, a: Allocator, list: []const Migration, o: Options) !usize {
     const tables = try ensure(pool, a, o);
-    try lock(pool, a, tables, o);
-    defer unlock(pool, a, tables);
+    const l: Lock = try .take(pool, a, tables, o);
+    defer l.release(a);
     const rows = try appliedRows(pool, a, tables);
     var last: i32 = 0;
     for (rows) |r| last = @max(last, r.batch);
@@ -234,6 +267,7 @@ pub fn rollback(pool: *db.Pool, a: Allocator, list: []const Migration, o: Option
             if (!builtin.is_test) std.log.err("migration {s} has no down.sql", .{m.id});
             return error.NoDownMigration;
         }
+        try l.keep();
         var tx = try pool.begin();
         defer tx.deinit();
         try tx.execScript(m.down);
@@ -399,6 +433,53 @@ test "a failing migration leaves nothing behind; an edited one stops the run" {
     try testing.expectError(error.MigrationChanged, latest(&pool, a, edited, opts));
 }
 
+test "status only reads: no bookkeeping tables are made" {
+    var env: std.process.Environ.Map = undefined;
+    const url = db.testUrl(&env) catch |err| {
+        if (err == error.SkipZigTest) env.deinit();
+        return err;
+    };
+    defer env.deinit();
+    var pool: db.Pool = try .init(testing.io, testing.allocator, .{ .url = url });
+    defer pool.deinit();
+    try reset(&pool);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const list = [_]Migration{.{ .id = "20260101_000000_a", .name = "a", .up = "", .down = "", .hash = "sha256:x" }};
+    const states = try status(&pool, a, &list, opts);
+    try testing.expectEqual(State.pending, states[0].state);
+    const t = try pool.queryOne(a, struct { t: ?[]const u8 }, "SELECT to_regclass('kzig_test_migrations')::text AS t", .{});
+    try testing.expectEqual(null, t.?.t);
+}
+
+test "a run that loses the lock stops, and leaves the new holder's lock alone" {
+    var env: std.process.Environ.Map = undefined;
+    const url = db.testUrl(&env) catch |err| {
+        if (err == error.SkipZigTest) env.deinit();
+        return err;
+    };
+    defer env.deinit();
+    var pool: db.Pool = try .init(testing.io, testing.allocator, .{ .url = url });
+    defer pool.deinit();
+    try reset(&pool);
+    defer reset(&pool) catch {};
+    var m = try TmpMigrations.init();
+    defer m.deinit();
+    // The first migration plays a second run taking the lock over as stale.
+    try m.add("20260101_000000_a", "UPDATE kzig_test_migrations_lock SET locked_by = 'other', locked_at = now() WHERE id = 1;", "");
+    try m.add("20260101_000001_b", "CREATE TABLE kzig_m_b (id int);", "DROP TABLE kzig_m_b;");
+    var o = opts;
+    o.on_boot = .apply;
+    try testing.expectError(error.MigrationLocked, onBoot(&pool, testing.io, testing.allocator, m.path, o));
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const held = try pool.queryOne(arena.allocator(), struct { locked_by: ?[]const u8 }, "SELECT locked_by FROM kzig_test_migrations_lock", .{});
+    try testing.expectEqualStrings("other", held.?.locked_by.?);
+    const b = try pool.queryOne(arena.allocator(), struct { t: ?[]const u8 }, "SELECT to_regclass('kzig_m_b')::text AS t", .{});
+    try testing.expectEqual(null, b.?.t);
+}
+
 test "boot policy and the lock" {
     var env: std.process.Environ.Map = undefined;
     const url = db.testUrl(&env) catch |err| {
@@ -418,6 +499,9 @@ test "boot policy and the lock" {
     o.on_boot = .fail_if_pending;
     try testing.expectError(error.PendingMigrations, onBoot(&pool, testing.io, testing.allocator, m.path, o));
     // Another run holds the lock.
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    _ = try ensure(&pool, arena.allocator(), opts);
     _ = try pool.exec("UPDATE kzig_test_migrations_lock SET locked_at = now(), locked_by = 'someone' WHERE id = 1", .{});
     o.on_boot = .apply;
     try testing.expectError(error.MigrationLocked, onBoot(&pool, testing.io, testing.allocator, m.path, o));
