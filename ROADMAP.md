@@ -61,6 +61,11 @@ after M6.
 | Streams, ranges, multipart uploads, upload forms, `compose`, tus, credential providers | Not ported: whole bodies, fixed keys | file-storage-api needs none of them |
 | Disk `put` under a file (`a.txt/b`): ENOTDIR, a 500 | `error.InvalidKey` (400) | The key can't name a file there; a client can fix it |
 | kick/db's schema, query builder and generated migrations | SQL strings with `$1` arguments, rows decoded into structs; migrations written by hand | The layers above SQL come later (see Later) |
+| `uuid().primaryKey()` builder chains | `.{ .type = .uuid, .primary_key = true }` struct literals | Plain Zig; a misspelt option is a compile error |
+| `references(() => t.id)` | `.references = .{ .to = "t.id" }`, checked when the schema is assembled | A Zig table can't name itself in its own initializer |
+| `pgEnum('role', …)` | A Zig enum with `pub const pg_name` | The enum is the row field's type |
+| `and()` / `or()` | `db.all` / `db.any`; `where(col, op, v)` and `whereExpr(e)` | Keywords; no overloading |
+| `executeTakeFirstOrThrow` without a row: a 500 | `error.NotFound`, a 404 | The usual meaning of "no such row" in a handler |
 | `pg` driver, TLS | A Postgres client in Zig, no TLS (`sslmode=require` is refused) | No dependency; reach the server over a private network or a local proxy for now |
 | A DB adapter always reports health | `onHealthCheck` may return null; no database configured, nothing on `/health/ready` | task-api runs without a database |
 
@@ -329,11 +334,36 @@ Not covered: IPv6 literal S3 endpoints (std.http.Client takes host names; name t
 
 Not covered: TLS, binary result format, `LISTEN`/`NOTIFY`, `COPY`.
 
+### M14 — Schema and query builder
+
+- [x] `kzig.db.table` / `kzig.db.Schema`: kick/db's Postgres column types, defaults, unique,
+      indexes (unique, partial, `using`), foreign keys with actions, checks, pg enums,
+      `snake_case` casing and kick/db's derived constraint names; `Row`/`Insert`/`Update` types
+- [x] `kzig.db.Client`: `selectFrom` (select, where, joins, order, group, limit, offset, count),
+      `insertInto` (one or many rows, `DEFAULT` cells, `onConflict`), `updateTable`,
+      `deleteFrom`, `returning`; condition helpers; checked at comptime
+- [x] `upsert` and race-safe `findOrCreate` (savepoint inside a transaction)
+- [x] `kzig.db.Timestamp`; request bodies, rows and OpenAPI read it
+- [x] task-api: task-kickdb-api's 16 tables in Zig, checked against its init `snapshot.json`;
+      its init migration as is; users on the builder
+
+### M15 — Generated migrations
+
+- [ ] Snapshots from the schema, byte for byte as kick/db writes them; `kzig db generate`
+      (diff, down.sql, renames by prompt or flag), `kzig db check`
+
+### M16 — Relations
+
+- [ ] `relations`, `one`/`many`/through; `client.query.<table>.findMany(.{ .with })`
+
+### M17 — Postgres TLS
+
+- [ ] `sslmode` (prefer, require, verify-ca, verify-full), system CAs; SCRAM's server proof required
+
 ### Later
 
 SSE, a WebSocket broker (Redis), serverless cron triggers,
-queues, a third engine (`io_uring`, edge). The ORM, in layers on `kzig.db`: a comptime
-table schema, a typed query builder, relations, and migrations generated from schema diffs.
+queues, a third engine (`io_uring`, edge).
 
 ## Open questions
 
