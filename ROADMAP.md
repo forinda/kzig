@@ -59,6 +59,7 @@ after M6.
 | The serverless `/_kick/cron/:scheduleId` trigger | Not ported | kzig runs as a server |
 | `S3Settings` requires `S3_BUCKET` | Every `S3_*` field optional; `S3.fromSettings` names the missing one when S3 is chosen | Settings are listed at comptime, and a disk app must boot without them |
 | Streams, ranges, multipart uploads, upload forms, `compose`, tus, credential providers | Not ported: whole bodies, fixed keys | file-storage-api needs none of them |
+| Disk `put` under a file (`a.txt/b`): ENOTDIR, a 500 | `error.InvalidKey` (400) | The key can't name a file there; a client can fix it |
 
 Kept for parity even where Zig would allow otherwise: route middleware runs **after** validation.
 

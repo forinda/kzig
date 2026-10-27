@@ -391,9 +391,10 @@ pub const S3 = struct {
     }
 
     /// The network, not the request: worth a 503 and a retry. A bad
-    /// endpoint or certificate stays an error of its own (500).
+    /// endpoint or certificate stays an error of its own (500). A malformed
+    /// body surfaces as ReadFailed too, so it also reads as unavailable.
     fn unreachableBucket(err: anyerror) bool {
-        inline for (.{ "ConnectionRefused", "ConnectionResetByPeer", "ConnectionTimedOut", "NetworkUnreachable", "NetworkDown", "HostUnreachable", "UnknownHostName", "NameServerFailure", "TemporaryNameServerFailure", "HttpConnectionClosing", "ReadFailed", "WriteFailed", "EndOfStream", "BrokenPipe" }) |name| {
+        inline for (.{ "ConnectionRefused", "ConnectionResetByPeer", "ConnectionTimedOut", "NetworkUnreachable", "NetworkDown", "HostUnreachable", "UnknownHostName", "NameServerFailure", "TemporaryNameServerFailure", "HttpConnectionClosing", "HttpRequestTruncated", "ReadFailed", "WriteFailed", "EndOfStream", "BrokenPipe" }) |name| {
             if (err == @field(anyerror, name)) return true;
         }
         return false;
@@ -480,8 +481,19 @@ pub const S3 = struct {
         }
         errdefer req.connection.?.closing = true;
         if (body) |b| {
+            // In 64 KiB pieces, so the watchdog sees a slow upload move.
             req.transfer_encoding = .{ .content_length = b.len };
-            try req.sendBodyComplete(@constCast(b));
+            var bw = try req.sendBody(&.{});
+            var at: usize = 0;
+            while (at < b.len) {
+                const n = @min(b.len - at, 64 * 1024);
+                try bw.writer.writeAll(b[at..][0..n]);
+                try bw.flush();
+                at += n;
+                dog.arm();
+            }
+            try bw.end();
+            try req.connection.?.flush();
         } else try req.sendBodiless();
         dog.arm();
         var redirect: [1024]u8 = undefined;
@@ -1072,4 +1084,45 @@ test "a miss leaves nothing in the caller's allocator" {
     defer s3.deinit();
     // testing.allocator: a leaked error body fails the test.
     try testing.expectEqual(null, try s3.storage().get(testing.allocator, "missing"));
+}
+
+fn slowReader(server: *Io.net.Server) !void {
+    const conn = try server.accept(testing.io);
+    defer conn.close(testing.io);
+    var buf: [64 * 1024]u8 = undefined;
+    var r = conn.reader(testing.io, &buf);
+    var length: usize = 0;
+    while (true) {
+        const line = std.mem.trimEnd(u8, try r.interface.takeDelimiterInclusive('\n'), "\r\n");
+        if (line.len == 0) break;
+        if (std.ascii.startsWithIgnoreCase(line, "content-length:")) length = try std.fmt.parseInt(usize, std.mem.trim(u8, line[15..], " "), 10);
+    }
+    // 1 MiB every 20 ms: over the timeout in total, never silent for it
+    // (what the kernel buffers drains well within it).
+    while (length > 0) {
+        const n = @min(length, 1024 * 1024);
+        try r.interface.discardAll(n);
+        length -= n;
+        try testing.io.sleep(.fromMilliseconds(20), .awake);
+    }
+    var wbuf: [128]u8 = undefined;
+    var w = conn.writer(testing.io, &wbuf);
+    try w.interface.writeAll("HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n");
+    try w.interface.flush();
+}
+
+test "a slow upload that keeps moving isn't cut" {
+    const address = try Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try address.listen(testing.io, .{ .reuse_address = true });
+    defer server.deinit(testing.io);
+    var fut = try testing.io.concurrent(slowReader, .{&server});
+    defer _ = fut.await(testing.io) catch {};
+    var buf: [64]u8 = undefined;
+    const endpoint = try std.fmt.bufPrint(&buf, "http://127.0.0.1:{d}", .{server.socket.address.getPort()});
+    var s3: S3 = try .init(testing.io, testing.allocator, .{ .bucket = "b", .endpoint = endpoint, .credentials = example, .timeout_ms = 300 });
+    defer s3.deinit();
+    const big = try testing.allocator.alloc(u8, 32 * 1024 * 1024);
+    defer testing.allocator.free(big);
+    @memset(big, 'x');
+    try s3.storage().put("big", big, .{});
 }

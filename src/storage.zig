@@ -265,7 +265,15 @@ pub const Disk = struct {
                 // A link, or a file where a folder should be: O_NOFOLLOW
                 // can't tell them apart, so look.
                 error.SymLinkLoop, error.NotDir => {
-                    const st = try dir.statFile(d.io, part, .{ .follow_symlinks = false });
+                    const st = dir.statFile(d.io, part, .{ .follow_symlinks = false }) catch |e| switch (e) {
+                        // Removed meanwhile: there's nothing there.
+                        error.FileNotFound => {
+                            if (create) return error.InvalidKey;
+                            dir.close(d.io);
+                            return null;
+                        },
+                        else => return e,
+                    };
                     if (st.kind == .sym_link or create) return error.InvalidKey;
                     // No file under a file (KickJS: ENOTDIR is missing).
                     dir.close(d.io);
