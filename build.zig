@@ -12,7 +12,7 @@ pub fn build(b: *std.Build) void {
 
     const tests = b.addTest(.{ .root_module = mod });
     const test_step = b.step("test", "Run tests");
-    test_step.dependOn(&b.addRunArtifact(tests).step);
+    test_step.dependOn(runTests(b, tests));
 
     // The `kzig` CLI (kzig new, kzig g module, …).
     const cli_mod = b.createModule(.{ .root_source_file = b.path("src/cli/main.zig"), .target = target, .optimize = optimize });
@@ -24,7 +24,7 @@ pub fn build(b: *std.Build) void {
     cli_mod.addImport("kzig", mod);
     const cli = b.addExecutable(.{ .name = "kzig", .root_module = cli_mod });
     b.installArtifact(cli);
-    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cli_mod })).step);
+    test_step.dependOn(runTests(b, b.addTest(.{ .root_module = cli_mod })));
 
     // The http.zig runtime is its own module behind -Dhttpz, so std-runtime
     // users never fetch http.zig.
@@ -42,7 +42,7 @@ pub fn build(b: *std.Build) void {
                     .{ .name = "httpz", .module = dep.module("httpz") },
                 },
             });
-            test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = httpz_mod })).step);
+            test_step.dependOn(runTests(b, b.addTest(.{ .root_module = httpz_mod })));
             addBench(b, bench_step, mod, httpz_mod, target, optimize);
         }
     }
@@ -58,7 +58,7 @@ pub fn build(b: *std.Build) void {
         });
         const exe = b.addExecutable(.{ .name = name, .root_module = root });
         examples_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
-        test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = root })).step);
+        test_step.dependOn(runTests(b, b.addTest(.{ .root_module = root })));
     }
 
     // Each fixture must fail to compile with its message: the "compile error,
@@ -89,6 +89,16 @@ fn addBench(b: *std.Build, step: *std.Build.Step, kzig: *std.Build.Module, httpz
     if (httpz) |m| root.addImport("kzig_httpz", m);
     const exe = b.addExecutable(.{ .name = if (httpz != null) "bench-httpz" else "bench-std", .root_module = root });
     step.dependOn(&b.addInstallArtifact(exe, .{}).step);
+}
+
+/// Test results are cached by binary, not environment: with an integration
+/// server configured they always run, or a run without one would stand in.
+fn runTests(b: *std.Build, t: *std.Build.Step.Compile) *std.Build.Step {
+    const run = b.addRunArtifact(t);
+    for ([_][]const u8{ "DATABASE_URL", "S3_TEST_ENDPOINT" }) |name| {
+        if (b.graph.environ_map.get(name) != null) run.has_side_effects = true;
+    }
+    return &run.step;
 }
 
 const examples = [_][]const u8{"task-api"};
