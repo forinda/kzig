@@ -47,9 +47,9 @@ Each milestone ends with tests passing (`zig build test`, no leaks under
 
 ### M0 — Foundation
 
-- [ ] Clean `build.zig`: the `kzig` module, `test` step, an `examples` step
-- [ ] `CLAUDE.md`, `CONTRIBUTING.md`, this roadmap
-- [ ] CI: `zig build test` and `zig fmt --check` on Linux and macOS
+- [x] Clean `build.zig`: the `kzig` module and `test` step
+- [x] `CLAUDE.md`, `CONTRIBUTING.md`, this roadmap
+- [x] CI: `zig build test` and `zig fmt --check` on Linux and macOS
 
 ### M1 — Core runtime on `std`
 
@@ -75,6 +75,7 @@ Each milestone ends with tests passing (`zig build test`, no leaks under
 - [ ] Test overrides (`kzig.testing.app(.{ .overrides })`), allowed only in test builds
 - [ ] Config: a struct with defaults, filled from env at boot, every bad key reported at once
 - [ ] Built-in health module (`/health`)
+- [ ] `examples` build step; example tests run under `zig build test`
 - [ ] **Acceptance:** `examples/minimal-api` ported with its three tests
 
 ### M3 — Middleware and contributors
