@@ -18,6 +18,10 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 /// `verify-full` the host name too.
 pub const SslMode = enum { disable, allow, prefer, require, verify_ca, verify_full };
 
+/// libpq's `sslnegotiation`: `postgres` asks with SSLRequest first; `direct`
+/// (Postgres 17) starts TLS at once with ALPN `postgresql`, a round trip less.
+pub const SslNegotiation = enum { postgres, direct };
+
 pub const Config = struct {
     host: []const u8 = "127.0.0.1",
     port: u16 = 5432,
@@ -28,6 +32,7 @@ pub const Config = struct {
     /// Server-side `statement_timeout`; 0 leaves the server's.
     statement_timeout_ms: u32 = 0,
     sslmode: SslMode = .prefer,
+    sslnegotiation: SslNegotiation = .postgres,
     /// PEM file of the CAs to trust (`verify-ca`, `verify-full`); the
     /// system's when null.
     sslrootcert: ?[]const u8 = null,
@@ -59,6 +64,8 @@ pub const Config = struct {
                     if (mode.len > buf.len) return error.InvalidDatabaseUrl;
                     for (mode, 0..) |ch, i| buf[i] = if (ch == '-') '_' else ch;
                     c.sslmode = std.meta.stringToEnum(SslMode, buf[0..mode.len]) orelse return error.InvalidDatabaseUrl;
+                } else if (std.mem.startsWith(u8, pair, "sslnegotiation=")) {
+                    c.sslnegotiation = std.meta.stringToEnum(SslNegotiation, pair["sslnegotiation=".len..]) orelse return error.InvalidDatabaseUrl;
                 } else if (std.mem.eql(u8, pair, "insecure_auth=true")) {
                     c.insecure_auth = true;
                 } else if (std.mem.startsWith(u8, pair, "sslrootcert=")) {
@@ -68,6 +75,9 @@ pub const Config = struct {
                 }
             }
         }
+        // libpq: direct TLS can't fall back to plaintext.
+        if (c.sslnegotiation == .direct and (c.sslmode == .disable or c.sslmode == .allow or c.sslmode == .prefer))
+            return error.InvalidDatabaseUrl;
         return c;
     }
 };
@@ -184,6 +194,7 @@ pub const Conn = struct {
     fn negotiateTls(c: *Conn, cfg: Config) !void {
         // ponytail: `allow` is treated as `prefer` (TLS first, not plaintext first).
         if (cfg.sslmode == .disable) return;
+        if (cfg.sslnegotiation == .direct) return c.handshake(cfg);
         var req: [8]u8 = undefined;
         std.mem.writeInt(u32, req[0..4], 8, .big);
         std.mem.writeInt(u32, req[4..8], 80877103, .big);
@@ -204,6 +215,10 @@ pub const Conn = struct {
             },
             else => return c.lost(),
         }
+        return c.handshake(cfg);
+    }
+
+    fn handshake(c: *Conn, cfg: Config) !void {
         const plan = tlsPlan(cfg);
         const verify = plan.chain;
         const now = Io.Clock.real.now(c.io);
@@ -231,6 +246,8 @@ pub const Conn = struct {
             // SNI in every mode (libpq's sslsni), but never an IP address (RFC 6066).
             .server_name = if (isIp(cfg.host)) null else cfg.host,
             .os_roots = plan.os_roots,
+            // Direct TLS: the server only accepts it with ALPN `postgresql`.
+            .alpn = if (cfg.sslnegotiation == .direct) "postgresql" else null,
             .ca = if (verify) .{ .bundle = .{ .gpa = c.gpa, .io = c.io, .lock = &lock, .bundle = &bundle } } else .no_verification,
             .read_buffer = &c.tls_rbuf,
             .write_buffer = &c.tls_wbuf,
@@ -1190,4 +1207,23 @@ test "MD5 only over verified TLS unless the URL allows it; nothing trusted after
         try testing.expectError(error.DbAuthFailed, Conn.connect(testing.io, testing.allocator, f.config(.disable)));
         try f.finish();
     }
+}
+
+test "sslnegotiation=direct: TLS from the first byte, ALPN postgresql; needs sslmode require or stronger" {
+    const Script = struct {
+        fn direct(s: Io.net.Stream) anyerror!void {
+            var rb: [2048]u8 = undefined;
+            var r = s.reader(testing.io, &rb);
+            const header = try r.interface.takeArray(5);
+            // A TLS handshake record, not an SSLRequest.
+            try testing.expectEqual(0x16, header[0]);
+            const hello = try r.interface.take(std.mem.readInt(u16, header[3..5], .big));
+            try testing.expect(std.mem.find(u8, hello, "\x0apostgresql") != null);
+        }
+    };
+    const f = try Fake.start(Script.direct);
+    var cfg = f.config(.require);
+    cfg.sslnegotiation = .direct;
+    try testing.expectError(error.TlsHandshakeFailed, Conn.connect(testing.io, testing.allocator, cfg));
+    try f.finish();
 }

@@ -454,6 +454,10 @@ test "TLS: verify-full against the server's CA and name; a wrong name or CA is r
     var wrong_ca: Pool = try .init(testing.io, testing.allocator, .{ .url = try tlsUrl(a, url, "localhost", "verify-ca", "src/db/testdata/unrelated-ca.pem"), .max_connections = 1 });
     defer wrong_ca.deinit();
     try testing.expectError(error.TlsHandshakeFailed, wrong_ca.ping());
+    // PG 17's direct TLS: no SSLRequest round trip.
+    var direct: Pool = try .init(testing.io, testing.allocator, .{ .url = try std.fmt.allocPrint(a, "{s}&sslnegotiation=direct", .{try tlsUrl(a, url, "localhost", "verify-full", ca)}), .max_connections = 1 });
+    defer direct.deinit();
+    try testing.expect((try direct.queryOne(a, Ssl, on, .{})).?.ssl);
     // disable stays in the clear.
     var plain: Pool = try .init(testing.io, testing.allocator, .{ .url = try tlsUrl(a, url, "localhost", "disable", ca), .max_connections = 1 });
     defer plain.deinit();
@@ -545,5 +549,7 @@ test "database URLs" {
     try testing.expectEqual(pg.SslMode.verify_ca, (try pg.Config.parse(a, "postgres://ada@h/app?sslmode=verify-ca")).sslmode);
     try testing.expectError(error.InvalidDatabaseUrl, pg.Config.parse(a, "postgres://ada@h/app?sslmode=strict"));
     try testing.expect((try pg.Config.parse(a, "postgres://ada@h/app?insecure_auth=true")).insecure_auth);
+    try testing.expectEqual(pg.SslNegotiation.direct, (try pg.Config.parse(a, "postgres://ada@h/app?sslmode=require&sslnegotiation=direct")).sslnegotiation);
+    try testing.expectError(error.InvalidDatabaseUrl, pg.Config.parse(a, "postgres://ada@h/app?sslnegotiation=direct"));
     try testing.expectError(error.InvalidDatabaseUrl, pg.Config.parse(a, "mysql://ada@h/app"));
 }

@@ -117,6 +117,9 @@ pub const Options = struct {
     },
     write_buffer: []u8,
     read_buffer: []u8,
+    /// kzig: an ALPN protocol to offer (`postgresql` for direct TLS). The
+    /// server must select it; a TLS 1.2 server can't (`error.TlsNoApplicationProtocol`).
+    alpn: ?[]const u8 = null,
     /// kzig: the name for SNI when `host` is `.no_verification` (libpq sends
     /// SNI whatever sslmode; SNI-routed hosts need it). Null: none.
     server_name: ?[]const u8 = null,
@@ -152,6 +155,8 @@ pub const Options = struct {
 };
 
 pub const InitError = error{
+    /// kzig: `alpn` was offered and the server didn't select it.
+    TlsNoApplicationProtocol,
     InsufficientEntropy,
     DiskQuota,
     LockViolation,
@@ -263,7 +268,19 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
         int(u16, 1 + 2 + host_len) ++ // server_name_list byte count
         .{0x00} ++ // name_type
         int(u16, host_len);
-    const server_name_extension_len = if (host_len == 0) 0 else server_name_extension.len + host_len;
+    const server_name_extension_len_sni = if (host_len == 0) 0 else server_name_extension.len + host_len;
+    // kzig: ALPN goes after the SNI name, as a runtime tail of the hello.
+    var alpn_buf: [7 + 255]u8 = undefined;
+    const alpn_ext: []const u8 = if (options.alpn) |proto| blk: {
+        if (proto.len == 0 or proto.len > 255) return error.TlsIllegalParameter;
+        std.mem.writeInt(u16, alpn_buf[0..2], @backingInt(tls.ExtensionType.application_layer_protocol_negotiation), .big);
+        std.mem.writeInt(u16, alpn_buf[2..4], @intCast(2 + 1 + proto.len), .big);
+        std.mem.writeInt(u16, alpn_buf[4..6], @intCast(1 + proto.len), .big);
+        alpn_buf[6] = @intCast(proto.len);
+        @memcpy(alpn_buf[7..][0..proto.len], proto);
+        break :blk alpn_buf[0 .. 7 + proto.len];
+    } else "";
+    const server_name_extension_len = server_name_extension_len_sni + alpn_ext.len;
 
     const extensions_header =
         int(u16, @intCast(extensions_payload.len + server_name_extension_len)) ++
@@ -286,14 +303,14 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
         int(u16, @backingInt(tls.ProtocolVersion.tls_1_0)) ++
         int(u16, @intCast(out_handshake.len - server_name_extension.len + server_name_extension_len)) ++
         out_handshake;
-    const cleartext_header = if (host_len == 0)
+    const cleartext_header = if (server_name_extension_len_sni == 0)
         cleartext_header_buf[0 .. cleartext_header_buf.len - server_name_extension.len]
     else
         &cleartext_header_buf;
 
     {
-        var iovecs: [2][]const u8 = .{ cleartext_header, host };
-        try output.writeVecAll(iovecs[0..if (host.len == 0) 1 else 2]);
+        var iovecs: [3][]const u8 = .{ cleartext_header, host, alpn_ext };
+        try output.writeVecAll(&iovecs);
         try output.flush();
     }
 
@@ -338,6 +355,7 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
         finished,
     };
     var handshake_state: HandshakeState = .hello;
+    var alpn_selected = false;
     var handshake_cipher: tls.HandshakeCipher = undefined;
     var main_cert_pub_key: CertificatePublicKey = undefined;
     var tls12_negotiated_group: ?tls.NamedGroup = null;
@@ -525,6 +543,7 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                 const p = &@field(handshake_cipher, @tagName(tag.with()));
                                 p.transcript_hash.update(cleartext_header[tls.record_header_len..]); // Client Hello part 1
                                 p.transcript_hash.update(host); // Client Hello part 2
+                                p.transcript_hash.update(alpn_ext); // kzig: part 3
                                 p.transcript_hash.update(wrapped_handshake);
                             },
 
@@ -596,13 +615,22 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                             try all_extd.ensure(4);
                             const et = all_extd.decode(tls.ExtensionType);
                             const ext_size = all_extd.decode(u16);
-                            const extd = try all_extd.sub(ext_size);
-                            _ = extd;
+                            var extd = try all_extd.sub(ext_size);
                             switch (et) {
                                 .server_name => {},
+                                // kzig: the protocol the server chose must be ours.
+                                .application_layer_protocol_negotiation => if (options.alpn) |proto| {
+                                    try extd.ensure(3);
+                                    _ = extd.decode(u16);
+                                    const n = extd.decode(u8);
+                                    try extd.ensure(n);
+                                    if (!mem.eql(u8, extd.slice(n), proto)) return error.TlsNoApplicationProtocol;
+                                    alpn_selected = true;
+                                },
                                 else => {},
                             }
                         }
+                        if (options.alpn != null and !alpn_selected) return error.TlsNoApplicationProtocol;
                         handshake_state = .certificate;
                     },
                     .certificate => cert: {
@@ -709,6 +737,8 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                     },
                     .server_key_exchange => {
                         if (tls_version != .tls_1_2) return error.TlsUnexpectedMessage;
+                        // kzig: ALPN is only checked on TLS 1.3 (direct TLS needs it).
+                        if (options.alpn != null) return error.TlsNoApplicationProtocol;
                         if (cipher_state != .cleartext) return error.TlsUnexpectedMessage;
                         switch (handshake_state) {
                             .trust_chain_established => {},
