@@ -170,7 +170,7 @@ fn internalError(ctx: *Ctx, err: anyerror) void {
     if (!builtin.is_test) std.log.err("{t} {s}: {t}", .{ ctx.req.method, ctx.req.path, err });
     ctx.dropRepresentationHeaders();
     ctx.status(.internal_server_error);
-    ctx.json(.{
+    ctx.jsonOmitNulls(.{
         .message = "Internal Server Error",
         .requestId = if (ctx.requestId()) |id| (if (std.unicode.utf8ValidateSlice(id)) id else null) else null,
         .@"error" = @as(?[]const u8, if (builtin.mode == .debug) @errorName(err) else null),

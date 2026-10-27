@@ -111,7 +111,14 @@ pub const Ctx = struct {
     }
 
     pub fn json(ctx: *Ctx, value: anytype) !void {
-        try ctx.writeJson("application/json", value);
+        // `null` fields are sent, as `res.json` does.
+        try ctx.writeJson("application/json", value, true);
+    }
+
+    /// `json`, leaving out `null` fields: for framework bodies (problem
+    /// details, the 500 body) whose absent members are simply missing.
+    pub fn jsonOmitNulls(ctx: *Ctx, value: anytype) !void {
+        try ctx.writeJson("application/json", value, false);
     }
 
     pub fn created(ctx: *Ctx, value: anytype) !void {
@@ -176,7 +183,7 @@ pub const Ctx = struct {
             .status = @backingInt(p.status),
             .detail = p.detail,
             .errors = p.errors,
-        });
+        }, false);
     }
 
     pub fn removeHeader(ctx: *Ctx, name: []const u8) void {
@@ -195,8 +202,8 @@ pub const Ctx = struct {
             ctx.removeHeader(h);
     }
 
-    fn writeJson(ctx: *Ctx, content_type: []const u8, value: anytype) !void {
-        ctx.res.body = try std.json.Stringify.valueAlloc(ctx.arena, value, .{ .emit_null_optional_fields = false });
+    fn writeJson(ctx: *Ctx, content_type: []const u8, value: anytype, emit_nulls: bool) !void {
+        ctx.res.body = try std.json.Stringify.valueAlloc(ctx.arena, value, .{ .emit_null_optional_fields = emit_nulls });
         try ctx.setHeader("content-type", content_type);
         ctx.res.sent = true;
     }

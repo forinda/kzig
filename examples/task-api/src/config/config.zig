@@ -5,5 +5,4 @@ pub const Config = struct {
     port: u16 = 3000,
     node_env: enum { development, production, @"test" } = .development,
     log_level: []const u8 = "info",
-    // database_url: []const u8,
 };

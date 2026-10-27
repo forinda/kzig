@@ -40,7 +40,7 @@ pub fn build(b: *std.Build) void {
     }
 }
 
-const examples = [_][]const u8{ "minimal-api", "multi-tenant-api" };
+const examples = [_][]const u8{"task-api"};
 
 const compile_errors = [_][2][]const u8{
     .{ "missing_service", "repo: no service" },
