@@ -78,16 +78,19 @@ pub const sqlite_built = has_sqlite;
 const sqlite = if (has_sqlite) @import("sqlite.zig") else struct {
     pub const Conn = void;
 };
+const libsql = @import("libsql.zig");
 
 /// A connection of either driver.
 const Conn = union(enum) {
     pg: *pg.Conn,
     sqlite: *sqlite.Conn,
+    libsql: *libsql.Session,
 
     fn run(c: Conn, text: []const u8, params: []const ?[]const u8, ctx: anytype, comptime row: anytype) pg.Error!u64 {
         return switch (c) {
             .pg => |p| p.run(text, params, ctx, row),
             .sqlite => |s| if (!has_sqlite) unreachable else s.run(text, params, ctx, row),
+            .libsql => |s| s.run(text, params, ctx, row),
         };
     }
 
@@ -95,13 +98,14 @@ const Conn = union(enum) {
         return switch (c) {
             .pg => |p| p.script(text),
             .sqlite => |s| if (!has_sqlite) unreachable else s.script(text),
+            .libsql => |s| s.script(text),
         };
     }
 
     fn dialect(c: Conn) Dialect {
         return switch (c) {
             .pg => .postgres,
-            .sqlite => .sqlite,
+            .sqlite, .libsql => .sqlite,
         };
     }
 };
@@ -114,7 +118,7 @@ const Conn = union(enum) {
 pub const Pool = struct {
     io: Io,
     gpa: Allocator,
-    driver: union(enum) { pg: pg.Config, sqlite: *sqlite.Conn },
+    driver: union(enum) { pg: pg.Config, sqlite: *sqlite.Conn, libsql: *libsql.Client },
     arena: std.heap.ArenaAllocator,
     mutex: Io.Mutex = .init,
     idle: std.ArrayList(*pg.Conn) = .empty,
@@ -127,6 +131,10 @@ pub const Pool = struct {
             const conn = try sqlite.Conn.open(gpa, o.url["sqlite:".len..]);
             return .{ .io = io, .gpa = gpa, .driver = .{ .sqlite = conn }, .arena = .init(gpa), .permits = .{ .permits = 1 }, .acquire_timeout_ms = o.acquire_timeout_ms };
         }
+        for ([_][]const u8{ "libsql://", "https://", "http://" }) |scheme| if (std.mem.startsWith(u8, o.url, scheme)) {
+            const client = try libsql.Client.init(io, gpa, o.url);
+            return .{ .io = io, .gpa = gpa, .driver = .{ .libsql = client }, .arena = .init(gpa), .permits = .{ .permits = o.max_connections } };
+        };
         var arena: std.heap.ArenaAllocator = .init(gpa);
         errdefer arena.deinit();
         const a = arena.allocator();
@@ -140,13 +148,14 @@ pub const Pool = struct {
         for (p.idle.items) |c| c.close();
         p.idle.deinit(p.gpa);
         if (p.driver == .sqlite) if (has_sqlite) p.driver.sqlite.close();
+        if (p.driver == .libsql) p.driver.libsql.deinit();
         p.arena.deinit();
     }
 
     pub fn dialect(p: *const Pool) Dialect {
         return switch (p.driver) {
             .pg => .postgres,
-            .sqlite => .sqlite,
+            .sqlite, .libsql => .sqlite,
         };
     }
 
@@ -160,6 +169,7 @@ pub const Pool = struct {
         }
         p.permits.wait(p.io) catch return error.ServiceUnavailable;
         errdefer p.permits.post(p.io);
+        if (p.driver == .libsql) return .{ .libsql = try libsql.Session.open(p.driver.libsql) };
         const config = p.driver.pg;
         {
             p.mutex.lockUncancelable(p.io);
@@ -174,6 +184,8 @@ pub const Pool = struct {
         switch (conn) {
             // The one handle stays; a transaction left open is undone.
             .sqlite => |s| if (has_sqlite and s.inTransaction()) s.script("ROLLBACK") catch {},
+            // An open stream is closed (and its transaction with it).
+            .libsql => |s| s.close(),
             .pg => |c| {
                 if (c.broken or c.tx_status != 'I') return c.close();
                 p.mutex.lockUncancelable(p.io);
@@ -238,11 +250,13 @@ pub const Pool = struct {
     pub fn beginWith(p: *Pool, around: struct { before: []const u8 = "", after: []const u8 = "" }) !Tx {
         const c = try p.acquire();
         errdefer p.release(c);
+        // A remote SQLite keeps one stream for the transaction.
+        if (c == .libsql) c.libsql.keep = true;
         if (around.before.len > 0) try c.script(around.before);
         errdefer if (around.after.len > 0) c.script(around.after) catch {};
         // SQLite: take the write lock now. A deferred transaction that reads
         // and then writes fails at once if another connection wrote between.
-        try c.script(if (c == .sqlite) "BEGIN IMMEDIATE" else "BEGIN");
+        try c.script(if (c.dialect() == .sqlite) "BEGIN IMMEDIATE" else "BEGIN");
         return .{ .pool = p, .conn = c, .after = around.after };
     }
 };
@@ -358,6 +372,7 @@ test {
     _ = @import("tls/Client.zig");
     _ = pg;
     if (@import("kzig_options").sqlite) _ = @import("sqlite.zig");
+    _ = @import("libsql.zig");
 }
 
 /// `DATABASE_URL` for the tests that need a server; skipped without one.

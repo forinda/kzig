@@ -23,7 +23,7 @@ jobs:
         if: matrix.optimize == 'Debug'
 
   # The S3 driver against a real S3 API (SeaweedFS checks SigV4 like AWS),
-  # and kzig.db against Postgres.
+  # and kzig.db against Postgres and libsql.
   integration:
     runs-on: ubuntu-latest
     steps:
@@ -90,8 +90,14 @@ jobs:
             sleep 2
           done
           [ -n "$ok" ] || { docker logs s3; exit 1; }
+      # Turso's server (sqld), pinned by digest: the libsql driver's tests.
+      - name: libsql server
+        run: |
+          docker run -d --name libsql -p 8080:8080 ghcr.io/tursodatabase/libsql-server@sha256:6dd3eb276d9d3604e4a48ac4a999a2e267814732d57d7e94c04ba71482333a67
+          for i in $(seq 60); do curl -s -o /dev/null -X POST localhost:8080/v2/pipeline -d '{"requests":[]}' && break; sleep 1; done
       - run: zig build test --summary all
         env:
+          LIBSQL_TEST_URL: http://127.0.0.1:8080
           DATABASE_URL: postgres://kzig:kzigpass@localhost:5432/kzig_test
           PG_TEST_ROOTCERT: ${{ runner.temp }}/pg/ca.pem
           PG_TEST_CERT_DIR: ${{ runner.temp }}/pg

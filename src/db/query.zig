@@ -1337,6 +1337,22 @@ test "runs on SQLite: insert, select, join, update, delete; upsert and findOrCre
     try upsertSuite(Lite, &pool);
 }
 
+test "runs on libsql (LIBSQL_TEST_URL): insert, select, join, update, delete; upsert and findOrCreate" {
+    var env: std.process.Environ.Map = try testing.environ.createMap(testing.allocator);
+    defer env.deinit();
+    const url = env.get("LIBSQL_TEST_URL") orelse return error.SkipZigTest;
+    var pool: dbm.Pool = try .init(testing.io, testing.allocator, .{ .url = url, .max_connections = 4 });
+    defer pool.deinit();
+    const drop = "DROP TABLE IF EXISTS people; DROP TABLE IF EXISTS teams;";
+    try pool.execScript(drop);
+    try setupLite(&pool);
+    try insertSelectSuite(Lite, &pool);
+    try pool.execScript(drop);
+    try setupLite(&pool);
+    defer pool.execScript(drop) catch {};
+    try upsertSuite(Lite, &pool);
+}
+
 fn setupPeople(pool: *dbm.Pool) !void {
     try pool.execScript(
         \\DROP TABLE IF EXISTS people, teams; DROP TYPE IF EXISTS role;

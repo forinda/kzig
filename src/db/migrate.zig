@@ -668,3 +668,35 @@ test "SQLite: foreign keys stay on for migrations that don't rebuild; old orphan
     _ = try pool.exec("INSERT INTO users VALUES (3, 'Cy')", .{});
     try testing.expectEqual(3, (try pool.queryOne(a, N, "SELECT count(*) AS n FROM audit", .{})).?.n); // two at setup, one now
 }
+
+test "libsql (LIBSQL_TEST_URL): migrations, a rebuild of a referenced table in one stream" {
+    var env: std.process.Environ.Map = try testing.environ.createMap(testing.allocator);
+    defer env.deinit();
+    const url = env.get("LIBSQL_TEST_URL") orelse return error.SkipZigTest;
+    var pool: db.Pool = try .init(testing.io, testing.allocator, .{ .url = url });
+    defer pool.deinit();
+    const drop = "DROP TABLE IF EXISTS posts; DROP TABLE IF EXISTS users; DROP TABLE IF EXISTS kzig_test_migrations; DROP TABLE IF EXISTS kzig_test_migrations_lock;";
+    try pool.execScript(drop);
+    defer pool.execScript(drop) catch {};
+    var m = try TmpMigrations.init();
+    defer m.deinit();
+    try m.add("20260101_000000_a",
+        \\CREATE TABLE "users" ("id" INTEGER PRIMARY KEY, "name" TEXT);
+        \\CREATE TABLE "posts" ("id" INTEGER PRIMARY KEY, "authorId" INTEGER NOT NULL, FOREIGN KEY ("authorId") REFERENCES "users" ("id") ON DELETE CASCADE);
+        \\INSERT INTO "users" VALUES (1, 'Ada');
+        \\INSERT INTO "posts" VALUES (1, 1);
+    , "");
+    try m.add("20260102_000000_b",
+        \\CREATE TABLE "_kick_new_users" ("id" INTEGER PRIMARY KEY, "name" TEXT NOT NULL);
+        \\INSERT INTO "_kick_new_users" ("id", "name") SELECT "id", "name" FROM "users";
+        \\DROP TABLE "users";
+        \\ALTER TABLE "_kick_new_users" RENAME TO "users";
+    , "");
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const list = try load(testing.io, a, m.path);
+    try testing.expectEqual(2, (try latest(&pool, a, list, opts)).applied);
+    for (try status(&pool, a, list, opts)) |st| try testing.expectEqual(.applied, st.state);
+    try testing.expectEqual(1, (try pool.queryOne(a, struct { n: i64 }, "SELECT count(*) AS n FROM posts", .{})).?.n);
+}
