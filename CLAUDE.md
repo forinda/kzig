@@ -7,16 +7,19 @@ and adapters with KickJS's boot order and request pipeline, built on `comptime` 
 decorators. Requires **Zig 0.17.0**. [`ROADMAP.md`](./ROADMAP.md) is the plan and the list of
 deliberate differences from KickJS — read it before starting work.
 
-References, checked out next to this repo:
+References (clone them to read the source; `CLAUDE.local.md`, git-ignored, can point at your
+local checkouts):
 
-- `../kick-js` — the TypeScript framework being ported. Its flow is the spec: boot in
-  `packages/kickjs/src/http/application.ts`, the per-route pipeline in
-  `packages/kickjs/src/http/runtimes/express.ts`, contributors in
+- [forinda/kick-js](https://github.com/forinda/kick-js) — the TypeScript framework being
+  ported. Its flow is the spec: boot in `packages/kickjs/src/http/application.ts`, the per-route
+  pipeline in `packages/kickjs/src/http/runtimes/express.ts`, contributors in
   `packages/kickjs/src/core/contributor-pipeline.ts`, errors in
   `packages/kickjs/src/http/middleware/error-handler.ts`, DI in `packages/di/src/container.ts`.
-- `../kickjs-examples-archive` — the acceptance suite. Each example ports file for file.
-- `../tokamak` — Zig framework on http.zig; source of the comptime DI and route-reflection ideas.
-- `../http.zig` — the second runtime (M6).
+- [forinda/kickjs-examples-archive](https://github.com/forinda/kickjs-examples-archive) — the
+  acceptance suite. Each example ports file for file.
+- [cztomsik/tokamak](https://github.com/cztomsik/tokamak) — Zig framework on http.zig; source of
+  the comptime DI and route-reflection ideas.
+- [karlseguin/http.zig](https://github.com/karlseguin/http.zig) — the second runtime (M6).
 
 When porting a feature, read the KickJS source for it first and match its behaviour (order,
 status codes, error bodies). A deliberate difference goes in the roadmap's "differ on purpose"
