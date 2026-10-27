@@ -120,7 +120,7 @@ pub fn App(comptime spec: anytype) type {
     section_list = section_list ++ plugin_settings ++ opt(spec, "settings", @as([]const type, &.{}));
     inline for (modules) |M| section_list = section_list ++ M.settings;
     inline for (adapters) |A| {
-        if (@hasDecl(A, "settings")) section_list = section_list ++ A.settings;
+        if (@hasDecl(A, "settings")) section_list = section_list ++ @as([]const type, A.settings);
     }
     const sections = di.unique(section_list);
 

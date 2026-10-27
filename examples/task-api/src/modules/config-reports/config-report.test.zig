@@ -26,10 +26,15 @@ test "lists every section with its origins" {
 }
 
 test "is not served in production" {
+    var key_buf: [64]u8 = undefined;
     var env: std.process.Environ.Map = .init(testing.allocator);
     defer env.deinit();
     try env.put("NODE_ENV", "production");
     try env.put("APP_PUBLIC_URL", "https://api.example.com");
+    for ([_][]const u8{ "TRANSACTIONAL_MAIL", "MARKETING_MAIL" }) |m| {
+        try env.put(try std.fmt.bufPrint(&key_buf, "{s}_PASSWORD", .{m}), "a-long-password");
+        try env.put(try std.fmt.bufPrint(&key_buf, "{s}_FROM", .{m}), "noreply@example.com");
+    }
     const App = @import("../../main.zig").App;
     const app = try testing.allocator.create(App);
     defer testing.allocator.destroy(app);
@@ -42,9 +47,14 @@ test "is not served in production" {
 }
 
 test "is not served when NODE_ENV is unset" {
+    var key_buf: [64]u8 = undefined;
     var env: std.process.Environ.Map = .init(testing.allocator);
     defer env.deinit();
     try env.put("APP_PUBLIC_URL", "https://api.example.com");
+    for ([_][]const u8{ "TRANSACTIONAL_MAIL", "MARKETING_MAIL" }) |m| {
+        try env.put(try std.fmt.bufPrint(&key_buf, "{s}_PASSWORD", .{m}), "a-long-password");
+        try env.put(try std.fmt.bufPrint(&key_buf, "{s}_FROM", .{m}), "noreply@example.com");
+    }
     const App = @import("../../main.zig").App;
     const app = try testing.allocator.create(App);
     defer testing.allocator.destroy(app);

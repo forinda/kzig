@@ -39,6 +39,10 @@ Engines come in this order: the standard library (`std.http.Server` on `std.Io`)
 | `AsyncLocalStorage` request store | `*Ctx` passed explicitly, request arena | No hidden state |
 | `throw new HttpException(422, details)` | `return ctx.fail(.unprocessable_entity, details)` | Zig errors carry no payload; details live on `ctx` |
 | Adapter `shutdown` run concurrently | Run in reverse mount order | A DB adapter must outlive the adapters that use it |
+| Services built lazily; adapters register them in `beforeMount` | Services (and their `init` hooks) are built before `beforeMount` | DI is resolved at comptime; a service owns its own setup |
+| Request-scoped services, `@PreDestroy` | A contributor with `dispose(self, *V)` | The request scope is the contributor store; no ALS |
+| Transient scope | Not ported | Construct a value |
+| Plugins with `register`/`onReady` | Plugins are bundles; hooks live on their adapters | One lifecycle mechanism |
 | Typegen, Vite HMR | None; `zig build --watch` | Zig types are already the source of truth |
 
 Kept for parity even where Zig would allow otherwise: route middleware runs **after** validation.
@@ -140,7 +144,7 @@ Follow-ups:
 
 Follow-ups:
 
-- [ ] Mail adapter sections (`MailSettings.scoped(…)`) with adapters (M5)
+- [x] Mail adapter sections (`MailSettings("TRANSACTIONAL_MAIL")`) with adapters (M5)
 - [ ] A query string with bad escapes reads as absent in typed queries; answer 400 instead
 - [ ] Form bodies (`application/x-www-form-urlencoded`) and 415 for unsupported body types;
       duplicate JSON keys use the last value instead of 400
@@ -151,15 +155,26 @@ Follow-ups:
 
 ### M5 — Lifecycle
 
-- [ ] Adapter middleware phases in KickJS order: `beforeGlobal`, global, `afterGlobal`,
-      `beforeRoutes`, `afterRoutes`
-- [ ] Adapters: `beforeMount`, `middleware`, `contributors`, `onRouteMount`, `beforeStart`,
-      `afterStart`, `onError`, `onResponse`, `onHealthCheck`, `shutdown`; `depends_on` order
-- [ ] Plugins bundling modules, adapters, middleware and contributors
-- [ ] Request and transient scopes, torn down with the request
-- [ ] Graceful shutdown: SIGINT/SIGTERM, stop accepting, drain with timeout, adapters in
-      reverse, services `deinit`
-- [ ] **Acceptance:** shutdown drains an in-flight request; adapter hook order matches KickJS
+- [x] Adapter middleware phases in KickJS order: `before_global`, plugins, App, `after_global`
+      (the default), `before_routes`; `after_routes` for unmatched requests only
+- [x] Adapters: `beforeMount`, `middleware`, `contributors`, `settings`, `onRouteMount`,
+      `beforeStart`, `afterStart`, `onError`, `onResponse`, `onHealthCheck`, `shutdown`;
+      `depends_on` order (cycles and unknown dependencies are compile errors)
+- [x] Plugins bundling modules, adapters, middleware, contributors and settings
+- [x] Request scope: contributors' `dispose`, after the response, in reverse
+- [x] Graceful shutdown: `runtime.std.serve` on SIGINT/SIGTERM — stop accepting, health says
+      draining, in-flight requests finish (cut at `shutdown_timeout_ms`), idle connections close,
+      then adapters `shutdown` in reverse and services `deinit`; a second signal exits
+- [x] `/health/ready` aggregates adapters' `onHealthCheck` (503 degraded / draining)
+- [x] Settings sections take `validate` like decoded types
+- [x] **Acceptance:** shutdown drains an in-flight request; adapter hook order matches KickJS;
+      task-api runs settings-api's two scoped `MailAdapter`s with its mail settings tests
+
+Follow-ups:
+
+- [ ] Adapter `when` (conditional adapters) and `introspect` / DevTools tabs
+- [ ] The signal flag is polled every 100 ms; wake at once (self-pipe / signalfd)
+- [ ] `Io.Threaded` has no connect timeout; the mail check races a sleep instead
 
 ### M6 — http.zig runtime
 

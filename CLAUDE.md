@@ -40,7 +40,8 @@ zig build --watch      # Rebuild on change
 ```
 src/
   root.zig             # Public API — re-exports only, selective
-  app.zig              # App(.{ … }), Module(.{ … }), boot and shutdown
+  app.zig              # App(.{ … }), Module(.{ … }), Plugin(.{ … }), boot and shutdown
+  adapter.zig          # Adapter hooks, ordering, StartInfo/RouteInfo
   di.zig               # Comptime container
   contributor.zig      # Context contributors: precedence, order, typed `got` values
   config.zig           # Config and settings sections from env

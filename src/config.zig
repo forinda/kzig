@@ -108,6 +108,17 @@ pub fn parseSection(
         });
     }
     if (issues.items.len > before) return error.InvalidConfig;
+    // Rules beyond types (KickJS: zod `.min(8)`), as on decoded bodies.
+    if (@hasDecl(T, "validate")) {
+        var found: decode.Issues = .init(arena);
+        out.validate(&found) catch return error.OutOfMemory;
+        for (found.list.items) |f| {
+            const key = if (sectionName(T).len > 0) try std.fmt.allocPrint(arena, "{s}_{s}", .{ sectionName(T), f.field }) else try arena.dupe(u8, f.field);
+            for (key) |*c| c.* = std.ascii.toUpper(c.*);
+            try issues.append(arena, .{ .key = key, .reason = f.message });
+        }
+        if (found.list.items.len > 0) return error.InvalidConfig;
+    }
     return out;
 }
 

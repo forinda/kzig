@@ -6,9 +6,9 @@ built on `comptime` instead of decorators, so a missing service or an unknown ha
 `zig build`, not the first request.
 
 > **Status: pre-alpha.** Modules, compile-time DI, config and settings sections, middleware,
-> context contributors, typed and validated request bodies, list queries, the router, problem
-> bodies, an HTTP server on `std.http` and an in-process test runtime work (M1–M4). Lifecycle —
-> adapters, plugins, graceful shutdown (M5) — is next. APIs will change. See the
+> context contributors, typed and validated request bodies, list queries, adapters, plugins,
+> health checks, graceful shutdown, an HTTP server on `std.http` and an in-process test runtime
+> work (M1–M5). An http.zig runtime (M6) is next. APIs will change. See the
 > [roadmap](./ROADMAP.md).
 
 Requires **Zig 0.17.0**. No dependencies.
@@ -17,8 +17,8 @@ Requires **Zig 0.17.0**. No dependencies.
 
 [`examples/task-api`](./examples/task-api) is one app that grows with each milestone. Its modules
 port the [KickJS example apps](https://github.com/forinda/kickjs-examples-archive) with their tests:
-`hello` (minimal-api), `projects` (multi-tenant-kickdb-api, in memory), `features` and
-`config-reports` (settings-api).
+`hello` (minimal-api), `projects` (multi-tenant-kickdb-api, in memory), `features`,
+`config-reports` and two scoped `MailAdapter`s (settings-api).
 
 ```zig
 // modules/hello/hello.service.zig
@@ -56,17 +56,17 @@ pub const App = kzig.App(.{
     .modules = &.{ HelloModule, ProjectModule, FeaturesModule, ConfigReportModule },
     .config = Config, // PORT, NODE_ENV, LOG_LEVEL
     .settings = &.{AppSettings}, // APP_NAME, APP_PUBLIC_URL
+    .adapters = &.{ MailAdapter("transactional", TransactionalMail), MailAdapter("marketing", MarketingMail) },
     .middleware = .{ kzig.middleware.requestId(), kzig.middleware.requestLogger(.{}), kzig.middleware.helmet(.{}) },
 });
 
 pub fn main(init: std.process.Init) !void {
     var app: App = undefined;
-    try app.init(init.io, init.gpa, init.environ_map);
-    defer app.deinit();
+    try app.init(init.io, init.gpa, init.environ_map); // adapters' beforeMount … beforeStart
+    defer app.deinit(); // adapters' shutdown (reverse), then services' deinit
 
-    var server: kzig.runtime.std.Server(App) = try .init(init.io, init.gpa, &app, .{ .port = app.get(Config).port });
-    defer server.deinit();
-    try server.run();
+    // Until SIGINT/SIGTERM, then drains: in-flight requests finish, idle connections close.
+    try kzig.runtime.std.serve(App, &app, init.io, init.gpa, .{ .port = app.get(Config).port });
 }
 ```
 
@@ -176,6 +176,40 @@ pub const AppSettings = struct {
 };
 ```
 
+## Adapters, plugins and shutdown
+
+An adapter is a service with optional KickJS hooks — `beforeMount`, `onRouteMount`,
+`beforeStart`, `afterStart`, `onError`, `onResponse`, `onHealthCheck`, `shutdown` — plus
+`depends_on`, phased `middleware`, `contributors` and `settings`:
+
+```zig
+pub fn MailAdapter(comptime name: []const u8, comptime Settings: type) type {
+    return struct {
+        pub const settings = &.{Settings}; // read and validated because this adapter is mounted
+        mail: *const Settings,
+        process: *const kzig.Process,
+
+        /// Part of /health/ready: 503 "degraded" when any check is down.
+        pub fn onHealthCheck(self: *@This()) kzig.HealthCheck {
+            return .{ .name = "MailAdapter:" ++ name, .status = if (self.reachable()) .up else .down };
+        }
+        …
+    };
+}
+```
+
+```console
+$ curl -i localhost:3000/health/ready
+HTTP/1.1 503 Service Unavailable
+{"status":"degraded","checks":[{"name":"MailAdapter:transactional","status":"down"},{"name":"MailAdapter:marketing","status":"down"}]}
+```
+
+`kzig.Plugin(.{ .modules, .adapters, .middleware, .contributors, .settings })` bundles them.
+On SIGINT/SIGTERM `serve` stops accepting, health answers `draining`, requests in flight finish
+(cut after `shutdown_timeout_ms`, 30 s) and idle connections close; then `app.deinit()` runs
+adapters' `shutdown` in reverse dependency order. A contributor's `dispose(self, *V)` runs after
+each response — KickJS's request scope.
+
 ## Testing
 
 `kzig.testing.request` runs the full pipeline in-process, no socket:
@@ -240,6 +274,9 @@ UTF-8 and malformed escapes answer 400. A request with both `content-length` and
 | `ctx.get('tenant')` | a `got: struct { tenant: Tenant }` handler parameter |
 | `@Middleware(fn)` / `bootstrap({ middlewares })` | `.middleware = .{fn}` on a route, controller or App |
 | `requestId()`, `requestLogger()`, `cors()`, `helmet()` | `kzig.middleware.requestId()`, … |
+| `defineAdapter({ beforeMount, onHealthCheck, … })` | a struct with those decls in `.adapters` |
+| `definePlugin({ modules, adapters, … })` | `kzig.Plugin(.{ … })` in `.plugins` |
+| `app.shutdown()` on SIGTERM | `kzig.runtime.std.serve(…)` + `defer app.deinit()` |
 | `@Post('/', { body: zodSchema })` / `ctx.body` | `got: struct { body: CreateProject }` |
 | `ctx.qs(config)` / `ctx.paginate(…)` | `got.query: kzig.ListQuery(config)` / `query.paginate(…)` |
 | `defineSettings('FEATURES', schema)` | a struct with `pub const prefix = "FEATURES"` |
