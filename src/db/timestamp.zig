@@ -9,6 +9,7 @@ pub const Timestamp = struct {
     us: i64,
 
     pub const openapi_schema = "{\"type\":\"string\",\"format\":\"date-time\"}";
+    pub const json_expected = "date-time";
 
     pub fn now(io: Io) Timestamp {
         return .{ .us = @intCast(@divFloor(Io.Clock.real.now(io).toNanoseconds(), std.time.ns_per_us)) };
@@ -50,13 +51,22 @@ pub const Timestamp = struct {
             }
             if (p.i < text.len) switch (text[p.i]) {
                 'Z' => p.i += 1,
+                // ±HH, ±HH:MM, ±HH:MM:SS (old zones, LMT), as Postgres prints them.
                 '+', '-' => |sign| {
                     p.i += 1;
-                    var off = (try p.num(2)) * 3600;
+                    const oh = try p.num(2);
+                    var om: i64 = 0;
+                    var os: i64 = 0;
                     if (p.i < text.len) {
                         if (text[p.i] == ':') p.i += 1;
-                        off += (try p.num(2)) * 60;
+                        om = try p.num(2);
+                        if (p.i < text.len and text[p.i] == ':') {
+                            p.i += 1;
+                            os = try p.num(2);
+                        }
                     }
+                    if (oh > 15 or om > 59 or os > 59) return error.InvalidTimestamp;
+                    const off = oh * 3600 + om * 60 + os;
                     secs -= if (sign == '+') off else -off;
                 },
                 else => return error.InvalidTimestamp,
@@ -72,7 +82,8 @@ pub const Timestamp = struct {
         const days = @divFloor(secs, 86400);
         const day_secs: u64 = @intCast(@mod(secs, 86400));
         const c = civilFromDays(days);
-        try w.print("{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}", .{ @as(u64, @intCast(c.year)), c.month, c.day, day_secs / 3600, day_secs % 3600 / 60, day_secs % 60 });
+        // Years before 1 aren't written (Postgres would want `BC`).
+        try w.print("{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}", .{ @as(u64, @intCast(@max(c.year, 0))), c.month, c.day, day_secs / 3600, day_secs % 3600 / 60, day_secs % 60 });
         if (frac != 0) {
             var buf: [6]u8 = undefined;
             _ = std.fmt.bufPrint(&buf, "{d:0>6}", .{frac}) catch unreachable;
@@ -81,9 +92,18 @@ pub const Timestamp = struct {
         try w.writeByte('Z');
     }
 
+    /// As KickJS's `Date.toJSON`: always milliseconds (`.000Z`); finer
+    /// digits are dropped, as a `Date` drops them.
     pub fn jsonStringify(self: Timestamp, jw: anytype) !void {
         var buf: [40]u8 = undefined;
-        try jw.write(std.fmt.bufPrint(&buf, "{f}", .{self}) catch unreachable);
+        const ms: Timestamp = .{ .us = @divFloor(self.us, 1000) * 1000 };
+        const iso = std.fmt.bufPrint(&buf, "{f}", .{ms}) catch unreachable;
+        // `{f}` trims the fraction; put back three digits.
+        const frac = if (std.mem.findScalar(u8, iso, '.')) |dot| iso[dot + 1 .. iso.len - 1] else "";
+        var out: [40]u8 = undefined;
+        const head = iso[0..19];
+        const s = std.fmt.bufPrint(&out, "{s}.{s}{s}Z", .{ head, frac, "000"[frac.len..] }) catch unreachable;
+        try jw.write(s);
     }
 
     pub fn fromPg(text: []const u8) !Timestamp {
@@ -157,12 +177,34 @@ test "parse: Postgres text, offsets, fractions, date-only and ISO 8601" {
     }
 }
 
+test "parse: offsets with seconds (old zones); offsets out of range are refused" {
+    try testing.expectEqual(-2208988800000000, (try Timestamp.parse("1900-01-01 02:27:16+02:27:16")).us);
+    try testing.expectError(error.InvalidTimestamp, Timestamp.parse("2026-10-27 12:00:00+99"));
+    try testing.expectError(error.InvalidTimestamp, Timestamp.parse("2026-10-27 12:00:00+05:60"));
+}
+
+test "JSON: milliseconds always, as KickJS's Date.toJSON writes them" {
+    const json = try std.json.Stringify.valueAlloc(testing.allocator, .{ .a = Timestamp{ .us = 0 }, .b = Timestamp{ .us = 1793091600512345 } }, .{});
+    defer testing.allocator.free(json);
+    try testing.expectEqualStrings("{\"a\":\"1970-01-01T00:00:00.000Z\",\"b\":\"2026-10-27T09:00:00.512Z\"}", json);
+}
+
+test "a request body can carry a Timestamp" {
+    const decode = @import("../core/decode.zig");
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var issues: decode.Issues = .init(a);
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"at\":\"2026-10-27T12:00:00Z\"}", .{});
+    try testing.expectEqual(1793102400000000, (try decode.json(struct { at: Timestamp }, a, v, &issues)).?.at.us);
+    const bad = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"at\":\"soon\"}", .{});
+    try testing.expectEqual(null, try decode.json(struct { at: Timestamp }, a, bad, &issues));
+    try testing.expectEqualStrings("expected date-time", issues.list.items[0].message);
+}
+
 test "format: ISO 8601 in UTC, fraction only when there is one" {
     var buf: [64]u8 = undefined;
     try testing.expectEqualStrings("2026-10-27T12:00:00Z", try std.fmt.bufPrint(&buf, "{f}", .{Timestamp{ .us = 1793102400000000 }}));
     try testing.expectEqualStrings("2026-10-27T09:00:00.5Z", try std.fmt.bufPrint(&buf, "{f}", .{Timestamp{ .us = 1793091600500000 }}));
     try testing.expectEqualStrings("1969-12-31T23:59:59.999999Z", try std.fmt.bufPrint(&buf, "{f}", .{Timestamp{ .us = -1 }}));
-    const json = try std.json.Stringify.valueAlloc(testing.allocator, .{ .at = Timestamp{ .us = 0 } }, .{});
-    defer testing.allocator.free(json);
-    try testing.expectEqualStrings("{\"at\":\"1970-01-01T00:00:00Z\"}", json);
 }

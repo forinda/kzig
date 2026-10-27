@@ -201,6 +201,12 @@ pub const Conn = struct {
         try c.cstr(cfg.application_name);
         try c.cstr("client_encoding");
         try c.cstr("UTF8");
+        // Timestamps are read as UTC ISO text, and CURRENT_TIMESTAMP into a
+        // `timestamp` column must be UTC too, whatever the server's defaults.
+        try c.cstr("TimeZone");
+        try c.cstr("UTC");
+        try c.cstr("DateStyle");
+        try c.cstr("ISO, MDY");
         if (cfg.statement_timeout_ms > 0) {
             var buf: [16]u8 = undefined;
             try c.cstr("statement_timeout");

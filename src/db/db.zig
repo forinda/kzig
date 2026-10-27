@@ -396,6 +396,22 @@ test "committing after a failed statement is an error, not a silent rollback" {
     try db.ping();
 }
 
+test "sessions run in UTC with ISO dates, whatever the server's defaults" {
+    var env: std.process.Environ.Map = undefined;
+    const url = testUrl(&env) catch |err| {
+        if (err == error.SkipZigTest) env.deinit();
+        return err;
+    };
+    defer env.deinit();
+    var db: Pool = try .init(testing.io, testing.allocator, .{ .url = url, .max_connections = 1 });
+    defer db.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const r = (try db.queryOne(arena.allocator(), struct { tz: []const u8, ds: []const u8 }, "SELECT current_setting('TimeZone') AS tz, current_setting('DateStyle') AS ds", .{})).?;
+    try testing.expectEqualStrings("UTC", r.tz);
+    try testing.expectEqualStrings("ISO, MDY", r.ds);
+}
+
 test "Timestamp round-trips through timestamptz and timestamp" {
     var env: std.process.Environ.Map = undefined;
     const url = testUrl(&env) catch |err| {
