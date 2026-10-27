@@ -1,22 +1,12 @@
 const std = @import("std");
 const kzig = @import("kzig");
-const Database = @import("../../db/database.zig").Database;
+const database = @import("../../db/database.zig");
+const Database = database.Database;
 
-/// A user as responses carry it: never the password hash.
-pub const User = struct {
-    id: []const u8,
-    email: []const u8,
-    firstName: []const u8,
-    lastName: []const u8,
-    avatarUrl: ?[]const u8,
-    globalRole: []const u8,
-    isActive: bool,
-    createdAt: []const u8,
-};
+/// The columns responses carry: never the password hash.
+const public = .{ .id, .email, .firstName, .lastName, .avatarUrl, .globalRole, .isActive, .createdAt };
 
-const columns =
-    \\"id", "email", "firstName", "lastName", "avatarUrl", "globalRole"::text AS "globalRole", "isActive", "createdAt"::text AS "createdAt"
-;
+pub const User = @TypeOf(@as(database.Client, undefined).selectFrom(.users).select(public)).Row;
 
 pub const NewUser = struct {
     email: []const u8,
@@ -33,23 +23,26 @@ pub const NewUser = struct {
     }
 };
 
-/// task-kickdb-api's user repository, in SQL.
+/// task-kickdb-api's user repository.
 pub const UserRepository = struct {
     database: *Database,
 
     pub fn list(self: *UserRepository, a: std.mem.Allocator) ![]User {
-        return (try self.database.get()).query(a, User, "SELECT " ++ columns ++ " FROM \"users\" ORDER BY \"createdAt\" ASC", .{});
+        return (try self.database.client()).selectFrom(.users).select(public).orderBy(.createdAt, .asc).execute(a);
     }
 
     pub fn findById(self: *UserRepository, a: std.mem.Allocator, id: []const u8) !?User {
-        return (try self.database.get()).queryOne(a, User, "SELECT " ++ columns ++ " FROM \"users\" WHERE \"id\" = $1", .{id});
+        return (try self.database.client()).selectFrom(.users).select(public).where(.id, .eq, id).executeTakeFirst(a);
     }
 
     /// A taken email is `error.Conflict` (409), from the unique index.
     pub fn create(self: *UserRepository, a: std.mem.Allocator, in: NewUser) !User {
-        return (try (try self.database.get()).queryOne(a, User,
-            \\INSERT INTO "users" ("email", "passwordHash", "firstName", "lastName", "avatarUrl")
-            \\VALUES ($1, $2, $3, $4, $5) RETURNING
-        ++ " " ++ columns, .{ in.email, in.passwordHash, in.firstName, in.lastName, in.avatarUrl })).?;
+        return (try self.database.client()).insertInto(.users).values(.{
+            .email = in.email,
+            .passwordHash = in.passwordHash,
+            .firstName = in.firstName,
+            .lastName = in.lastName,
+            .avatarUrl = in.avatarUrl,
+        }).returning(public).executeTakeFirstOrThrow(a);
     }
 };

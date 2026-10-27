@@ -1,0 +1,10 @@
+{
+  "id": "20261015_231323_init",
+  "name": "init",
+  "createdAt": "2026-10-15T23:13:23.660Z",
+  "reviewed": true,
+  "dialect": "postgres",
+  "previousId": null,
+  "downIsDraft": false,
+  "empty": false
+}

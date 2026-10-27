@@ -1,4 +1,7 @@
 const kzig = @import("kzig");
+const Schema = @import("schema.zig").Schema;
+
+pub const Client = kzig.db.Client(Schema);
 
 /// `MIGRATIONS_DIR`, relative to the working directory.
 pub const DbSettings = struct {
@@ -26,5 +29,10 @@ pub const Database = struct {
     pub fn get(self: *Database) !*kzig.db.Pool {
         if (self.pool) |*p| return p;
         return error.ServiceUnavailable;
+    }
+
+    /// The query builder over task-kickdb-api's schema (`DB_PRIMARY`).
+    pub fn client(self: *Database) !Client {
+        return .init(.{ .pool = try self.get() });
     }
 };
