@@ -4,6 +4,9 @@ const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
+pub const S3 = @import("storage/s3.zig").S3;
+pub const S3Settings = @import("storage/s3.zig").Settings;
+
 pub const PutOptions = struct { content_type: ?[]const u8 = null };
 
 pub const FileInfo = struct {
@@ -348,6 +351,10 @@ pub fn expectContract(s: Storage) !void {
         try testing.expectError(error.InvalidKey, s.get(a, bad));
     }
     try testing.expectError(error.InvalidLimit, s.list(a, .{ .limit = 1001 }));
+}
+
+test {
+    _ = @import("storage/s3.zig");
 }
 
 test "memory storage keeps the contract" {
