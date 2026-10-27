@@ -203,6 +203,16 @@ fn html(comptime s: []const u8) []const u8 {
     }
 }
 
+/// A JSON string body that can't close the surrounding `<script>`.
+fn scriptString(comptime s: []const u8) []const u8 {
+    comptime {
+        var out: []const u8 = "";
+        for (openapi.escape(s)) |c| out = out ++ (if (c == '<') "\\u003c" else &[_]u8{c});
+        const result = out;
+        return result;
+    }
+}
+
 /// Swagger UI from unpkg, as KickJS falls back to without swagger-ui-dist.
 fn swaggerHtml(comptime o: Options) []const u8 {
     return "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"UTF-8\">\n" ++
@@ -210,7 +220,7 @@ fn swaggerHtml(comptime o: Options) []const u8 {
         "<link rel=\"stylesheet\" href=\"https://unpkg.com/swagger-ui-dist@5/swagger-ui.css\">\n</head>\n<body>\n<div id=\"swagger-ui\"></div>\n" ++
         "<script src=\"https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js\"></script>\n" ++
         "<script src=\"https://unpkg.com/swagger-ui-dist@5/swagger-ui-standalone-preset.js\"></script>\n" ++
-        "<script>window.ui = SwaggerUIBundle({ url: \"" ++ openapi.escape(o.spec_path) ++ "\", dom_id: '#swagger-ui', deepLinking: true, " ++
+        "<script>window.ui = SwaggerUIBundle({ url: \"" ++ scriptString(o.spec_path) ++ "\", dom_id: '#swagger-ui', deepLinking: true, " ++
         "presets: [SwaggerUIBundle.presets.apis, SwaggerUIStandalonePreset], layout: 'StandaloneLayout' });</script>\n</body>\n</html>\n";
 }
 

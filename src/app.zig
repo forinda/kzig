@@ -1280,13 +1280,70 @@ test "route docs from types" {
     const show = docOf("/api/v1/items/:id", .GET);
     try testing.expectEqualStrings("get", show.method);
     try testing.expectEqualStrings("/api/v1/items/{id}", show.path);
-    try testing.expectEqualStrings("{\"tags\":[\"Items\"],\"summary\":\"Get an item\",\"operationId\":\"DocsController_show\"," ++
-        "\"parameters\":[{\"name\":\"id\",\"in\":\"path\",\"required\":true,\"schema\":{\"type\":\"integer\",\"format\":\"int32\",\"minimum\":0}}," ++
+    try testing.expectEqualStrings("{\"tags\":[\"Items\"],\"summary\":\"Get an item\",\"operationId\":\"get_api_v1_items_id\"," ++
+        "\"parameters\":[{\"name\":\"id\",\"in\":\"path\",\"required\":true,\"schema\":{\"type\":\"integer\",\"format\":\"int64\",\"minimum\":0}}," ++
         "{\"name\":\"verbose\",\"in\":\"query\",\"required\":false,\"schema\":{\"type\":\"boolean\"}}]," ++
         "\"responses\":{\"200\":{\"description\":\"Successful operation\",\"content\":{\"application/json\":{\"schema\":" ++
-        "{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\",\"format\":\"int32\",\"minimum\":0},\"title\":{\"type\":\"string\"}},\"required\":[\"id\",\"title\"]}}}}," ++
+        "{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\",\"format\":\"int64\",\"minimum\":0},\"title\":{\"type\":\"string\"}},\"required\":[\"id\",\"title\"]}}}}," ++
         "\"422\":{\"description\":\"Validation error\",\"content\":{\"application/problem+json\":{\"schema\":{\"$ref\":\"#/components/schemas/ProblemDetails\"}}}}}," ++
         "\"security\":[{\"BearerAuth\":[]}]}", show.operation);
+}
+
+const StatusDocsController = struct {
+    pub const routes = .{
+        .{ .method = .POST, .path = "/value", .handler = "value" },
+        .{ .method = .DELETE, .path = "/value", .handler = "value" },
+        .{ .method = .GET, .path = "/nothing", .handler = "nothing" },
+        .{ .method = .GET, .path = "/status", .handler = "accepted" },
+        .{ .method = .GET, .path = "/text", .handler = "text" },
+        .{ .method = .POST, .path = "/listed", .handler = "listed", .docs = .{ .responses = .{.{ .status = 422, .description = "Mine" }} } },
+    };
+    pub fn value(_: *StatusDocsController, _: *Ctx) DocItem {
+        return .{ .id = 1, .title = "x" };
+    }
+    pub fn nothing(_: *StatusDocsController, _: *Ctx) void {}
+    pub fn accepted(_: *StatusDocsController, _: *Ctx) std.http.Status {
+        return .accepted;
+    }
+    pub fn text(_: *StatusDocsController, _: *Ctx) []const u8 {
+        return "hi";
+    }
+    pub fn listed(_: *StatusDocsController, _: *Ctx, got: struct { body: struct { a: u8 } }) u8 {
+        return got.body.a;
+    }
+};
+
+const StatusDocsApp = App(.{ .modules = &.{Module(.{ .name = "S", .path = "/s", .controllers = &.{StatusDocsController} })}, .health = false });
+
+fn statusDoc(comptime path: []const u8, comptime method: std.http.Method) []const u8 {
+    inline for (StatusDocsApp.routes) |r| {
+        if (comptime std.mem.eql(u8, r.path, path) and r.method == method) return r.doc.?.operation;
+    }
+    unreachable;
+}
+
+test "documented statuses are the ones the server sends" {
+    // A returned value is 200 whatever the method (Ctx.send), void is 204
+    // without content, a returned Status is whatever it is, a string is text.
+    try testing.expect(std.mem.find(u8, statusDoc("/api/v1/s/value", .POST), "\"200\":{\"description\":\"Successful operation\",\"content\":{\"application/json\"") != null);
+    try testing.expect(std.mem.find(u8, statusDoc("/api/v1/s/value", .DELETE), "\"200\":") != null);
+    try testing.expectEqualStrings("\"204\":{\"description\":\"No content\"}", responsesOf(statusDoc("/api/v1/s/nothing", .GET)));
+    try testing.expectEqualStrings("\"default\":{\"description\":\"Status set by the handler\"}", responsesOf(statusDoc("/api/v1/s/status", .GET)));
+    try testing.expect(std.mem.find(u8, statusDoc("/api/v1/s/text", .GET), "\"text/plain\":{\"schema\":{\"type\":\"string\"}}") != null);
+}
+
+fn responsesOf(op: []const u8) []const u8 {
+    // Last member, no security: the operation ends with the responses
+    // object's `}` and its own.
+    const start = std.mem.find(u8, op, "\"responses\":{").? + "\"responses\":{".len;
+    return op[start .. op.len - 2];
+}
+
+test "listed statuses are not added twice and operation ids are unique" {
+    const listed = statusDoc("/api/v1/s/listed", .POST);
+    try testing.expectEqual(1, std.mem.count(u8, listed, "\"422\""));
+    try testing.expect(std.mem.find(u8, statusDoc("/api/v1/s/value", .POST), "\"operationId\":\"post_api_v1_s_value\"") != null);
+    try testing.expect(std.mem.find(u8, statusDoc("/api/v1/s/value", .DELETE), "\"operationId\":\"delete_api_v1_s_value\"") != null);
 }
 
 test "explicit responses replace the default" {

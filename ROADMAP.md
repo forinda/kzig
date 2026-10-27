@@ -216,8 +216,8 @@ Follow-ups:
       `@ApiTags`, `@ApiOperation`, `@ApiResponse`, `@ApiBearerAuth`, `@ApiExclude`
 - [x] `kzig.swagger.Plugin(.{ … })`: `/openapi.json`, `/docs` (Swagger UI), `/redoc`;
       `disable_in_prod`; servers from the listening port
-- [x] **Acceptance:** task-api serves its spec; it passes structural checks (paths, parameters,
-      `$ref`s, operation ids, tags)
+- [x] **Acceptance:** task-api serves its spec; `openapi.test.zig` checks it on every run (paths,
+      parameters, `$ref`s, unique operation ids, tags, statuses)
 
 Follow-ups:
 
@@ -225,6 +225,11 @@ Follow-ups:
 - [ ] Named component schemas (`$ref`) instead of inline ones; recursive types
 - [ ] `@ApiSecurity` / custom security schemes; a public flag
 - [ ] Local Swagger UI assets (KickJS serves `swagger-ui-dist` when installed)
+- [ ] A `params` field that isn't in the path is a compile error (it always fails at runtime)
+- [ ] No `requestBody` on GET/HEAD when a controller-level contributor reads `body`
+- [ ] Servers from the bound host, not always `localhost`
+- [ ] Compile time of doc generation for very large apps (≈4.5 s per 100 routes); name the
+      route when the eval quota runs out
 
 ### Later
 

@@ -42,4 +42,5 @@ test {
     _ = @import("modules/features/feature.test.zig");
     _ = @import("modules/config-reports/config-report.test.zig");
     _ = @import("adapters/mail.test.zig");
+    _ = @import("openapi.test.zig");
 }
