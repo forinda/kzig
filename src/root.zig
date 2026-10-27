@@ -2,6 +2,7 @@
 const context = @import("context.zig");
 const problem = @import("problem.zig");
 const router = @import("router.zig");
+const di = @import("di.zig");
 pub const testing = @import("testing.zig");
 pub const config = @import("config.zig");
 pub const runtime = struct {
@@ -18,11 +19,13 @@ pub const Route = router.Route;
 pub const route = router.route;
 pub const Router = router.Router;
 pub const normalizePath = router.normalizePath;
+pub const Container = di.Container;
 
 test {
     _ = context;
     _ = problem;
     _ = router;
+    _ = di;
     _ = testing;
     _ = config;
     _ = runtime.std;
