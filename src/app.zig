@@ -24,6 +24,12 @@ pub const Process = struct {
     /// `NODE_ENV` is `development` or `test` — read raw, so an unset
     /// `NODE_ENV` counts as production (the archive apps' `isDevOrTest()`).
     dev_or_test: bool = false,
+    /// Set once shutdown begins; health answers `draining`.
+    draining: std.atomic.Value(bool) = .init(false),
+
+    pub fn isDraining(self: *const Process) bool {
+        return self.draining.load(.acquire);
+    }
 
     /// Seconds since the app started, like Node's `process.uptime()`.
     pub fn uptime(self: *const Process) f64 {
@@ -118,7 +124,7 @@ pub fn App(comptime spec: anytype) type {
     }
     const sections = di.unique(section_list);
 
-    comptime var listed: []const type = sections ++ &[_]type{ Process, ConfigReport } ++ adapters;
+    comptime var listed: []const type = sections ++ &[_]type{ Process, ConfigReport, health.Probe } ++ adapters;
     comptime var adapter_contributors: []const type = plugin_contributors;
     inline for (adapters) |A| {
         if (@hasDecl(A, "contributors")) adapter_contributors = adapter_contributors ++ contributor.types(A.contributors, @typeName(A));
@@ -199,7 +205,8 @@ pub fn App(comptime spec: anytype) type {
             if (failed) return error.InvalidConfig;
 
             const process: Process = .{ .io = io, .gpa = gpa, .started_at = std.Io.Clock.awake.now(io), .dev_or_test = config.devOrTest(env) };
-            try self.container.initWith(values ++ .{ process, ConfigReport{ .vars = origins.items } } ++ overrides);
+            const probe: health.Probe = .{ .app = self, .checks = healthChecks };
+            try self.container.initWith(values ++ .{ process, ConfigReport{ .vars = origins.items }, probe } ++ overrides);
             errdefer self.container.deinit();
 
             // KickJS boot order, after services are built: beforeMount,
@@ -225,6 +232,20 @@ pub fn App(comptime spec: anytype) type {
             self.shutdownAdapters();
             self.container.deinit();
             self.config_arena.deinit();
+        }
+
+        /// Shutdown has begun: health answers `draining`.
+        pub fn beginDrain(self: *Self) void {
+            self.get(Process).draining.store(true, .release);
+        }
+
+        fn healthChecks(ptr: *anyopaque, arena: std.mem.Allocator) anyerror![]const health.HealthCheck {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            var out: std.ArrayList(health.HealthCheck) = .empty;
+            inline for (adapters) |A| {
+                if (@hasDecl(A, "onHealthCheck")) try out.append(arena, self.get(A).onHealthCheck());
+            }
+            return out.items;
         }
 
         /// The server is listening: adapter `afterStart`.

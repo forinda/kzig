@@ -38,6 +38,7 @@ pub const App = app.App;
 pub const Plugin = app.Plugin;
 pub const Process = app.Process;
 pub const ConfigReport = app.ConfigReport;
+pub const HealthCheck = @import("health.zig").HealthCheck;
 pub const Version = app.Version;
 
 test {
