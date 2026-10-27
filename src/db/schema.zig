@@ -110,6 +110,35 @@ pub const SchemaOptions = struct {
     casing: ?enum { snake_case } = null,
 };
 
+/// `Schema`'s options as given: `.casing` and `.relations`.
+fn optionsOf(comptime o: anytype) SchemaOptions {
+    for (@typeInfo(@TypeOf(o)).@"struct".field_names) |f| if (!std.mem.eql(u8, f, "casing") and !std.mem.eql(u8, f, "relations"))
+        @compileError("Schema: no option ." ++ f ++ " (casing, relations)");
+    return .{ .casing = if (@hasField(@TypeOf(o), "casing")) o.casing else null };
+}
+
+pub const RelationKind = enum { one, many };
+
+/// A relation resolved as kick/db's `extract-relations.ts` does; column
+/// names are keys, the target is its declared table name.
+pub const RelationInfo = struct {
+    name: []const u8,
+    kind: RelationKind,
+    target_tag: []const u8,
+    target: []const u8,
+    source_columns: []const []const u8,
+    target_columns: []const []const u8,
+    relation_name: ?[]const u8 = null,
+    through: ?Through = null,
+
+    pub const Through = struct {
+        table_tag: []const u8,
+        table: []const u8,
+        source_columns: []const []const u8,
+        target_columns: []const []const u8,
+    };
+};
+
 /// A table from a struct literal of columns (each a `Column`) and, optionally,
 /// `.indexes`, `.checks` and `.primary_key`.
 pub fn table(comptime name: []const u8, comptime columns: anytype, comptime constraints: anytype) type {
@@ -260,8 +289,10 @@ pub fn sqlType(comptime t: Type) []const u8 {
 
 /// The tables in `tables` (a struct literal of `table` types), resolved:
 /// database names, derived constraint names, enums, checked references.
-pub fn Schema(comptime tables: anytype, comptime options: SchemaOptions) type {
+pub fn Schema(comptime tables: anytype, comptime given: anytype) type {
     comptime {
+        const options = optionsOf(given);
+        const decls = if (@hasField(@TypeOf(given), "relations")) given.relations else .{};
         @setEvalBranchQuota(200_000);
         const tags = @typeInfo(@TypeOf(tables)).@"struct".field_names;
         var infos: [tags.len]TableInfo = undefined;
@@ -276,6 +307,11 @@ pub fn Schema(comptime tables: anytype, comptime options: SchemaOptions) type {
         }
         const infos_final = infos;
         const enums_final = sortEnums(enum_list);
+        for (@typeInfo(@TypeOf(decls)).@"struct".field_names) |t| if (!@hasField(@TypeOf(tables), t))
+            @compileError("relations." ++ t ++ ": no table " ++ t);
+        var rels: [tags.len][]const RelationInfo = undefined;
+        for (tags, &rels) |tag, *r| r.* = resolveRelations(tables, decls, tag);
+        const rels_final = rels;
         return struct {
             pub const Tag = std.meta.FieldEnum(@TypeOf(tables));
             pub const tables_info: []const TableInfo = &infos_final;
@@ -290,8 +326,131 @@ pub fn Schema(comptime tables: anytype, comptime options: SchemaOptions) type {
             pub fn info(comptime t: Tag) TableInfo {
                 return infos_final[@backingInt(t)];
             }
+
+            /// The table's relations, in declaration order.
+            pub fn relationsOf(comptime t: Tag) []const RelationInfo {
+                return rels_final[@backingInt(t)];
+            }
+
+            pub const relations_info: []const []const RelationInfo = &rels_final;
+            /// Tables given a relations entry (kick/db writes those, even empty).
+            pub const relation_tables: []const []const u8 = @typeInfo(@TypeOf(decls)).@"struct".field_names;
         };
     }
+}
+
+fn declOf(comptime decls: anytype, comptime tag: []const u8) type {
+    return @TypeOf(if (@hasField(@TypeOf(decls), tag)) @field(decls, tag) else .{});
+}
+
+fn tableByTag(comptime tables: anytype, comptime tag: []const u8, comptime at: []const u8) type {
+    if (!@hasField(@TypeOf(tables), tag)) @compileError(at ++ ": no table " ++ tag);
+    return @field(tables, tag);
+}
+
+fn keyList(comptime T: type, comptime lits: anytype, comptime at: []const u8) []const []const u8 {
+    var out: []const []const u8 = &.{};
+    for (lits) |l| {
+        if (!has(T.column_keys, @tagName(l))) @compileError(at ++ ": no column " ++ @tagName(l) ++ " in " ++ T.name_);
+        out = out ++ [_][]const u8{@tagName(l)};
+    }
+    return out;
+}
+
+const ForeignKeyRef = struct { columns: []const []const u8, ref_columns: []const []const u8 };
+
+/// `T`'s single-column keys to the table declared `ref_table`.
+fn keysTo(comptime T: type, comptime ref_table: []const u8) []const ForeignKeyRef {
+    var out: []const ForeignKeyRef = &.{};
+    for (T.column_keys, T.column_defs) |k, c| if (c.references) |r| {
+        const dot = std.mem.findScalar(u8, r.to, '.').?;
+        if (std.mem.eql(u8, r.to[0..dot], ref_table)) out = out ++ [_]ForeignKeyRef{.{ .columns = &.{k}, .ref_columns = &.{r.to[dot + 1 ..]} }};
+    };
+    return out;
+}
+
+fn optStr(comptime R: type, comptime r: R, comptime f: []const u8) ?[]const u8 {
+    return if (@hasField(R, f)) @field(r, f) else null;
+}
+
+fn resolveRelations(comptime tables: anytype, comptime decls: anytype, comptime tag: []const u8) []const RelationInfo {
+    const T = @field(tables, tag);
+    const D = declOf(decls, tag);
+    const decl: D = if (@hasField(@TypeOf(decls), tag)) @field(decls, tag) else .{};
+    var out: []const RelationInfo = &.{};
+    for (@typeInfo(D).@"struct".field_names) |rk| {
+        const at = T.name_ ++ "." ++ rk;
+        const R = @TypeOf(@field(decl, rk));
+        const r = @field(decl, rk);
+        for (@typeInfo(R).@"struct".field_names) |f| if (!has(&.{ "one", "many", "fields", "references", "relation_name", "through" }, f))
+            @compileError(at ++ ": no option ." ++ f);
+        if (has(T.column_keys, rk)) @compileError(at ++ ": a relation can't share a column's name");
+        if (@hasField(R, "one") == @hasField(R, "many")) @compileError(at ++ ": give .one or .many the target table");
+        const rel_name = optStr(R, r, "relation_name");
+        if (@hasField(R, "one")) {
+            const target_tag = @tagName(r.one);
+            const Target = tableByTag(tables, target_tag, at);
+            if (!@hasField(R, "fields") or !@hasField(R, "references")) @compileError(at ++ ": a one needs .fields and .references");
+            out = out ++ [_]RelationInfo{.{ .name = rk, .kind = .one, .target_tag = target_tag, .target = Target.name_, .source_columns = keyList(T, r.fields, at), .target_columns = keyList(Target, r.references, at), .relation_name = rel_name }};
+            continue;
+        }
+        const target_tag = @tagName(r.many);
+        const Target = tableByTag(tables, target_tag, at);
+        if (@hasField(R, "through")) {
+            const Th = @TypeOf(r.through);
+            const j_tag = if (Th == @TypeOf(.x)) @tagName(r.through) else @tagName(r.through.table);
+            const J = tableByTag(tables, j_tag, at);
+            const explicit = Th != @TypeOf(.x);
+            if (!explicit and std.mem.eql(u8, tag, target_tag)) @compileError(at ++ ": a through joining a table to itself needs .from and .to");
+            const to_source = pickKey(J, T.name_, if (explicit) keyList(J, r.through.from, at) else null, at ++ " (to the source)");
+            const to_target = pickKey(J, Target.name_, if (explicit) keyList(J, r.through.to, at) else null, at ++ " (to the target)");
+            out = out ++ [_]RelationInfo{.{ .name = rk, .kind = .many, .target_tag = target_tag, .target = Target.name_, .source_columns = to_source.ref_columns, .target_columns = to_target.ref_columns, .relation_name = rel_name, .through = .{ .table_tag = j_tag, .table = J.name_, .source_columns = to_source.columns, .target_columns = to_target.columns } }};
+            continue;
+        }
+        // kick/db: the inverse with the same relation name, else the one
+        // untagged `one` back, else the target's one foreign key to us.
+        const TD = declOf(decls, target_tag);
+        const tdecl: TD = if (@hasField(@TypeOf(decls), target_tag)) @field(decls, target_tag) else .{};
+        var tagged: ?[2][]const []const u8 = null;
+        var tagged_n: usize = 0;
+        var untagged: ?[2][]const []const u8 = null;
+        var untagged_n: usize = 0;
+        for (@typeInfo(TD).@"struct".field_names) |ik| {
+            const IR = @TypeOf(@field(tdecl, ik));
+            const ir = @field(tdecl, ik);
+            if (!@hasField(IR, "one") or !std.mem.eql(u8, @tagName(ir.one), tag) or !@hasField(IR, "fields")) continue;
+            const pair = [2][]const []const u8{ keyList(T, ir.references, at), keyList(Target, ir.fields, at) };
+            const irn = optStr(IR, ir, "relation_name");
+            if (rel_name != null and irn != null and std.mem.eql(u8, irn.?, rel_name.?)) {
+                tagged = pair;
+                tagged_n += 1;
+            } else if (irn == null) {
+                untagged = pair;
+                untagged_n += 1;
+            }
+        }
+        if (tagged_n > 1) @compileError(at ++ ": more than one one on " ++ Target.name_ ++ " has relation_name \"" ++ rel_name.? ++ "\"");
+        const pair = if (tagged_n == 1) tagged.? else if (untagged_n == 1) untagged.? else blk: {
+            const keys = keysTo(Target, T.name_);
+            if (keys.len != 1) @compileError(at ++ ": no one back from " ++ Target.name_ ++ " and no single foreign key to " ++ T.name_);
+            break :blk [2][]const []const u8{ keys[0].ref_columns, keys[0].columns };
+        };
+        out = out ++ [_]RelationInfo{.{ .name = rk, .kind = .many, .target_tag = target_tag, .target = Target.name_, .source_columns = pair[0], .target_columns = pair[1], .relation_name = rel_name }};
+    }
+    return out;
+}
+
+/// The junction's key to `ref_table`: the one there is, or the one on `columns`.
+fn pickKey(comptime J: type, comptime ref_table: []const u8, comptime columns: ?[]const []const u8, comptime at: []const u8) ForeignKeyRef {
+    var found: ?ForeignKeyRef = null;
+    var n: usize = 0;
+    for (keysTo(J, ref_table)) |k| {
+        if (columns) |cs| if (!std.mem.eql(u8, k.columns[0], cs[0])) continue;
+        found = k;
+        n += 1;
+    }
+    if (n != 1) @compileError(at ++ ": " ++ J.name_ ++ " needs exactly one foreign key to " ++ ref_table);
+    return found.?;
 }
 
 fn hasEnum(list: []const EnumInfo, name: []const u8) bool {
@@ -546,4 +705,56 @@ test "snake_case renames tables too, and names derived from them" {
 test "long constraint names are shortened as kick/db shortens them" {
     try testing.expectEqualStrings("a_very_long_table_name_for_testing_identifier_lim_aed105_unique", comptime fitIdentifier("a_very_long_table_name_for_testing_identifier_limits_in_postgres_col_unique"));
     try testing.expectEqualStrings("short_fk", comptime fitIdentifier("short_fk"));
+}
+
+const r_users = table("users", .{ .id = .{ .type = .serial, .primary_key = true } }, .{});
+const r_posts = table("posts", .{
+    .id = .{ .type = .serial, .primary_key = true },
+    .authorId = .{ .type = .integer, .not_null = true, .references = .{ .to = "users.id" } },
+    .editorId = .{ .type = .integer, .references = .{ .to = "users.id" } },
+    .parentId = .{ .type = .integer, .references = .{ .to = "posts.id" } },
+}, .{});
+const r_tags = table("tags", .{ .id = .{ .type = .serial, .primary_key = true } }, .{});
+const r_post_tags = table("post_tags", .{
+    .postId = .{ .type = .integer, .not_null = true, .references = .{ .to = "posts.id" } },
+    .tagId = .{ .type = .integer, .not_null = true, .references = .{ .to = "tags.id" } },
+}, .{});
+
+test "relations resolve as kick/db's: one as declared, many by its inverse or relation name, through by the junction's keys" {
+    const S = Schema(.{ .users = r_users, .posts = r_posts, .tags = r_tags, .post_tags = r_post_tags }, .{ .relations = .{
+        .users = .{
+            .posts = .{ .many = .posts, .relation_name = "author" },
+            .edited = .{ .many = .posts, .relation_name = "editor" },
+        },
+        .posts = .{
+            .author = .{ .one = .users, .fields = .{.authorId}, .references = .{.id}, .relation_name = "author" },
+            .editor = .{ .one = .users, .fields = .{.editorId}, .references = .{.id}, .relation_name = "editor" },
+            .parent = .{ .one = .posts, .fields = .{.parentId}, .references = .{.id} },
+            .children = .{ .many = .posts },
+            .tags = .{ .many = .tags, .through = .post_tags },
+        },
+        .tags = .{ .posts = .{ .many = .posts, .through = .post_tags } },
+    } });
+    const u = S.relationsOf(.users);
+    try testing.expectEqualStrings("posts", u[0].name);
+    try testing.expectEqualStrings("id", u[0].source_columns[0]);
+    try testing.expectEqualStrings("authorId", u[0].target_columns[0]);
+    try testing.expectEqualStrings("editorId", u[1].target_columns[0]);
+    const p = S.relationsOf(.posts);
+    try testing.expectEqual(.one, p[0].kind);
+    try testing.expectEqualStrings("users", p[0].target);
+    // The untagged one back to posts: parentId.
+    try testing.expectEqualStrings("parentId", p[3].target_columns[0]);
+    try testing.expectEqualStrings("post_tags", p[4].through.?.table);
+    try testing.expectEqualStrings("postId", p[4].through.?.source_columns[0]);
+    try testing.expectEqualStrings("tagId", p[4].through.?.target_columns[0]);
+    try testing.expectEqualStrings("id", p[4].target_columns[0]);
+    try testing.expectEqual(0, S.relationsOf(.post_tags).len);
+}
+
+test "a many with no one back falls back to the target's single foreign key" {
+    const S = Schema(.{ .users = r_users, .tags = r_tags, .post_tags = r_post_tags, .posts = r_posts }, .{ .relations = .{
+        .tags = .{ .links = .{ .many = .post_tags } },
+    } });
+    try testing.expectEqualStrings("tagId", S.relationsOf(.tags)[0].target_columns[0]);
 }
