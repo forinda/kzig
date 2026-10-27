@@ -1,6 +1,6 @@
 const kzig = @import("kzig");
 const repo = @import("{{kebab}}.repository.zig");
-const Query = @import("{{kebab}}.constants.zig").Query;
+const constants = @import("{{kebab}}.constants.zig");
 const {{Pascal}}Service = @import("{{kebab}}.service.zig").{{Pascal}}Service;
 
 const Id = struct { id: u64 };
@@ -21,7 +21,7 @@ pub const {{Pascal}}Controller = struct {
         .{ .method = .DELETE, .path = "/:id", .handler = "remove", .docs = .{ .summary = "Delete a {{kebab}}" } },
     };
 
-    pub fn list(self: *{{Pascal}}Controller, ctx: *kzig.Ctx, got: struct { query: Query }) !kzig.Paginated(repo.{{Pascal}}) {
+    pub fn list(self: *{{Pascal}}Controller, ctx: *kzig.Ctx, got: struct { query: constants.Query }) !kzig.Paginated(repo.{{Pascal}}) {
         const page = try self.service.list(ctx.arena, got.query);
         return got.query.paginate(ctx, repo.{{Pascal}}, page.rows, page.total);
     }

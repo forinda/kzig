@@ -1,11 +1,11 @@
 const std = @import("std");
 const repo = @import("task.repository.zig");
-const Query = @import("task.constants.zig").Query;
+const constants = @import("task.constants.zig");
 
 pub const TaskService = struct {
     repo: *repo.TaskRepository,
 
-    pub fn list(self: *TaskService, arena: std.mem.Allocator, query: Query) !repo.Page {
+    pub fn list(self: *TaskService, arena: std.mem.Allocator, query: constants.Query) !repo.TaskPage {
         return self.repo.findAll(arena, query);
     }
 

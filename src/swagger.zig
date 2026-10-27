@@ -189,6 +189,7 @@ fn contains(list: []const []const u8, s: []const u8) bool {
 
 fn html(comptime s: []const u8) []const u8 {
     comptime {
+        @setEvalBranchQuota(1_000_000);
         var out: []const u8 = "";
         for (s) |c| out = out ++ switch (c) {
             '&' => "&amp;",
@@ -206,6 +207,7 @@ fn html(comptime s: []const u8) []const u8 {
 /// A JSON string body that can't close the surrounding `<script>`.
 fn scriptString(comptime s: []const u8) []const u8 {
     comptime {
+        @setEvalBranchQuota(1_000_000);
         var out: []const u8 = "";
         for (openapi.escape(s)) |c| out = out ++ (if (c == '<') "\\u003c" else &[_]u8{c});
         const result = out;

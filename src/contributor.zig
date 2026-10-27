@@ -50,6 +50,7 @@ pub fn GotOf(comptime f: anytype) ?type {
 /// Contributor entries (a tuple of types) as a slice.
 pub fn types(comptime entries: anytype, comptime where: []const u8) []const type {
     comptime {
+        @setEvalBranchQuota(1_000_000);
         var out: []const type = &.{};
         for (entries) |e| {
             if (@TypeOf(e) != type or !isContributor(e))
@@ -65,6 +66,7 @@ pub fn types(comptime entries: anytype, comptime where: []const u8) []const type
 /// controller, method. `handler_got` is the handler's `got` struct, if any.
 pub fn Plan(comptime levels: [5][]const type, comptime handler_got: ?type, comptime where: []const u8) type {
     comptime {
+        @setEvalBranchQuota(1_000_000);
         var merged: []const type = &.{};
         for (levels) |level| {
             for (level, 0..) |C, i| {

@@ -16,6 +16,14 @@ step() { echo "== $*"; }
 # sed -i differs between GNU and BSD (macOS).
 edit() { sed "$1" "$2" > "$2.tmp" && mv "$2.tmp" "$2"; }
 
+fails() { if "$@" >/dev/null 2>&1; then echo "should have failed: $*" >&2; exit 1; fi; }
+
+step "kzig new refuses names Zig can't use as a package name"
+fails "$KZIG" new test --kzig "$ROOT"
+fails "$KZIG" new error --kzig "$ROOT"
+fails "$KZIG" new a-very-long-project-name-over-the-limit --kzig "$ROOT"
+test ! -e test && test ! -e error
+
 step "kzig new demo-app"
 "$KZIG" new demo-app --kzig "$ROOT"
 cd demo-app
@@ -24,6 +32,12 @@ zig build
 
 step "kzig g module task"
 "$KZIG" g module task
+zig build test
+
+step "module names that shadow template names: query, page, error"
+"$KZIG" g module query
+"$KZIG" g module page
+"$KZIG" g module error
 zig build test
 
 step "kzig g module note --minimal"
@@ -39,6 +53,13 @@ step "kzig g controller/service/middleware/contributor/adapter"
 "$KZIG" g middleware audit
 "$KZIG" g contributor current-user
 "$KZIG" g adapter cache
+"$KZIG" g middleware error
+
+step "--module must name an existing module folder inside the project"
+fails "$KZIG" g service evil --module ../../escape
+fails "$KZIG" g service evil --module /tmp
+fails "$KZIG" g service evil --module missing
+test ! -e ../../escape
 # Stubs aren't wired into the app; make the tests compile them.
 cat > src/stubs.test.zig <<'ZIG'
 const std = @import("std");
@@ -48,6 +69,7 @@ test {
     std.testing.refAllDecls(@import("middleware/audit.middleware.zig"));
     std.testing.refAllDecls(@import("contributors/current-user.contributor.zig").LoadCurrentUser);
     std.testing.refAllDecls(@import("adapters/cache.adapter.zig").CacheAdapter);
+    std.testing.refAllDecls(@import("middleware/error.middleware.zig"));
 }
 ZIG
 edit 's|^    // kzig:tests|    _ = @import("stubs.test.zig");\
@@ -57,10 +79,25 @@ zig build test
 step "refuses to overwrite"
 if "$KZIG" g module task 2>/dev/null; then echo "overwrote an existing module" >&2; exit 1; fi
 
-step "kzig rm module task"
-"$KZIG" rm module task
+step "a missing marker stops a module before any file is written"
+cp src/modules.zig modules.zig.bak
+edit '/kzig:modules/d' src/modules.zig
+fails "$KZIG" g module widget
+test ! -e src/modules/widgets
+mv modules.zig.bak src/modules.zig
+
+step "kzig rm module asks first"
+fails "$KZIG" rm module task </dev/null
+test -e src/modules/tasks
+
+step "kzig rm module task --force"
+"$KZIG" rm module task --force
 test ! -e src/modules/tasks
-! grep -q 'modules/tasks/' src/modules.zig src/main.zig
+if grep -q 'modules/tasks/' src/modules.zig src/main.zig; then echo "registry lines left behind" >&2; exit 1; fi
+
+step "kzig rm module hello --force (a singular folder)"
+"$KZIG" rm module hello --force
+test ! -e src/modules/hello
 edit '/stubs.test.zig/d' src/main.zig
 zig build test
 

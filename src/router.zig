@@ -61,6 +61,7 @@ pub fn normalizePath(arena: std.mem.Allocator, raw: []const u8) error{ BadReques
 
 fn patternSegments(comptime pattern: []const u8) []const []const u8 {
     comptime {
+        @setEvalBranchQuota(1_000_000);
         var list: []const []const u8 = &.{};
         var it = std.mem.splitScalar(u8, pattern, '/');
         var params = 0;
@@ -133,6 +134,7 @@ pub fn Router(comptime routes: []const Route) type {
         }
 
         fn unmatched(ctx: *Ctx) !void {
+            @setEvalBranchQuota(1_000_000);
             const path = try normalizePath(ctx.arena, ctx.req.path);
             var allow: std.ArrayList(u8) = .empty;
             var seen: std.EnumSet(std.http.Method) = .empty;
@@ -153,6 +155,9 @@ pub fn Router(comptime routes: []const Route) type {
         }
 
         fn runRoute(ctx: *Ctx, method: std.http.Method, path: Path) !bool {
+            // Every route's pattern is unrolled here; big apps need more
+            // than the default 1000 comptime branches.
+            @setEvalBranchQuota(1_000_000);
             inline for (routes) |r| {
                 if (r.method == method and try match(ctx, comptime patternSegments(r.path), path.segments)) {
                     if (r.middleware.len == 0) {
@@ -371,4 +376,21 @@ test "non-UTF-8 request id is left out of the 500 body" {
     var a = runTest(TestRouter, .GET, "/crash", &.{.{ .name = "x-request-id", .value = "\xff\"}" }});
     defer a.deinit();
     try testing.expect(std.mem.find(u8, a.res.body, "requestId") == null);
+}
+
+fn manyRoutes(comptime count: usize) []const Route {
+    comptime {
+        @setEvalBranchQuota(1_000_000);
+        var out: []const Route = &.{};
+        for (0..count) |i| out = out ++ .{route(.GET, std.fmt.comptimePrint("/r{d}/:id/items/:item", .{i}), T.hello)};
+        const result = out;
+        return result;
+    }
+}
+
+test "a large route table stays within the compile-time branch quota" {
+    const Big = Router(manyRoutes(60));
+    var a = runTest(Big, .GET, "/r59/1/items/2", &.{});
+    defer a.deinit();
+    try testing.expectEqual(std.http.Status.ok, a.res.status);
 }

@@ -29,6 +29,7 @@ pub const RouteInfo = struct {
 /// `adapters` with each one after the adapters it `depends_on`.
 pub fn order(comptime adapters: []const type) []const type {
     comptime {
+        @setEvalBranchQuota(1_000_000);
         const Walk = struct {
             state: [adapters.len]enum { new, active, done } = @splat(.new),
             out: []const type = &.{},

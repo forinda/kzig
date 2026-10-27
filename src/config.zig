@@ -175,6 +175,7 @@ fn own(comptime F: type, arena: std.mem.Allocator, v: F) !F {
 
 fn envKey(comptime prefix: []const u8, comptime name: []const u8) []const u8 {
     comptime {
+        @setEvalBranchQuota(1_000_000);
         var buf: [name.len]u8 = undefined;
         for (name, 0..) |c, i| buf[i] = std.ascii.toUpper(c);
         const upper = buf;

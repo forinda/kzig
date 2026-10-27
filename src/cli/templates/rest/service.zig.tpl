@@ -1,11 +1,11 @@
 const std = @import("std");
 const repo = @import("{{kebab}}.repository.zig");
-const Query = @import("{{kebab}}.constants.zig").Query;
+const constants = @import("{{kebab}}.constants.zig");
 
 pub const {{Pascal}}Service = struct {
     repo: *repo.{{Pascal}}Repository,
 
-    pub fn list(self: *{{Pascal}}Service, arena: std.mem.Allocator, query: Query) !repo.Page {
+    pub fn list(self: *{{Pascal}}Service, arena: std.mem.Allocator, query: constants.Query) !repo.{{Pascal}}Page {
         return self.repo.findAll(arena, query);
     }
 

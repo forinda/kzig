@@ -322,6 +322,7 @@ pub fn App(comptime spec: anytype) type {
 
 fn buildRoutes(comptime AppT: type, comptime modules: []const type, comptime api_prefix: []const u8, comptime default_version: u16, comptime outer: [2][]const type) []const router.Route {
     comptime {
+        @setEvalBranchQuota(1_000_000);
         var list: []const router.Route = &.{};
         var owners: []const []const u8 = &.{};
         for (modules) |M| {
@@ -372,6 +373,7 @@ fn buildRoutes(comptime AppT: type, comptime modules: []const type, comptime api
 /// `.{ .phase = …, .handler = … }`; the phase defaults to `after_global`.
 fn phase(comptime AppT: type, comptime adapters: []const type, comptime p: mw.Phase) []const mw.Fn {
     comptime {
+        @setEvalBranchQuota(1_000_000);
         var out: []const mw.Fn = &.{};
         for (adapters) |A| {
             if (!@hasDecl(A, "middleware")) continue;
@@ -387,6 +389,7 @@ fn phase(comptime AppT: type, comptime adapters: []const type, comptime p: mw.Ph
 
 fn pluginChain(comptime AppT: type, comptime plugins: []const type) []const mw.Fn {
     comptime {
+        @setEvalBranchQuota(1_000_000);
         var out: []const mw.Fn = &.{};
         for (plugins) |Pl| out = out ++ mwChain(AppT, Pl.middleware, Pl.name);
         const result = out;
@@ -397,6 +400,7 @@ fn pluginChain(comptime AppT: type, comptime plugins: []const type) []const mw.F
 /// Struct middleware types in `entries`; they are services.
 fn mwTypes(comptime entries: anytype) []const type {
     comptime {
+        @setEvalBranchQuota(1_000_000);
         var out: []const type = &.{};
         for (entries) |e| {
             if (@TypeOf(e) == type) out = out ++ .{e};
@@ -410,6 +414,7 @@ fn mwTypes(comptime entries: anytype) []const type {
 /// type with `pub fn handle(self: *T, *Ctx, *Next) !void`.
 fn mwChain(comptime AppT: type, comptime entries: anytype, comptime where: []const u8) []const mw.Fn {
     comptime {
+        @setEvalBranchQuota(1_000_000);
         var out: []const mw.Fn = &.{};
         for (entries) |e| out = out ++ .{mwFn(AppT, e, where)};
         const result = out;

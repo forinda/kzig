@@ -1,6 +1,6 @@
 const kzig = @import("kzig");
 const repo = @import("task.repository.zig");
-const Query = @import("task.constants.zig").Query;
+const constants = @import("task.constants.zig");
 const TaskService = @import("task.service.zig").TaskService;
 
 const Id = struct { id: u64 };
@@ -21,7 +21,7 @@ pub const TaskController = struct {
         .{ .method = .DELETE, .path = "/:id", .handler = "remove", .docs = .{ .summary = "Delete a task" } },
     };
 
-    pub fn list(self: *TaskController, ctx: *kzig.Ctx, got: struct { query: Query }) !kzig.Paginated(repo.Task) {
+    pub fn list(self: *TaskController, ctx: *kzig.Ctx, got: struct { query: constants.Query }) !kzig.Paginated(repo.Task) {
         const page = try self.service.list(ctx.arena, got.query);
         return got.query.paginate(ctx, repo.Task, page.rows, page.total);
     }

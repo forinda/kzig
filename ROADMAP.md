@@ -44,6 +44,7 @@ after M6.
 | Request-scoped services, `@PreDestroy` | A contributor with `dispose(self, *V)` | The request scope is the contributor store; no ALS |
 | Transient scope | Not ported | Construct a value |
 | Plugins with `register`/`onReady` | Plugins are bundles; hooks live on their adapters | One lifecycle mechanism |
+| `kick g module` folders not pluralized by default | `kzig g module task` writes `src/modules/tasks` | Matches the archive apps' layout; `rm module` finds either |
 | Typegen, Vite HMR | None; `zig build --watch` | Zig types are already the source of truth |
 | Swagger from zod schemas + decorators | OpenAPI from the Zig types, at comptime | The schema can't drift from the code |
 | Swagger operations untagged without `@ApiTags` | Tagged with the module's name | Swagger UI groups by module |
@@ -248,6 +249,10 @@ Follow-ups:
 - [ ] `kzig dev` (rebuild and restart on change) and `kzig build` / `start`
 - [ ] Generators for DTO-only, guards, tests; `kzig add <feature>` (swagger, http.zig runtime)
 - [ ] Prebuilt `kzig` binaries in releases
+- [ ] Errors to stderr; `kzig --help` / `kzig help` exit 0
+- [ ] Generated list endpoint: 400 for filter operators it doesn't support (today they match all)
+- [ ] Plurals for irregular words (`person`, `data`, `quiz`) and acronyms (`HTTPClient`)
+- [ ] Generated tests: a search test with more than one row; 404 documented on `/:id` routes
 
 ### Later
 

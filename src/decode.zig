@@ -202,6 +202,7 @@ pub fn label(comptime F: type) []const u8 {
 
 fn enumNames(comptime E: type) []const u8 {
     comptime {
+        @setEvalBranchQuota(1_000_000);
         var out: []const u8 = "";
         for (@typeInfo(E).@"enum".field_names, 0..) |n, i| out = out ++ (if (i > 0) ", " else "") ++ n;
         const result = out;

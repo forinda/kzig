@@ -29,8 +29,8 @@ const usage =
     \\  kzig g middleware|contributor|adapter <name>
     \\      One file to wire in yourself.
     \\
-    \\  kzig rm module <name>
-    \\      Deletes src/modules/<plural> and unmounts it.
+    \\  kzig rm module <name> [--force]
+    \\      Deletes the module's folder and unmounts it (asks first unless --force).
     \\
 ;
 
@@ -142,14 +142,12 @@ pub fn main(init: std.process.Init) !u8 {
         cli.print("error: {t}\n\n{s}", .{ err, usage });
         return 2;
     };
-    const p = flags.positional;
     run(cli, flags) catch |err| {
         switch (err) {
             error.Usage => cli.print("{s}", .{usage}),
             error.InvalidName => cli.print("error: a name starts with a letter and has letters, digits, '-' or '_'\n", .{}),
             error.NotAProject => cli.print("error: no src/modules.zig here — run this in a kzig project (made by `kzig new`)\n", .{}),
             error.Exists => {},
-            error.NoSuchModule => cli.print("error: no module src/modules/{s}\n", .{if (p.len > 2) p[2] else ""}),
             else => cli.print("error: {t}\n", .{err}),
         }
         return if (err == error.Usage) 2 else 1;
@@ -173,15 +171,22 @@ fn run(cli: Cli, flags: Flags) !void {
     }
     if (std.mem.eql(u8, cmd, "rm") or std.mem.eql(u8, cmd, "remove")) {
         if (p.len != 3 or !std.mem.eql(u8, p[1], "module")) return error.Usage;
-        return removeModule(cli, p[2]);
+        return removeModule(cli, flags, p[2]);
     }
     return error.Usage;
+}
+
+/// `name`, or `@"name"` when Zig reserves it (`error`, `test`, `type`).
+fn identifier(a: Allocator, name: []const u8) ![]const u8 {
+    if (std.zig.isValidId(name) and !std.zig.primitives.isPrimitive(name)) return name;
+    return std.fmt.allocPrint(a, "@\"{s}\"", .{name});
 }
 
 fn vars(n: Names, extra: []const [2][]const u8, a: Allocator) ![]const [2][]const u8 {
     const base = [_][2][]const u8{
         .{ "Pascal", n.pascal },
         .{ "camel", n.camel },
+        .{ "camelId", try identifier(a, n.camel) },
         .{ "kebab", n.kebab },
         .{ "snake", n.snake },
         .{ "plural", n.plural },
@@ -215,11 +220,20 @@ fn writeAll(cli: Cli, dir: []const u8, templates: []const Template, v: []const [
 fn newProject(cli: Cli, flags: Flags, raw: []const u8) !void {
     const n = try Names.init(cli.arena, raw);
     const dir = n.kebab;
+    // The package name in build.zig.zon is a bare Zig identifier of at most
+    // 32 bytes (as `zig init` requires).
+    if (!std.zig.isValidId(n.snake) or std.zig.primitives.isPrimitive(n.snake) or n.snake.len > 32) {
+        cli.print("error: '{s}' can't be a Zig package name: it must not be a keyword or primitive, and at most 32 characters\n", .{n.snake});
+        return error.Exists;
+    }
 
     var dependency: []const u8 = "";
     if (flags.kzig) |kzig_path| {
+        const kzig_abs = cli.cwd.realPathFileAlloc(cli.io, kzig_path, cli.arena) catch {
+            cli.print("error: --kzig {s}: no such directory\n", .{kzig_path});
+            return error.Exists;
+        };
         try cli.cwd.createDirPath(cli.io, dir);
-        const kzig_abs = try cli.cwd.realPathFileAlloc(cli.io, kzig_path, cli.arena);
         const project_abs = try cli.cwd.realPathFileAlloc(cli.io, dir, cli.arena);
         const rel = try std.fs.path.relativeAlloc(cli.arena, project_abs, null, project_abs, kzig_abs);
         dependency = try std.fmt.allocPrint(cli.arena, "        .kzig = .{{ .path = \"{s}\" }},\n", .{rel});
@@ -267,6 +281,16 @@ fn newProject(cli: Cli, flags: Flags, raw: []const u8) !void {
     , .{dir});
 }
 
+/// KickJS asks before deleting a module; `--force` skips it.
+fn confirm(cli: Cli, dir: []const u8) !bool {
+    cli.print("Delete {s} and everything in it? This cannot be undone. [y/N] ", .{dir});
+    var buf: [64]u8 = undefined;
+    var stdin = Io.File.stdin().reader(cli.io, &buf);
+    const line = stdin.interface.takeDelimiterExclusive('\n') catch return false;
+    const answer = std.mem.trim(u8, line, " \t\r");
+    return std.ascii.eqlIgnoreCase(answer, "y") or std.ascii.eqlIgnoreCase(answer, "yes");
+}
+
 fn requireProject(cli: Cli) !void {
     cli.cwd.access(cli.io, "src/modules.zig", .{}) catch return error.NotAProject;
 }
@@ -282,6 +306,12 @@ fn edit(cli: Cli, path: []const u8, comptime f: anytype, args: anytype) !void {
 fn generateModule(cli: Cli, flags: Flags, raw: []const u8) !void {
     try requireProject(cli);
     const n = try Names.init(cli.arena, raw);
+    // Checked before writing, so a failure leaves nothing half done.
+    const registry_source = try cli.cwd.readFileAlloc(cli.io, "src/modules.zig", cli.arena, .limited(1 << 20));
+    if (std.mem.find(u8, registry_source, "// kzig:modules") == null) {
+        cli.print("error: src/modules.zig has no `// kzig:modules` line; add it inside `modules` where new modules go\n", .{});
+        return error.Exists;
+    }
     const dir = try std.fmt.allocPrint(cli.arena, "src/modules/{s}", .{n.plural});
     const v = try vars(n, &.{}, cli.arena);
     try writeAll(cli, dir, if (flags.minimal) &minimal_files else &rest_files, v, flags.force);
@@ -299,18 +329,39 @@ fn generateModule(cli: Cli, flags: Flags, raw: []const u8) !void {
 fn generateStub(cli: Cli, flags: Flags, s: Stub, raw: []const u8) !void {
     try requireProject(cli);
     const n = try Names.init(cli.arena, raw);
-    const dir = s.dir orelse if (flags.module) |m| try std.fmt.allocPrint(cli.arena, "src/modules/{s}", .{m}) else "src";
+    const dir = s.dir orelse if (flags.module) |m| blk: {
+        // A folder name, not a path: nothing outside src/modules.
+        _ = Names.init(cli.arena, m) catch {
+            cli.print("error: --module {s}: a module folder name (letters, digits, '-', '_')\n", .{m});
+            return error.Exists;
+        };
+        const d = try std.fmt.allocPrint(cli.arena, "src/modules/{s}", .{m});
+        cli.cwd.access(cli.io, d, .{}) catch {
+            cli.print("error: --module {s}: no folder {s}\n", .{ m, d });
+            return error.Exists;
+        };
+        break :blk d;
+    } else "src";
     try writeAll(cli, dir, &.{s.template}, try vars(n, &.{}, cli.arena), flags.force);
 }
 
-fn removeModule(cli: Cli, raw: []const u8) !void {
+fn removeModule(cli: Cli, flags: Flags, raw: []const u8) !void {
     try requireProject(cli);
     const n = try Names.init(cli.arena, raw);
-    const dir = try std.fmt.allocPrint(cli.arena, "src/modules/{s}", .{n.plural});
-    cli.cwd.access(cli.io, dir, .{}) catch return error.NoSuchModule;
+    // Generated modules are plural (`tasks`); `kzig new`'s hello is not.
+    const plural_dir = try std.fmt.allocPrint(cli.arena, "src/modules/{s}", .{n.plural});
+    const single_dir = try std.fmt.allocPrint(cli.arena, "src/modules/{s}", .{n.kebab});
+    const dir = if (cli.cwd.access(cli.io, plural_dir, .{})) |_| plural_dir else |_| if (cli.cwd.access(cli.io, single_dir, .{})) |_| single_dir else |_| {
+        cli.print("error: no module folder {s} or {s}\n", .{ plural_dir, single_dir });
+        return error.Exists;
+    };
+    if (!flags.force and !try confirm(cli, dir)) {
+        cli.print("Nothing deleted.\n", .{});
+        return error.Exists;
+    }
     try cli.cwd.deleteTree(cli.io, dir);
     cli.print("  delete {s}\n", .{dir});
-    const needle = try std.fmt.allocPrint(cli.arena, "\"modules/{s}/", .{n.plural});
+    const needle = try std.fmt.allocPrint(cli.arena, "\"modules/{s}/", .{std.fs.path.basename(dir)});
     try edit(cli, "src/modules.zig", registry.remove, .{needle});
     edit(cli, "src/main.zig", registry.remove, .{needle}) catch |err| switch (err) {
         error.FileNotFound => {},

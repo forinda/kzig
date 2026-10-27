@@ -1,6 +1,6 @@
 const std = @import("std");
 const kzig = @import("kzig");
-const Query = @import("{{kebab}}.constants.zig").Query;
+const constants = @import("{{kebab}}.constants.zig");
 
 pub const {{Pascal}} = struct {
     id: u64,
@@ -29,7 +29,7 @@ fn checkName(name: []const u8, issues: *kzig.Issues) !void {
     if (name.len == 0 or name.len > 200) try issues.add("name", "must be 1 to 200 characters");
 }
 
-pub const Page = struct { rows: []const {{Pascal}}, total: usize };
+pub const {{Pascal}}Page = struct { rows: []const {{Pascal}}, total: usize };
 
 /// In memory — replace with your database. Shared by concurrent requests,
 /// so every access holds the lock.
@@ -50,7 +50,7 @@ pub const {{Pascal}}Repository = struct {
         self.strings.deinit();
     }
 
-    pub fn findAll(self: *{{Pascal}}Repository, arena: std.mem.Allocator, query: Query) !Page {
+    pub fn findAll(self: *{{Pascal}}Repository, arena: std.mem.Allocator, query: constants.Query) !{{Pascal}}Page {
         self.lock();
         defer self.unlock();
         var matched: std.ArrayList({{Pascal}}) = .empty;
@@ -118,7 +118,7 @@ pub const {{Pascal}}Repository = struct {
     }
 };
 
-fn matches(row: {{Pascal}}, query: Query) bool {
+fn matches(row: {{Pascal}}, query: constants.Query) bool {
     // `name` is the only filterable field (see Query).
     for (query.filters) |f| {
         const ok = switch (f.operator) {
