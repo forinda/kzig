@@ -37,6 +37,18 @@ AMD Ryzen 5 5600G (6 cores / 12 threads), 37 GB RAM, Linux 7.0, Zig 0.17.0, Node
 | Express (KickJS benchmark app) | /api/v1/echo/42 | 8,445 | 11.35 | 25 | 0 |
 | Express (KickJS benchmark app) | /api/v1/validate | 9,487 | 10.06 | 28 | 0 |
 
+## Route matching
+
+`zig build bench-router -Doptimize=ReleaseFast && ./zig-out/bin/bench-router`: 500 routes
+(100 REST resources), matching alone, no socket. Same machine as above.
+
+| request | linear scan (≤ v0.1.0) | segment tree |
+| --- | ---: | ---: |
+| first route | 72–87 ns | 101–103 ns |
+| middle | 254–296 ns | 102–103 ns |
+| last | 482–681 ns | 104–153 ns |
+| miss (404, `Allow` checked) | 3,568–4,046 ns | 292–385 ns |
+
 ## Reading them
 
 - **kzig vs KickJS**: 6–23× the requests at a tenth of the latency or less, on every route

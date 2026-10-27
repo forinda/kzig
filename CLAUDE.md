@@ -54,7 +54,7 @@ src/
   swagger.zig          # Swagger plugin: /openapi.json, /docs, /redoc
   health.zig           # Built-in /health/live, /health/ready
   context.zig          # Ctx, Request/Response views, return-value send
-  router.zig           # Route table, matching, 404/405
+  router.zig           # Route table as a comptime segment tree, matching, 404/405
   problem.zig          # RFC 9457 problem bodies, error-set → status
   middleware.zig       # Next chain; re-exports the built-ins
   middleware/          # requestId, requestLogger, cors, helmet

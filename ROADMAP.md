@@ -284,9 +284,18 @@ Follow-ups:
       `onCronError` for adapters; shutdown waits for runs in flight
 - [x] task-api `crons` module (`cron-jobs-api`): last runs, `GET /cron/jobs`, guarded manual run
 
+### M11 — Route tree
+
+- [x] Routes matched through a comptime segment tree (static children binary-searched, one
+      `:param` child, `*` routes) instead of a scan of every route; precedence stays
+      declaration order (the lowest-index match wins), checked against the old scan for every
+      path over a trap-laden table
+- [x] `zig build bench-router`: 500 routes, about 100 ns wherever the route sits (the scan:
+      80–680 ns), a 404 in 300–400 ns (was 3.6–4 µs); the benchmark compiles in a third of the time
+
 ### Later
 
-Radix-tree router, SSE, S3 storage, a WebSocket broker (Redis), serverless cron triggers,
+SSE, S3 storage, a WebSocket broker (Redis), serverless cron triggers,
 queues, database layer, a third engine (`io_uring`, edge).
 
 ## Open questions

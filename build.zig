@@ -28,6 +28,7 @@ pub fn build(b: *std.Build) void {
     // users never fetch http.zig.
     const bench_step = b.step("bench", "Build the benchmark servers (bench-httpz needs -Dhttpz)");
     addBench(b, bench_step, mod, null, target, optimize);
+    addRouterBench(b, mod, target, optimize);
     if (b.option(bool, "httpz", "Build the http.zig runtime (kzig_httpz module)") orelse false) {
         if (b.lazyDependency("httpz", .{ .target = target, .optimize = optimize })) |dep| {
             const httpz_mod = b.addModule("kzig_httpz", .{
@@ -68,6 +69,13 @@ pub fn build(b: *std.Build) void {
         run.expectStdErrMatch(case[1]);
         test_step.dependOn(&run.step);
     }
+}
+
+fn addRouterBench(b: *std.Build, kzig: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
+    const root = b.createModule(.{ .root_source_file = b.path("benchmarks/router.zig"), .target = target, .optimize = optimize });
+    root.addImport("kzig", kzig);
+    const exe = b.addExecutable(.{ .name = "bench-router", .root_module = root });
+    b.step("bench-router", "Build the route-matching benchmark").dependOn(&b.addInstallArtifact(exe, .{}).step);
 }
 
 fn addBench(b: *std.Build, step: *std.Build.Step, kzig: *std.Build.Module, httpz: ?*std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {

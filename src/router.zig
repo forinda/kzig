@@ -97,7 +97,131 @@ fn match(ctx: *Ctx, comptime pattern: []const []const u8, segments: []const []co
     return segments.len == pattern.len;
 }
 
+/// The route table as a segment tree, built at comptime: a node per path
+/// prefix, its static children, one `:param` child, routes ending there and
+/// `*` routes. Matching walks only the branches that fit the path and keeps
+/// the lowest-index route that matches, so precedence is still declaration
+/// order (KickJS/Express); `min` prunes branches that can't beat it.
+const Node = struct {
+    /// Sorted by segment, for a binary search.
+    statics: []const Edge = &.{},
+    param: ?u32 = null,
+    /// Routes ending here, ascending.
+    ends: []const u32 = &.{},
+    /// Routes whose final `*` starts here, ascending.
+    rest: []const u32 = &.{},
+    /// The lowest route index in this subtree.
+    min: u32 = std.math.maxInt(u32),
+};
+
+const Edge = struct { seg: []const u8, node: u32 };
+
+fn buildTree(comptime routes: []const Route) []const Node {
+    comptime {
+        @setEvalBranchQuota(10_000_000);
+        var cap: usize = 1;
+        for (routes) |r| cap += patternSegments(r.path).len;
+        var nodes: [cap]Node = undefined;
+        nodes[0] = .{};
+        var count: u32 = 1;
+        for (routes, 0..) |r, ri_usize| {
+            const ri: u32 = ri_usize;
+            var n: u32 = 0;
+            nodes[0].min = @min(nodes[0].min, ri);
+            var wildcard = false;
+            for (patternSegments(r.path)) |p| {
+                if (std.mem.eql(u8, p, "*")) {
+                    nodes[n].rest = nodes[n].rest ++ .{ri};
+                    wildcard = true;
+                    break;
+                }
+                if (p[0] == ':') {
+                    if (nodes[n].param == null) {
+                        nodes[count] = .{};
+                        nodes[n].param = count;
+                        count += 1;
+                    }
+                    n = nodes[n].param.?;
+                } else {
+                    const child = for (nodes[n].statics) |e| {
+                        if (std.mem.eql(u8, e.seg, p)) break e.node;
+                    } else blk: {
+                        nodes[count] = .{};
+                        nodes[n].statics = nodes[n].statics ++ .{Edge{ .seg = p, .node = count }};
+                        count += 1;
+                        break :blk count - 1;
+                    };
+                    n = child;
+                }
+                nodes[n].min = @min(nodes[n].min, ri);
+            }
+            if (!wildcard) nodes[n].ends = nodes[n].ends ++ .{ri};
+        }
+        for (nodes[0..count]) |*node| {
+            var sorted = node.statics[0..node.statics.len].*;
+            std.mem.sort(Edge, &sorted, {}, edgeLess);
+            const frozen = sorted;
+            node.statics = &frozen;
+        }
+        const final = nodes[0..count].*;
+        return &final;
+    }
+}
+
+fn edgeLess(_: void, a: Edge, b: Edge) bool {
+    return std.mem.order(u8, a.seg, b.seg) == .lt;
+}
+
+fn staticChild(node: *const Node, seg: []const u8) ?u32 {
+    var lo: usize = 0;
+    var hi: usize = node.statics.len;
+    while (lo < hi) {
+        const mid = (lo + hi) / 2;
+        switch (std.mem.order(u8, node.statics[mid].seg, seg)) {
+            .eq => return node.statics[mid].node,
+            .lt => lo = mid + 1,
+            .gt => hi = mid,
+        }
+    }
+    return null;
+}
+
+/// The lowest-index route for `method` matching `segments`, from node `n`
+/// at segment `i`.
+fn findIn(nodes: []const Node, methods: []const std.http.Method, n: u32, segments: []const []const u8, i: usize, method: std.http.Method, best: *?u32) void {
+    const node = &nodes[n];
+    if (best.*) |b| if (node.min >= b) return;
+    for (node.rest) |ri| if (methods[ri] == method) {
+        if (best.* == null or ri < best.*.?) best.* = ri;
+        break;
+    };
+    if (i == segments.len) {
+        for (node.ends) |ri| if (methods[ri] == method) {
+            if (best.* == null or ri < best.*.?) best.* = ri;
+            break;
+        };
+        return;
+    }
+    if (staticChild(node, segments[i])) |c| findIn(nodes, methods, c, segments, i + 1, method, best);
+    if (node.param) |p| findIn(nodes, methods, p, segments, i + 1, method, best);
+}
+
+/// Every route matching `segments`, any method (for 405's `Allow`).
+fn collectIn(nodes: []const Node, n: u32, segments: []const []const u8, i: usize, arena: std.mem.Allocator, out: *std.ArrayList(u32)) !void {
+    const node = &nodes[n];
+    try out.appendSlice(arena, node.rest);
+    if (i == segments.len) return out.appendSlice(arena, node.ends);
+    if (staticChild(node, segments[i])) |c| try collectIn(nodes, c, segments, i + 1, arena, out);
+    if (node.param) |p| try collectIn(nodes, p, segments, i + 1, arena, out);
+}
+
 pub fn Router(comptime routes: []const Route) type {
+    const tree = buildTree(routes);
+    const methods = comptime blk: {
+        var m: [routes.len]std.http.Method = undefined;
+        for (routes, &m) |r, *o| o.* = r.method;
+        break :blk m;
+    };
     return struct {
         /// Never fails: every outcome, errors included, becomes a response.
         pub fn handle(_: @This(), ctx: *Ctx) void {
@@ -134,42 +258,54 @@ pub fn Router(comptime routes: []const Route) type {
         }
 
         fn unmatched(ctx: *Ctx) !void {
-            @setEvalBranchQuota(1_000_000);
             const path = try normalizePath(ctx.arena, ctx.req.path);
+            var matched: std.ArrayList(u32) = .empty;
+            if (routes.len > 0) try collectIn(tree, 0, path.segments, 0, ctx.arena, &matched);
+            if (matched.items.len == 0) return error.NotFound;
+            // In declaration order, as the routes were listed.
+            std.mem.sort(u32, matched.items, {}, std.sort.asc(u32));
             var allow: std.ArrayList(u8) = .empty;
             var seen: std.EnumSet(std.http.Method) = .empty;
-            inline for (routes) |r| {
-                if (!seen.contains(r.method) and try match(ctx, comptime patternSegments(r.path), path.segments)) {
-                    seen.insert(r.method);
-                    if (allow.items.len > 0) try allow.appendSlice(ctx.arena, ", ");
-                    try allow.appendSlice(ctx.arena, @tagName(r.method));
-                    if (r.method == .GET and !seen.contains(.HEAD)) {
-                        seen.insert(.HEAD);
-                        try allow.appendSlice(ctx.arena, ", HEAD");
-                    }
+            for (matched.items) |ri| {
+                const m = methods[ri];
+                if (seen.contains(m)) continue;
+                seen.insert(m);
+                if (allow.items.len > 0) try allow.appendSlice(ctx.arena, ", ");
+                try allow.appendSlice(ctx.arena, @tagName(m));
+                if (m == .GET and !seen.contains(.HEAD)) {
+                    seen.insert(.HEAD);
+                    try allow.appendSlice(ctx.arena, ", HEAD");
                 }
             }
-            if (allow.items.len == 0) return error.NotFound;
             try ctx.writeProblem(.{ .status = .method_not_allowed });
             try ctx.setHeader("allow", allow.items);
         }
 
         fn runRoute(ctx: *Ctx, method: std.http.Method, path: Path) !bool {
-            // Every route's pattern is unrolled here; big apps need more
-            // than the default 1000 comptime branches.
-            @setEvalBranchQuota(1_000_000);
-            inline for (routes) |r| {
-                if (r.method == method and try match(ctx, comptime patternSegments(r.path), path.segments)) {
-                    if (r.middleware.len == 0) {
-                        try r.handler(ctx);
-                    } else {
-                        var next: mw.Next = .{ .ctx = ctx, .chain = r.middleware, .final = r.handler };
-                        next.run();
-                    }
-                    return true;
+            if (routes.len == 0) return false;
+            var best: ?u32 = null;
+            findIn(tree, &methods, 0, path.segments, 0, method, &best);
+            const ri = best orelse return false;
+            try runners[ri](ctx, path.segments);
+            return true;
+        }
+
+        /// Per route: its params from the path, then its middleware and handler.
+        const runners = blk: {
+            var out: [routes.len]*const fn (*Ctx, []const []const u8) anyerror!void = undefined;
+            for (routes, &out) |r, *o| o.* = Runner(r).run;
+            break :blk out;
+        };
+
+        fn Runner(comptime r: Route) type {
+            return struct {
+                fn run(ctx: *Ctx, segments: []const []const u8) anyerror!void {
+                    _ = try match(ctx, comptime patternSegments(r.path), segments);
+                    if (r.middleware.len == 0) return r.handler(ctx);
+                    var next: mw.Next = .{ .ctx = ctx, .chain = r.middleware, .final = r.handler };
+                    next.run();
                 }
-            }
-            return false;
+            };
         }
     };
 }
@@ -393,4 +529,83 @@ test "a large route table stays within the compile-time branch quota" {
     var a = runTest(Big, .GET, "/r59/1/items/2", &.{});
     defer a.deinit();
     try testing.expectEqual(std.http.Status.ok, a.res.status);
+}
+
+fn nothing(_: *Ctx) void {}
+
+/// Declaration order decides, so the traps: a param before a static, a
+/// wildcard before a specific route, the same shape under several methods.
+const tricky = [_]Route{
+    route(.GET, "/users/:id", nothing),
+    route(.GET, "/users/me", nothing),
+    route(.GET, "/users/:id/posts", nothing),
+    route(.POST, "/users", nothing),
+    route(.GET, "/files/*", nothing),
+    route(.GET, "/files/special", nothing),
+    route(.DELETE, "/users/:id", nothing),
+    route(.GET, "/:any/x", nothing),
+    route(.PUT, "/a/b/c", nothing),
+    route(.GET, "/a/:b/c", nothing),
+    route(.GET, "/a/b/:c", nothing),
+    route(.GET, "/", nothing),
+    route(.PATCH, "/*", nothing),
+    route(.GET, "/me/:a/:b", nothing),
+};
+
+/// The matcher the tree replaced: the first route, in order, that fits.
+fn linearFirst(ctx: *Ctx, method: ?std.http.Method, segments: []const []const u8, start: usize) !?usize {
+    inline for (tricky, 0..) |r, i| {
+        if (i >= start and (method == null or r.method == method.?) and try match(ctx, comptime patternSegments(r.path), segments)) return i;
+    }
+    return null;
+}
+
+test "the tree picks what the linear scan picked, for every path and method" {
+    const tree = comptime buildTree(&tricky);
+    const methods = comptime blk: {
+        var m: [tricky.len]std.http.Method = undefined;
+        for (&tricky, &m) |r, *o| o.* = r.method;
+        break :blk m;
+    };
+    const words = [_][]const u8{ "users", "me", "1", "posts", "files", "special", "a", "b", "c", "x" };
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const req: context.Request = .{ .method = .GET, .path = "/", .query = "", .headers = &.{}, .body = "" };
+    var res: context.Response = .{};
+    var ctx: Ctx = .{ .arena = arena.allocator(), .req = &req, .res = &res };
+    var segs: [4][]const u8 = undefined;
+    var checked: usize = 0;
+    for (0..5) |len| {
+        var combo: [4]usize = @splat(0);
+        while (true) {
+            for (0..len) |k| segs[k] = words[combo[k]];
+            const path = segs[0..len];
+            for ([_]std.http.Method{ .GET, .POST, .PUT, .DELETE, .PATCH }) |m| {
+                var best: ?u32 = null;
+                findIn(tree, &methods, 0, path, 0, m, &best);
+                const want = try linearFirst(&ctx, m, path, 0);
+                try testing.expectEqual(want, if (best) |b| @as(usize, b) else null);
+            }
+            // Allow: the same set of matching routes.
+            var got: std.ArrayList(u32) = .empty;
+            try collectIn(tree, 0, path, 0, arena.allocator(), &got);
+            var count: usize = 0;
+            var from: usize = 0;
+            while (try linearFirst(&ctx, null, path, from)) |i| : (from = i + 1) {
+                count += 1;
+                try testing.expect(std.mem.findScalar(u32, got.items, @intCast(i)) != null);
+            }
+            try testing.expectEqual(count, got.items.len);
+            checked += 1;
+            // Next combination of `len` words.
+            var k: usize = 0;
+            while (k < len) : (k += 1) {
+                combo[k] += 1;
+                if (combo[k] < words.len) break;
+                combo[k] = 0;
+            }
+            if (k == len) break;
+        }
+    }
+    try testing.expectEqual(1 + 10 + 100 + 1000 + 10000, checked);
 }
