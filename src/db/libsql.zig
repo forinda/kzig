@@ -4,6 +4,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const pg = @import("pg.zig");
+const http_client = @import("../core/http_client.zig");
 
 const Allocator = std.mem.Allocator;
 const Error = pg.Error;
@@ -18,12 +19,14 @@ pub const Client = struct {
     endpoint: []const u8,
     /// `Bearer <authToken>`, when the URL has one.
     authorization: ?[]const u8,
+    /// A request the server is silent on this long fails (0: never).
+    timeout_ms: u32 = 30_000,
 
     /// `libsql://host[:port][?authToken=…]` (https), or `http(s)://…`.
-    pub fn init(io: std.Io, gpa: Allocator, url: []const u8) !*Client {
+    pub fn init(io: std.Io, gpa: Allocator, url: []const u8, timeout_ms: u32) !*Client {
         const c = try gpa.create(Client);
         errdefer gpa.destroy(c);
-        c.* = .{ .gpa = gpa, .io = io, .http = .{ .allocator = gpa, .io = io }, .arena = .init(gpa), .endpoint = "", .authorization = null };
+        c.* = .{ .gpa = gpa, .io = io, .http = .{ .allocator = gpa, .io = io }, .arena = .init(gpa), .endpoint = "", .authorization = null, .timeout_ms = timeout_ms };
         errdefer c.arena.deinit();
         const a = c.arena.allocator();
         var rest = url;
@@ -187,34 +190,20 @@ pub const Session = struct {
             if (!s.keep) w.writeAll(if (request != null) ",{\"type\":\"close\"}" else "{\"type\":\"close\"}") catch |e| break :blk e;
             w.writeAll("]}") catch |e| break :blk e;
         }) catch return error.OutOfMemory;
-        var out: std.Io.Writer.Allocating = .init(a);
-        refreshTlsClock(&s.client.http, s.client.io);
-        const res = s.client.http.fetch(.{
-            .location = .{ .url = s.endpoint orelse s.client.endpoint },
-            .method = .POST,
-            .payload = body.written(),
-            // `privileged_headers` aren't sent by std 0.17's client; the
-            // token goes in `authorization`, and no redirect carries it on.
-            .headers = .{
-                .content_type = .{ .override = "application/json" },
-                .authorization = if (s.client.authorization) |v| .{ .override = v } else .default,
-            },
-            .redirect_behavior = .unhandled,
-            .response_writer = &out.writer,
-        }) catch |err| {
+        const res = http_client.postJson(&s.client.http, s.client.io, a, s.endpoint orelse s.client.endpoint, s.client.authorization, body.written(), s.client.timeout_ms, 64 << 20) catch |err| {
             if (!builtin.is_test) std.log.err("db: libsql {s}: {t}", .{ s.client.endpoint, err });
             try s.setBaton(null);
-            return error.ServiceUnavailable;
+            return if (err == error.OutOfMemory) error.OutOfMemory else error.ServiceUnavailable;
         };
         // An HTTP error ends the stream (Hrana): its transaction is gone. A
         // 400 outside one is the request's fault.
         if (res.status != .ok) {
-            if (!builtin.is_test) std.log.err("db: libsql: HTTP {d}: {s}", .{ @backingInt(res.status), out.written() });
+            if (!builtin.is_test) std.log.err("db: libsql: HTTP {d}: {s}", .{ @backingInt(res.status), res.body[0..@min(res.body.len, 300)] });
             const in_stream = s.baton != null;
             try s.setBaton(null);
             return if (res.status == .bad_request and !in_stream and !s.keep) error.DbError else error.ServiceUnavailable;
         }
-        const v = std.json.parseFromSliceLeaky(std.json.Value, a, out.written(), .{ .parse_numbers = false }) catch return error.DbDecode;
+        const v = std.json.parseFromSliceLeaky(std.json.Value, a, res.body, .{ .parse_numbers = false }) catch return error.DbDecode;
         const baton = field(v, "baton");
         try s.setBaton(if (baton != null and baton.? == .string) baton.?.string else null);
         // The server ended a stream we meant to keep.
@@ -249,21 +238,6 @@ fn fail(e: std.json.Value) Error {
         return error.Conflict;
     if (std.mem.startsWith(u8, code, "SQLITE_BUSY") or std.mem.startsWith(u8, code, "SQLITE_LOCKED")) return error.ServiceUnavailable;
     return error.DbError;
-}
-
-/// std's client checks certificates against the time of its first TLS
-/// request, for good: past an hour, a fresh time (certificates rotate).
-pub fn refreshTlsClock(h: *std.http.Client, io: std.Io) void {
-    const now = std.Io.Clock.real.now(io);
-    {
-        h.ca_bundle_lock.lockShared(io) catch return;
-        defer h.ca_bundle_lock.unlockShared(io);
-        const t = h.now orelse return;
-        if (now.nanoseconds - t.nanoseconds < std.time.ns_per_hour) return;
-    }
-    h.ca_bundle_lock.lock(io) catch return;
-    defer h.ca_bundle_lock.unlock(io);
-    if (h.now != null) h.now = now;
 }
 
 /// A text parameter as a Hrana value: a canonical integer as `integer`,
@@ -400,6 +374,8 @@ const FakeHrana = struct {
     n: usize = 0,
     /// Answer `results` as an object: not what Hrana sends.
     malformed: bool = false,
+    /// Read the request, never answer.
+    silent: bool = false,
 
     fn start(f: *FakeHrana) !void {
         const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
@@ -446,6 +422,11 @@ const FakeHrana = struct {
     }
 
     fn answer(f: *FakeHrana, req: *std.http.Server.Request) !void {
+        if (f.silent) {
+            f.mutex.unlock(testing.io);
+            defer f.mutex.lockUncancelable(testing.io);
+            return testing.io.sleep(.fromSeconds(60), .awake);
+        }
         var auth: []const u8 = "-";
         var it = req.iterateHeaders();
         while (it.next()) |h| if (std.ascii.eqlIgnoreCase(h.name, "authorization")) {
@@ -526,21 +507,12 @@ test "libsql: bytes that aren't UTF-8 go as a blob" {
 }
 
 test "libsql URLs: tls=0 is http; a token must be a header value" {
-    const c = try Client.init(testing.io, testing.allocator, "libsql://db.example.com:8080?tls=0&authToken=abc");
+    const c = try Client.init(testing.io, testing.allocator, "libsql://db.example.com:8080?tls=0&authToken=abc", 0);
     defer c.deinit();
     try testing.expectEqualStrings("http://db.example.com:8080/v2/pipeline", c.endpoint);
     try testing.expectEqualStrings("Bearer abc", c.authorization.?);
-    try testing.expectError(error.InvalidDatabaseUrl, Client.init(testing.io, testing.allocator, "libsql://h?authToken=a\r\nX-Evil: 1"));
-    try testing.expectError(error.InvalidDatabaseUrl, Client.init(testing.io, testing.allocator, "libsql://h?authToken"));
-}
-
-test "the HTTP client's TLS clock moves on: an hour-old one is replaced" {
-    var h: std.http.Client = .{ .allocator = testing.allocator, .io = testing.io };
-    defer h.deinit();
-    const now = std.Io.Clock.real.now(testing.io);
-    h.now = .{ .nanoseconds = now.nanoseconds - 2 * std.time.ns_per_hour };
-    refreshTlsClock(&h, testing.io);
-    try testing.expect(now.nanoseconds - h.now.?.nanoseconds < std.time.ns_per_min);
+    try testing.expectError(error.InvalidDatabaseUrl, Client.init(testing.io, testing.allocator, "libsql://h?authToken=a\r\nX-Evil: 1", 0));
+    try testing.expectError(error.InvalidDatabaseUrl, Client.init(testing.io, testing.allocator, "libsql://h?authToken", 0));
 }
 
 test "libsql: a malformed answer is DbDecode, not a crash" {
@@ -552,4 +524,17 @@ test "libsql: a malformed answer is DbDecode, not a crash" {
     var pool: db.Pool = try .init(testing.io, testing.allocator, .{ .url = try std.fmt.bufPrint(&buf, "http://127.0.0.1:{d}", .{fake.port()}) });
     defer pool.deinit();
     try testing.expectError(error.DbDecode, pool.exec("SELECT 1", .{}));
+}
+
+test "libsql: a server that never answers is ServiceUnavailable after request_timeout_ms" {
+    var fake: FakeHrana = undefined;
+    try fake.start();
+    defer fake.stop();
+    fake.silent = true;
+    var buf: [128]u8 = undefined;
+    var pool: db.Pool = try .init(testing.io, testing.allocator, .{ .url = try std.fmt.bufPrint(&buf, "http://127.0.0.1:{d}", .{fake.port()}), .request_timeout_ms = 200 });
+    defer pool.deinit();
+    const start = std.Io.Clock.awake.now(testing.io);
+    try testing.expectError(error.ServiceUnavailable, pool.exec("SELECT 1", .{}));
+    try testing.expect(start.durationTo(std.Io.Clock.awake.now(testing.io)).toMilliseconds() < 5000);
 }

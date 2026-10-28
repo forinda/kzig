@@ -6,6 +6,7 @@ const builtin = @import("builtin");
 const store = @import("storage.zig");
 const cron = @import("../cron/cron.zig");
 const kzig_config = @import("../core/config.zig");
+const http_client = @import("../core/http_client.zig");
 
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -400,32 +401,7 @@ pub const S3 = struct {
         return false;
     }
 
-    /// Cuts the socket once the bucket has been silent for `ms`; `arm`
-    /// restarts the wait whenever something arrives.
-    const Watchdog = struct {
-        io: Io,
-        stream: Io.net.Stream,
-        ms: u32,
-        deadline: std.atomic.Value(i64) = .init(std.math.maxInt(i64)),
-        fired: std.atomic.Value(bool) = .init(false),
-
-        fn arm(w: *Watchdog) void {
-            w.deadline.store(@as(i64, @intCast(@divTrunc(Io.Clock.awake.now(w.io).toNanoseconds(), std.time.ns_per_ms))) + w.ms, .release);
-        }
-
-        fn watch(w: *Watchdog) Io.Cancelable!void {
-            while (true) {
-                const now: i64 = @intCast(@divTrunc(Io.Clock.awake.now(w.io).toNanoseconds(), std.time.ns_per_ms));
-                const left = w.deadline.load(.acquire) - now;
-                if (left <= 0) {
-                    w.fired.store(true, .release);
-                    w.stream.shutdown(w.io, .both) catch {};
-                    return;
-                }
-                try w.io.sleep(.fromMilliseconds(@min(left, 50)), .awake);
-            }
-        }
-    };
+    const Watchdog = http_client.Watchdog;
 
     // ponytail: the timeout covers the request once connected; connecting
     // to an address that drops packets waits for the OS (Io.Threaded can't
@@ -458,6 +434,7 @@ pub const S3 = struct {
         const qs = try canonicalQuery(a, query);
         const target = try std.fmt.allocPrint(a, "{s}://{s}{s}{s}{s}", .{ s.scheme, s.host, path, if (qs.len > 0) "?" else "", qs });
         const uri = try std.Uri.parse(target);
+        http_client.refreshTlsClock(&s.client, s.io);
         var req = try s.client.request(method, uri, .{
             .redirect_behavior = .unhandled,
             .headers = .{

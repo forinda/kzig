@@ -67,6 +67,9 @@ pub const Options = struct {
     /// `ServiceUnavailable`, which is also what a task that uses the pool
     /// while holding its own transaction gets instead of waiting forever.
     acquire_timeout_ms: u32 = 30_000,
+    /// Turso and D1: a request the server is silent on this long (no byte
+    /// for that long) is `ServiceUnavailable`. 0: wait forever.
+    request_timeout_ms: u32 = 30_000,
 };
 
 /// Which SQL a database speaks.
@@ -136,11 +139,11 @@ pub const Pool = struct {
             return .{ .io = io, .gpa = gpa, .driver = .{ .sqlite = conn }, .arena = .init(gpa), .permits = .{ .permits = 1 }, .acquire_timeout_ms = o.acquire_timeout_ms };
         }
         if (std.mem.startsWith(u8, o.url, "d1://")) {
-            const client = try d1.Client.init(io, gpa, o.url);
+            const client = try d1.Client.init(io, gpa, o.url, o.request_timeout_ms);
             return .{ .io = io, .gpa = gpa, .driver = .{ .d1 = client }, .arena = .init(gpa), .permits = .{ .permits = o.max_connections } };
         }
         for ([_][]const u8{ "libsql://", "https://", "http://" }) |scheme| if (std.mem.startsWith(u8, o.url, scheme)) {
-            const client = try libsql.Client.init(io, gpa, o.url);
+            const client = try libsql.Client.init(io, gpa, o.url, o.request_timeout_ms);
             return .{ .io = io, .gpa = gpa, .driver = .{ .libsql = client }, .arena = .init(gpa), .permits = .{ .permits = o.max_connections } };
         };
         var arena: std.heap.ArenaAllocator = .init(gpa);

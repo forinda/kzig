@@ -76,6 +76,7 @@ test {
     _ = @import("core/decode.zig");
     _ = @import("core/di.zig");
     _ = @import("core/health.zig");
+    _ = @import("core/http_client.zig");
     _ = @import("core/middleware.zig");
     _ = @import("core/middleware/cors.zig");
     _ = @import("core/middleware/harness.zig");

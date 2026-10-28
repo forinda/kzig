@@ -5,6 +5,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const pg = @import("pg.zig");
+const http_client = @import("../core/http_client.zig");
 
 const Allocator = std.mem.Allocator;
 const Error = pg.Error;
@@ -21,13 +22,15 @@ pub const Client = struct {
     arena: std.heap.ArenaAllocator,
     endpoint: []const u8,
     authorization: []const u8,
+    /// A request the server is silent on this long fails (0: never).
+    timeout_ms: u32 = 30_000,
 
     /// `d1://<account id>/<database id>?token=…`; `&endpoint=` replaces
     /// `https://api.cloudflare.com/client/v4` (tests, a proxy).
-    pub fn init(io: std.Io, gpa: Allocator, url: []const u8) !*Client {
+    pub fn init(io: std.Io, gpa: Allocator, url: []const u8, timeout_ms: u32) !*Client {
         const c = try gpa.create(Client);
         errdefer gpa.destroy(c);
-        c.* = .{ .gpa = gpa, .io = io, .http = .{ .allocator = gpa, .io = io }, .arena = .init(gpa), .endpoint = "", .authorization = "" };
+        c.* = .{ .gpa = gpa, .io = io, .http = .{ .allocator = gpa, .io = io }, .arena = .init(gpa), .endpoint = "", .authorization = "", .timeout_ms = timeout_ms };
         errdefer c.arena.deinit();
         const a = c.arena.allocator();
         const rest = url["d1://".len..];
@@ -122,23 +125,12 @@ pub const Client = struct {
 
     /// The request; its `result` array, or the error D1 reports.
     fn post(c: *Client, a: Allocator, body: []const u8) Error![]const std.json.Value {
-        var out: std.Io.Writer.Allocating = .init(a);
-        @import("libsql.zig").refreshTlsClock(&c.http, c.io);
-        const res = c.http.fetch(.{
-            .location = .{ .url = c.endpoint },
-            .method = .POST,
-            .payload = body,
-            // `privileged_headers` aren't sent by std 0.17's client; the
-            // token goes in `authorization`, and no redirect carries it on.
-            .headers = .{ .content_type = .{ .override = "application/json" }, .authorization = .{ .override = c.authorization } },
-            .redirect_behavior = .unhandled,
-            .response_writer = &out.writer,
-        }) catch |err| {
+        const res = http_client.postJson(&c.http, c.io, a, c.endpoint, c.authorization, body, c.timeout_ms, 64 << 20) catch |err| {
             if (!builtin.is_test) std.log.err("db: d1: {t}", .{err});
-            return error.ServiceUnavailable;
+            return if (err == error.OutOfMemory) error.OutOfMemory else error.ServiceUnavailable;
         };
-        const v = std.json.parseFromSliceLeaky(std.json.Value, a, out.written(), .{ .parse_numbers = false }) catch {
-            if (!builtin.is_test) std.log.err("db: d1: HTTP {d}: {s}", .{ @backingInt(res.status), out.written() });
+        const v = std.json.parseFromSliceLeaky(std.json.Value, a, res.body, .{ .parse_numbers = false }) catch {
+            if (!builtin.is_test) std.log.err("db: d1: HTTP {d}: {s}", .{ @backingInt(res.status), res.body[0..@min(res.body.len, 300)] });
             return if (res.status == .ok) error.DbDecode else error.ServiceUnavailable;
         };
         const ok = field(v, "success");
@@ -280,6 +272,8 @@ const FakeD1 = if (@import("kzig_options").sqlite) struct {
     requests: std.atomic.Value(u32) = .init(0),
     /// Answer every request with this status (rate limits, outages).
     status: std.http.Status = .ok,
+    /// Read the request, never answer.
+    silent: bool = false,
     last_auth: [64]u8 = undefined,
     last_auth_len: usize = 0,
 
@@ -331,6 +325,11 @@ const FakeD1 = if (@import("kzig_options").sqlite) struct {
     }
 
     fn answer(f: *FakeD1, req: *std.http.Server.Request, a: std.mem.Allocator) !void {
+        if (f.silent) {
+            f.mutex.unlock(testing.io);
+            defer f.mutex.lockUncancelable(testing.io);
+            return testing.io.sleep(.fromSeconds(60), .awake);
+        }
         _ = f.requests.fetchAdd(1, .acq_rel);
         var it = req.iterateHeaders();
         while (it.next()) |h| if (std.ascii.eqlIgnoreCase(h.name, "authorization")) {
@@ -554,6 +553,19 @@ test "d1: dropped table names, quotes doubled" {
 }
 
 test "d1 URLs: a token must be there and be a header value" {
-    try testing.expectError(error.InvalidDatabaseUrl, Client.init(testing.io, testing.allocator, "d1://a/b?token="));
-    try testing.expectError(error.InvalidDatabaseUrl, Client.init(testing.io, testing.allocator, "d1://a/b?token=x\ny"));
+    try testing.expectError(error.InvalidDatabaseUrl, Client.init(testing.io, testing.allocator, "d1://a/b?token=", 0));
+    try testing.expectError(error.InvalidDatabaseUrl, Client.init(testing.io, testing.allocator, "d1://a/b?token=x\ny", 0));
+}
+
+test "d1: a server that never answers is ServiceUnavailable after request_timeout_ms" {
+    if (FakeD1 == void) return error.SkipZigTest;
+    var fake: FakeD1 = undefined;
+    try fake.start();
+    defer fake.stop();
+    fake.silent = true;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var pool: db.Pool = try .init(testing.io, testing.allocator, .{ .url = try fake.url(arena.allocator()), .request_timeout_ms = 200 });
+    defer pool.deinit();
+    try testing.expectError(error.ServiceUnavailable, pool.exec("SELECT 1", .{}));
 }
