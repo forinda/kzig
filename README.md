@@ -446,7 +446,10 @@ file. D1 has no interactive transactions: `begin` is `error.TransactionsUnsuppor
 `pool.batch(&.{ … })` runs statements as one, and each migration goes as one batch (its
 statements, its record, a foreign-key check). D1 keeps foreign keys on, so a migration that
 rebuilds or drops a table others reference is refused before it runs (`error.RebuildOfReferencedTable`).
-D1 binds at most 100 parameters per statement (`error.TooManyParameters`).
+D1 binds at most 100 parameters per statement (`error.TooManyParameters`); `db.insertMany(a,
+.items, rows, .{})` splits rows to fit (on any database: Postgres 65,535, SQLite 32,766) and runs
+the statements as one transaction, or one batch on D1. Turso and D1 requests time out after
+`request_timeout_ms` (30 s) of silence.
 
 ## WebSockets
 

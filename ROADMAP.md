@@ -461,12 +461,15 @@ bind them either).
 - [x] `d1://` over Cloudflare's REST API: `batch`, 100 parameters per statement, no transactions;
       migrations as one batch each, rebuilds of referenced tables refused (as kick/db); tested
       against a fake of the endpoint run by local SQLite
-- [ ] A live D1 test (credentials in CI), and `insertMany` that splits at D1's parameter limit
-- [ ] Request timeouts for the HTTP drivers (std's fetch has none)
-- [ ] On D1, kick/db's trigger check before a rebuild and its worded foreign-key error
-- [ ] Parameters bound by their Zig type, not the canonical-integer rule (raw SQL comparing
-      text through a function, `lower(s) = ?1`, can miss rows today)
-- [ ] S3's HTTP client refreshes its TLS clock too (the database drivers do, hourly)
+- [x] `insertMany` / `insertManyReturning`: rows split to the parameter limit (D1: 100), one
+      transaction or one D1 batch
+- [x] Request timeouts for the HTTP drivers (`request_timeout_ms`; S3's watchdog, shared)
+- [x] kick/db's trigger check before a rebuild (SQLite and D1); D1's guard failure is
+      `ForeignKeyViolation`
+- [x] Parameters bound by their Zig type on SQLite, Turso and D1 (a numeric-looking string stays
+      TEXT); raw text parameters keep the canonical-integer rule
+- [x] S3's HTTP client refreshes its TLS clock too
+- [ ] A live D1 test (Cloudflare credentials in CI)
 
 ### Later
 

@@ -56,6 +56,7 @@ src/
     problem.zig        # RFC 9457 problem bodies, error-set → status
     query.zig          # ListQuery (filter/sort/page) and Paginated
     health.zig         # Built-in /health/live, /health/ready
+    http_client.zig    # Shared by S3/Turso/D1: request watchdog, TLS clock refresh
     testing.zig        # In-process runtime and assertions, WsClient
     middleware.zig     # Next chain; re-exports the built-ins
     middleware/        # requestId, requestLogger, cors, helmet
