@@ -34,6 +34,7 @@ zig build test -Dhttpz # …plus the http.zig runtime (fetches http.zig)
 zig build test -Dsqlite # …plus local SQLite (fetches SQLite's amalgamation)
 zig build bench -Dhttpz -Doptimize=ReleaseFast && ./benchmarks/run.sh
 ./scripts/scaffold-check.sh # kzig new + generators, built and tested (after CLI or template changes)
+scripts/release-notes.sh v0.3.0  # preview a release's notes (RELEASING.md has the whole flow)
 zig fmt build.zig src examples tests benchmarks              # Format
 zig fmt --check build.zig build.zig.zon src examples tests benchmarks      # Check formatting
 zig build --watch      # Rebuild on change

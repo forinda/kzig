@@ -76,3 +76,7 @@ tracked refers to them.
   reproduction.
 - Security vulnerabilities: report privately via
   [security advisories](https://github.com/forinda/kzig/security/advisories/new), not an issue.
+
+## Releases
+
+See [RELEASING.md](./RELEASING.md): versions, the notes script, and the tag that publishes.
