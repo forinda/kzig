@@ -32,11 +32,11 @@ markdown_extensions:
   - pymdownx.highlight
   - pymdownx.superfences
 
-# Google Analytics (gtag): set your measurement ID and uncomment.
-# extra:
-#   analytics:
-#     provider: google
-#     property: G-XXXXXXXXXX
+# Google Analytics (gtag).
+extra:
+  analytics:
+    provider: google
+    property: G-GYQKXWK09G
 
 nav:
   - Home: index.md
