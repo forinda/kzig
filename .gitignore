@@ -21,3 +21,4 @@ zig-out/
 CLAUDE.local.md
 .superpowers/
 zig-pkg/
+_site/

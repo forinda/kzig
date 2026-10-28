@@ -37,7 +37,8 @@ zig build bench -Dhttpz -Doptimize=ReleaseFast && ./benchmarks/run.sh
 zig fmt build.zig src examples tests benchmarks              # Format
 zig fmt --check build.zig build.zig.zon src examples tests benchmarks      # Check formatting
 zig build --watch      # Rebuild on change
-zig build docs         # API reference (autodoc) into zig-out/docs; Pages publishes it with docs/index.html
+zig build docs         # API reference (autodoc) into zig-out/docs; Pages serves it at /api/
+mkdocs build --strict  # the guides in docs/ (pip install -r docs/requirements.txt)
 ```
 
 ## Repository Structure
@@ -77,6 +78,7 @@ src/
                        # vendored with ALPN, channel binding, client certs; keys.zig)
   cli/                 # The `kzig` CLI: main.zig, dev.zig, names, templates/*.tpl, registry
 examples/task-api/     # The one example app; grows each milestone
+docs/                  # The guides (MkDocs); mkdocs.yml has the nav
 benchmarks/            # bench.zig servers + run.sh against KickJS
 tests/compile_errors/  # Fixtures that must fail to compile (listed in build.zig)
 ```
@@ -206,6 +208,8 @@ Write rich bodies to a file and pass `--body-file`; never inline multi-line mark
   and are never referenced from tracked files. `ROADMAP.md` is the public plan.
 - Keep `ROADMAP.md` true: tick items as they land, move settled open questions into the
   relevant milestone.
+- The README is highlights only; a feature's details go in its page under `docs/` (and the nav
+  in `mkdocs.yml` when the page is new).
 - There is one example app, `examples/task-api`. A milestone adds modules to it rather than a
   new app; read the KickJS archive example first and port its tests with the same paths and
   status codes.

@@ -1,0 +1,64 @@
+site_name: kzig
+site_description: KickJS for Zig, wired at compile time.
+site_url: https://forinda.github.io/kzig/
+repo_url: https://github.com/forinda/kzig
+repo_name: forinda/kzig
+edit_uri: edit/main/docs/
+site_dir: _site
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - search.highlight
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: blue grey
+      accent: deep orange
+      toggle: { icon: material/weather-night, name: Dark mode }
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: blue grey
+      accent: deep orange
+      toggle: { icon: material/weather-sunny, name: Light mode }
+
+markdown_extensions:
+  - admonition
+  - tables
+  - toc: { permalink: true }
+  - pymdownx.highlight
+  - pymdownx.superfences
+
+# Google Analytics (gtag): set your measurement ID and uncomment.
+# extra:
+#   analytics:
+#     provider: google
+#     property: G-XXXXXXXXXX
+
+nav:
+  - Home: index.md
+  - Getting started: getting-started.md
+  - Guide:
+      - Modules, controllers, services: guide/modules.md
+      - Middleware and contributors: guide/middleware.md
+      - Validation and settings: guide/validation.md
+      - Adapters and shutdown: guide/adapters.md
+      - File uploads: guide/uploads.md
+      - Storage: guide/storage.md
+      - WebSockets: guide/websockets.md
+      - Scheduled jobs: guide/jobs.md
+      - OpenAPI: guide/openapi.md
+      - Testing: guide/testing.md
+  - Database:
+      - Postgres: database/index.md
+      - Schema and queries: database/schema.md
+      - Relations: database/relations.md
+      - Migrations: database/migrations.md
+      - SQLite, Turso, D1: database/sqlite.md
+  - CLI: cli.md
+  - Runtimes: runtimes.md
+  - Coming from KickJS: kickjs.md
+  - API reference: https://forinda.github.io/kzig/api/
