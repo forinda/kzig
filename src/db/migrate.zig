@@ -405,7 +405,7 @@ pub const TriggerRow = struct { name: []const u8, tbl_name: []const u8, sql: []c
 /// The rebuilt tables' triggers: a rebuild drops them with the old table.
 fn triggersOf(pool: *db.Pool, a: Allocator, rebuilt: []const []const u8) ![]const TriggerRow {
     var list: std.ArrayList(TriggerRow) = .empty;
-    for (rebuilt) |t| try list.appendSlice(a, try pool.query(a, TriggerRow, "SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ?1", .{t}));
+    for (rebuilt) |t| try list.appendSlice(a, try pool.query(a, TriggerRow, "SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ?1 COLLATE NOCASE", .{t}));
     return list.items;
 }
 
@@ -440,31 +440,53 @@ pub fn checkTriggers(a: Allocator, triggers: []const TriggerRow, sql: []const u8
 }
 
 /// A rebuilt table's columns (lowercased: SQLite ignores ASCII case), from
-/// the migration's `CREATE TABLE "_kick_new_<table>" (`.
+/// the migration's `CREATE TABLE "_kick_new_<table>" (…)`: its column list,
+/// on one line or many; null when there is none to read (nothing checked).
 fn rebuiltColumns(a: Allocator, sql: []const u8, table: []const u8) !?[]const []const u8 {
     var create: std.ArrayList(u8) = .empty;
     try create.appendSlice(a, "CREATE TABLE \"_kick_new_");
     for (table) |ch| try create.appendSlice(a, if (ch == '"') "\"\"" else &.{ch});
     try create.appendSlice(a, "\" (");
-    const start = std.mem.find(u8, sql, create.items) orelse return null;
-    const end = std.mem.findPos(u8, sql, start, "\n);") orelse sql.len;
+    const start = (std.ascii.findIgnoreCase(sql, create.items) orelse return null) + create.items.len;
     var out: std.ArrayList([]const u8) = .empty;
-    var lines = std.mem.splitScalar(u8, sql[start..end], '\n');
-    _ = lines.next();
-    while (lines.next()) |line| {
-        const l = std.mem.trimStart(u8, line, " \t");
-        if (l.len == line.len or l.len == 0 or l[0] != '"') continue;
-        var name: std.ArrayList(u8) = .empty;
-        var j: usize = 1;
-        while (j < l.len) : (j += 1) {
-            if (l[j] == '"') {
-                if (j + 1 < l.len and l[j + 1] == '"') j += 1 else break;
-            }
-            try name.append(a, std.ascii.toLower(l[j]));
+    var i = start;
+    var depth: usize = 0;
+    var at_def = true; // at the start of a column or constraint definition
+    while (i < sql.len) : (i += 1) {
+        const ch = sql[i];
+        switch (ch) {
+            '\'' => {
+                i += 1;
+                while (i < sql.len) : (i += 1) if (sql[i] == '\'') {
+                    if (i + 1 < sql.len and sql[i + 1] == '\'') i += 1 else break;
+                };
+                at_def = false;
+            },
+            '"' => {
+                var name: std.ArrayList(u8) = .empty;
+                i += 1;
+                while (i < sql.len) : (i += 1) {
+                    if (sql[i] == '"') {
+                        if (i + 1 < sql.len and sql[i + 1] == '"') i += 1 else break;
+                    }
+                    try name.append(a, std.ascii.toLower(sql[i]));
+                }
+                if (at_def and depth == 0) try out.append(a, name.items);
+                at_def = false;
+            },
+            '(' => depth += 1,
+            ')' => {
+                if (depth == 0) break; // the end of the list
+                depth -= 1;
+            },
+            ',' => if (depth == 0) {
+                at_def = true;
+            },
+            ' ', '\t', '\r', '\n' => {},
+            else => at_def = false,
         }
-        try out.append(a, name.items);
     }
-    return out.items;
+    return if (out.items.len == 0) null else out.items;
 }
 
 /// String literals and comments blanked: `'new.removed'` in a message is text.
@@ -906,4 +928,35 @@ test "triggers: new./old. columns in code, not in strings or comments" {
     try testing.expectError(error.TriggerUsesDroppedColumn, checkTriggers(a, &.{.{ .name = "bad", .tbl_name = "t", .sql = "CREATE TRIGGER bad AFTER INSERT ON t BEGIN SELECT new.gone; END" }}, sql));
     // A table the migration doesn't rebuild isn't checked.
     try checkTriggers(a, &.{.{ .name = "other", .tbl_name = "u", .sql = "CREATE TRIGGER other AFTER INSERT ON u BEGIN SELECT new.gone; END" }}, sql);
+}
+
+test "SQLite: a trigger whose ON names the table in another case survives a rebuild" {
+    if (!@import("kzig_options").sqlite) return error.SkipZigTest;
+    var pool: db.Pool = try .init(testing.io, testing.allocator, .{ .url = "sqlite::memory:" });
+    defer pool.deinit();
+    try pool.execScript(
+        \\CREATE TABLE "users" ("id" INTEGER PRIMARY KEY, "name" TEXT);
+        \\CREATE TABLE "audit" ("v" TEXT);
+        \\CREATE TRIGGER "users_audit" AFTER INSERT ON Users BEGIN INSERT INTO "audit" VALUES (NEW."name"); END;
+    );
+    var m = try TmpMigrations.init();
+    defer m.deinit();
+    try m.add("20260101_000000_a", "CREATE TABLE \"_kick_new_users\" (\"id\" INTEGER PRIMARY KEY, \"name\" TEXT NOT NULL);\nINSERT INTO \"_kick_new_users\" SELECT \"id\", \"name\" FROM \"users\";\nDROP TABLE \"users\";\nALTER TABLE \"_kick_new_users\" RENAME TO \"users\";", "");
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    _ = try latest(&pool, a, try load(testing.io, a, m.path), opts);
+    try testing.expectEqual(1, (try pool.queryOne(a, struct { n: i64 }, "SELECT count(*) AS n FROM sqlite_master WHERE type = 'trigger'", .{})).?.n);
+}
+
+test "triggers: a rebuild's CREATE TABLE on one line; no column list parsed means no check" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const one_line = "CREATE TABLE \"_kick_new_t\" (\"id\" INTEGER, \"name\" TEXT, PRIMARY KEY (\"id\"));";
+    try checkTriggers(a, &.{.{ .name = "ok", .tbl_name = "t", .sql = "CREATE TRIGGER ok AFTER INSERT ON t BEGIN SELECT new.name; END" }}, one_line);
+    try testing.expectError(error.TriggerUsesDroppedColumn, checkTriggers(a, &.{.{ .name = "bad", .tbl_name = "t", .sql = "CREATE TRIGGER bad AFTER INSERT ON t BEGIN SELECT new.gone; END" }}, one_line));
+    // Indented lines in a later statement aren't the rebuilt table's columns.
+    const later = "CREATE TABLE \"_kick_new_t\" (\"id\" INTEGER);\nCREATE TABLE \"x\" (\n  \"gone\" TEXT\n);";
+    try testing.expectError(error.TriggerUsesDroppedColumn, checkTriggers(a, &.{.{ .name = "bad", .tbl_name = "t", .sql = "CREATE TRIGGER bad AFTER INSERT ON t BEGIN SELECT new.gone; END" }}, later));
 }
