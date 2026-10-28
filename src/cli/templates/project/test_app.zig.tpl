@@ -1,5 +1,5 @@
 //! Boots the app for a test (KickJS's `createTestApp`): a fresh app per
-//! test, with `NODE_ENV=test` plus the given variables.
+//! test, with `KZIG_ENV=test` plus the given variables.
 const std = @import("std");
 const kzig = @import("kzig");
 const App = @import("main.zig").App;
@@ -31,7 +31,7 @@ pub fn boot(vars: []const [2][]const u8) !TestApp {
 pub fn bootWith(vars: []const [2][]const u8, overrides: anytype) !TestApp {
     var env: std.process.Environ.Map = .init(testing.allocator);
     defer env.deinit();
-    try env.put("NODE_ENV", "test");
+    try env.put("KZIG_ENV", "test");
     for (vars) |v| try env.put(v[0], v[1]);
     const app = try testing.allocator.create(App);
     errdefer testing.allocator.destroy(app);

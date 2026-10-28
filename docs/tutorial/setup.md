@@ -37,7 +37,7 @@ $ zig build test
 bookmarks/
   build.zig, build.zig.zon     # `zig build`, `zig build run`, `zig build test`
   src/main.zig                 # the App: modules, config, middleware, plugins
-  src/config.zig               # PORT, NODE_ENV, LOG_LEVEL from the environment
+  src/config.zig               # PORT, KZIG_ENV, LOG_LEVEL from the environment
   src/modules.zig              # every mounted module; the generators edit it
   src/test_app.zig             # boots a fresh app per test
   src/modules/hello/           # a module: controller, service, test
@@ -83,7 +83,7 @@ test {
 Run it:
 
 ```console
-$ NODE_ENV=development zig build run
+$ KZIG_ENV=development zig build run
 info: listening on http://127.0.0.1:3000
 ```
 

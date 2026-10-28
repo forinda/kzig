@@ -21,9 +21,10 @@ pub fn run(io: Io, gpa: Allocator, arena: Allocator, environ: *const std.process
     const exe = try arena.print("zig-out/bin/{s}", .{bin});
     const argv = try std.mem.concat(arena, []const u8, &.{ &.{exe}, options.args });
 
-    // The app reads NODE_ENV; dev means development unless said otherwise.
+    // The app reads KZIG_ENV (else NODE_ENV); dev means development unless
+    // either says otherwise.
     var env = try environ.clone(arena);
-    if (env.get("NODE_ENV") == null) try env.put("NODE_ENV", "development");
+    if (env.get("KZIG_ENV") == null and env.get("NODE_ENV") == null) try env.put("KZIG_ENV", "development");
 
     signals.install();
     var seen = snapshot(io, gpa, cwd) orelse 0;

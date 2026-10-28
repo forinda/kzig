@@ -25,8 +25,10 @@ pub const Process = struct {
     io: std.Io,
     gpa: std.mem.Allocator,
     started_at: std.Io.Timestamp,
-    /// `NODE_ENV` is `development` or `test` — read raw, so an unset
-    /// `NODE_ENV` counts as production (the archive apps' `isDevOrTest()`).
+    /// `KZIG_ENV` (else `NODE_ENV`): unset or anything but `development`
+    /// and `test` is production.
+    env: config.Env = .production,
+    /// `env` is `development` or `test` (the archive apps' `isDevOrTest()`).
     dev_or_test: bool = false,
     /// Set once shutdown begins; health answers `draining`.
     draining: std.atomic.Value(bool) = .init(false),
@@ -269,7 +271,7 @@ pub fn App(comptime spec: anytype) type {
             }
             if (failed) return error.InvalidConfig;
 
-            const process: Process = .{ .io = io, .gpa = gpa, .started_at = std.Io.Clock.awake.now(io), .dev_or_test = config.devOrTest(env) };
+            const process: Process = .{ .io = io, .gpa = gpa, .started_at = std.Io.Clock.awake.now(io), .env = config.envMode(env), .dev_or_test = config.devOrTest(env) };
             self.ws_hub = .{ .io = io, .gpa = gpa, .opts = ws_opts };
             const probe: health.Probe = .{ .app = self, .checks = healthChecks };
             var jobs: cron.Jobs = .{ .io = io, .gpa = gpa, .infos = &cron_infos, .exprs = &cron_exprs, .app = self, .call = callCron, .allowed = cronAllowed, .report = reportCron };

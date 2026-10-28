@@ -39,7 +39,7 @@ pub const HelloModule = kzig.Module(.{
 // main.zig
 pub const App = kzig.App(.{
     .modules = &.{ HelloModule, ProjectModule, FeaturesModule, ConfigReportModule },
-    .config = Config, // PORT, NODE_ENV, LOG_LEVEL
+    .config = Config, // PORT, LOG_LEVEL
     .settings = &.{AppSettings}, // APP_NAME, APP_PUBLIC_URL
     .adapters = &.{ MailAdapter("transactional", TransactionalMail), MailAdapter("marketing", MarketingMail) },
     .middleware = .{ kzig.middleware.requestId(), kzig.middleware.requestLogger(.{}), kzig.middleware.helmet(.{}) },
@@ -56,13 +56,13 @@ pub fn main(init: std.process.Init) !void {
 ```
 
 ```console
-$ zig build examples && NODE_ENV=development ./zig-out/bin/task-api
+$ zig build examples && KZIG_ENV=development ./zig-out/bin/task-api
 $ curl localhost:3000/api/v1/hello
 {"message":"Hello World from kzig!","timestamp":"2026-10-27T05:22:26.756Z"}
 $ curl -H 'authorization: Bearer token-all' -H 'x-tenant: acme' -H 'content-type: application/json' \
     -d '{"title":""}' localhost:3000/api/v1/projects
 {"type":"about:blank","title":"Unprocessable Entity","status":422,"detail":"must be 1 to 200 characters","errors":[{"field":"title","message":"must be 1 to 200 characters"}]}
-$ NODE_ENV=production ./zig-out/bin/task-api
+$ KZIG_ENV=production ./zig-out/bin/task-api
 error: Settings 'APP' are invalid:
 error:   APP_PUBLIC_URL: required
 ```

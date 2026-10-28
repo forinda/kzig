@@ -50,7 +50,7 @@ pub fn sectionName(comptime T: type) []const u8 {
 /// Fills section `T` (KickJS `defineSettings`) field by field: `PREFIX_FIELD`
 /// (`beta_testers` reads `FEATURES_BETA_TESTERS`), else `PREFIX_FIELD_FILE`
 /// (a mounted secret, trailing newline dropped; needs `io`), else the field
-/// default, else `T.dev_defaults` when `NODE_ENV` is development or test —
+/// default, else `T.dev_defaults` when `KZIG_ENV` (or `NODE_ENV`) is development or test —
 /// so secrets fail closed in production. Lists are comma-separated.
 /// Collects every problem into `issues` (allocated in `arena`) before failing.
 pub fn parseSection(
@@ -128,9 +128,21 @@ pub fn providedOrigins(comptime T: type, arena: std.mem.Allocator, origins: *std
         try origins.append(arena, .{ .name = comptime envKey(sectionName(T), name), .section = sectionName(T), .origin = .provided, .required = false });
 }
 
+/// How the app runs.
+pub const Env = enum { development, @"test", production };
+
+/// `KZIG_ENV`, else `NODE_ENV` (what KickJS reads, so its configs carry
+/// over). `development` and `test` relax the defaults; anything else,
+/// unset included, is production, as KickJS's `isProduction()`.
+pub fn envMode(env: *const std.process.Environ.Map) Env {
+    const e = env.get("KZIG_ENV") orelse env.get("NODE_ENV") orelse return .production;
+    if (std.mem.eql(u8, e, "development")) return .development;
+    if (std.mem.eql(u8, e, "test")) return .@"test";
+    return .production;
+}
+
 pub fn devOrTest(env: *const std.process.Environ.Map) bool {
-    const e = env.get("NODE_ENV") orelse return false;
-    return std.mem.eql(u8, e, "development") or std.mem.eql(u8, e, "test");
+    return envMode(env) != .production;
 }
 
 fn devDefault(comptime T: type, comptime name: []const u8, comptime F: type) ?F {
@@ -362,5 +374,22 @@ test "dev default applies only in development" {
         var issues2: std.ArrayList(Issue) = .empty;
         try testing.expectError(error.InvalidConfig, parseSection(AppSettings, arena.allocator(), null, &prod, &issues2, null));
         try testing.expectEqualStrings("APP_PUBLIC_URL", issues2.items[0].key);
+    }
+}
+
+test "the mode: KZIG_ENV, else NODE_ENV; anything else (unset too) is production" {
+    const cases = [_]struct { []const [2][]const u8, Env }{
+        .{ &.{}, .production },
+        .{ &.{.{ "NODE_ENV", "development" }}, .development },
+        .{ &.{.{ "KZIG_ENV", "test" }}, .@"test" },
+        // KZIG_ENV wins: a KickJS NODE_ENV left behind doesn't override it.
+        .{ &.{ .{ "KZIG_ENV", "production" }, .{ "NODE_ENV", "development" } }, .production },
+        .{ &.{.{ "KZIG_ENV", "staging" }}, .production },
+    };
+    for (cases) |c| {
+        var env = try envOf(c[0]);
+        defer env.deinit();
+        try testing.expectEqual(c[1], envMode(&env));
+        try testing.expectEqual(c[1] != .production, devOrTest(&env));
     }
 }

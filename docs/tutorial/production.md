@@ -8,7 +8,7 @@ info: migration 20261028_024358_init applied
 info: listening on http://127.0.0.1:3000
 ```
 
-`kzig start` runs the built binary with `NODE_ENV=production` and replaces itself with it, so a
+`kzig start` runs the built binary with `KZIG_ENV=production` and replaces itself with it, so a
 supervisor's signals reach the app. The binary is all you deploy, with `db/migrations` beside it.
 
 ## Settings
@@ -17,7 +17,7 @@ supervisor's signals reach the app. The binary is all you deploy, with `db/migra
 | --- | --- | --- |
 | `PORT` | `3000` | |
 | `HOST` | `127.0.0.1` | `0.0.0.0` to accept connections from other machines (chapter 8 adds it) |
-| `NODE_ENV` | `development` | `production` turns off development defaults |
+| `KZIG_ENV` | production | `development` or `test` turn on the development defaults (`KZIG_ENV` is read when it isn't set) |
 | `API_KEY` | none in production | at least 32 characters |
 | `DB_FILE` | `data/bookmarks.db` | its folder is created |
 | `MIGRATIONS_DIR` | `db/migrations` | |

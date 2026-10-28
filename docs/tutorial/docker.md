@@ -11,11 +11,12 @@ to `serve`:
 ```zig title="src/config.zig"
 //! Environment config. Each field reads its upper-cased name (`port` ←
 //! `PORT`); a bad or missing value stops boot with every problem listed.
+//! How the app runs (`KZIG_ENV`: development, test, production) is
+//! `*const kzig.Process`'s `env`.
 pub const Config = struct {
     port: u16 = 3000,
     /// `0.0.0.0` in a container, so traffic from outside it reaches the app.
     host: []const u8 = "127.0.0.1",
-    node_env: enum { development, production, @"test" } = .development,
     log_level: []const u8 = "info",
 };
 ```
@@ -45,7 +46,7 @@ RUN zig build -Doptimize=ReleaseSafe -Dtarget=$(uname -m)-linux-musl
 FROM scratch
 COPY --from=build /src/zig-out/bin/bookmarks /bookmarks
 COPY db/migrations /db/migrations
-ENV NODE_ENV=production HOST=0.0.0.0 PORT=3000 \
+ENV KZIG_ENV=production HOST=0.0.0.0 PORT=3000 \
     DB_FILE=/data/bookmarks.db MIGRATIONS_DIR=/db/migrations MIGRATE_ON_BOOT=true
 VOLUME /data
 EXPOSE 3000

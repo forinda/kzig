@@ -6,7 +6,7 @@ each its own database: an in-memory one, migrated at boot like the real one.
 
 ```zig
 // src/test_app.zig, in bootWith
-try env.put("NODE_ENV", "test");
+try env.put("KZIG_ENV", "test");
 // A fresh database per test, migrated at boot.
 try env.put("DB_FILE", ":memory:");
 for (vars) |v| try env.put(v[0], v[1]);
@@ -88,7 +88,7 @@ test "bookmarks: a bad body is 422 with every field; a URL saved twice is 409" {
 }
 
 test "production refuses to start without an API key" {
-    try testing.expectError(error.InvalidConfig, test_app.boot(&.{.{ "NODE_ENV", "production" }}));
+    try testing.expectError(error.InvalidConfig, test_app.boot(&.{.{ "KZIG_ENV", "production" }}));
 }
 ```
 

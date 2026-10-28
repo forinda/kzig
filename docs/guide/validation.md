@@ -35,7 +35,32 @@ pub const FeatureSettings = struct {
 
 pub const AppSettings = struct {
     pub const prefix = "APP";
-    pub const dev_defaults = .{ .public_url = "http://localhost:3000" }; // only when NODE_ENV is development/test
+    pub const dev_defaults = .{ .public_url = "http://localhost:3000" }; // only when KZIG_ENV is development/test
     public_url: []const u8, // APP_PUBLIC_URL, or APP_PUBLIC_URL_FILE=/run/secrets/…
+};
+```
+
+## Development, test, production
+
+`KZIG_ENV` says how the app runs: `development`, `test`, or anything else (unset included) for
+production. `development` and `test` turn on a section's `dev_defaults`, apply migrations at
+boot (`kzig.db.migrate.onBoot`'s usual policy) and keep Swagger UI when the plugin has
+`disable_in_prod`. `kzig dev` sets `KZIG_ENV=development` and `kzig start` sets
+`KZIG_ENV=production`, unless one is set already.
+
+When `KZIG_ENV` isn't set, `NODE_ENV` is read instead, with the same values, so a KickJS app's
+`.env` files and deployment configs work unchanged.
+
+In code, inject `*const kzig.Process` and read `env` (`.development`, `.@"test"`,
+`.production`) or `dev_or_test`:
+
+```zig
+pub const MailService = struct {
+    process: *const kzig.Process,
+
+    pub fn send(self: *MailService, msg: Message) !void {
+        if (self.process.env == .@"test") return; // tests send nothing
+        …
+    }
 };
 ```

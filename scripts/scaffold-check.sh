@@ -82,12 +82,18 @@ step "kzig build and kzig start"
 "$KZIG" start --port 39812 > start.log 2>&1 &
 START=$!
 waitfor 30 curl -sf localhost:39812/api/v1/hello
-# NODE_ENV=production: Swagger is off.
+# KZIG_ENV=production: Swagger is off.
 if curl -sf localhost:39812/docs >/dev/null; then echo "kzig start isn't production" >&2; exit 1; fi
 # kzig start became the app: its pid takes the signal and drains.
 kill -TERM $START
 wait $START
 grep -q "draining" start.log
+# A mode already set is kept: KZIG_ENV=development turns Swagger back on.
+KZIG_ENV=development "$KZIG" start --port 39812 > start.log 2>&1 &
+START=$!
+waitfor 30 curl -sf localhost:39812/docs
+kill -TERM $START
+wait $START || true
 
 step "kzig add swagger and httpz"
 "$KZIG" add swagger | grep -q "already"
@@ -185,7 +191,7 @@ test "auth guard" {
     var app: GuardApp = undefined;
     var env: std.process.Environ.Map = .init(std.testing.allocator);
     defer env.deinit();
-    try env.put("NODE_ENV", "test");
+    try env.put("KZIG_ENV", "test");
     try app.init(std.testing.io, std.testing.allocator, &env);
     defer app.deinit();
     var denied = try kzig.testing.request(std.testing.allocator, &app, .{ .target = "/api/v1/guarded" });

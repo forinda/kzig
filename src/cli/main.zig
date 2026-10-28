@@ -35,7 +35,7 @@ const usage =
     \\
     \\  kzig dev [--bin <name>] [-- <app args>]
     \\      Builds and runs the app; rebuilds and restarts it when src/ or
-    \\      build.zig changes (NODE_ENV=development unless set).
+    \\      build.zig changes (KZIG_ENV=development unless set).
     \\
     \\  kzig add swagger|httpz
     \\      Wires a feature in: Swagger UI and /openapi.json, or the http.zig runtime.
@@ -44,7 +44,7 @@ const usage =
     \\      zig build -Doptimize=ReleaseSafe.
     \\
     \\  kzig start [--port <n>] [--bin <name>] [-- <app args>]
-    \\      Runs the built app (NODE_ENV=production unless set); --port sets PORT.
+    \\      Runs the built app (KZIG_ENV=production unless set); --port sets PORT.
     \\
     \\  kzig db new <name> | migrate | rollback | status [--dir db/migrations]
     \\  kzig db generate [name] [--db name] [--empty] [--rename-table old=new] [--rename-column table.old=new] [--exe zig-out/bin/app]
@@ -394,7 +394,7 @@ fn newProject(cli: Cli, flags: Flags, raw: []const u8) !void {
         \\Done. Next:
         \\  cd {s}
         \\  zig build test
-        \\  NODE_ENV=development zig build run   # http://localhost:3000/api/v1/hello, /docs
+        \\  KZIG_ENV=development zig build run   # http://localhost:3000/api/v1/hello, /docs
         \\  kzig g module task
         \\
     , .{dir});
@@ -479,7 +479,7 @@ fn build(cli: Cli, flags: Flags) !void {
     cli.print("Built zig-out/bin/. Run it with `kzig start`.\n", .{});
 }
 
-/// KickJS's `kick start`: the built app with NODE_ENV=production. kzig
+/// KickJS's `kick start`: the built app with KZIG_ENV=production. kzig
 /// becomes the app (exec), so a supervisor's signals reach it directly.
 fn start(cli: Cli, flags: Flags) !void {
     const bin = flags.bin orelse try dev.binName(cli.io, cli.arena, cli.cwd) orelse return error.NoBinary;
@@ -489,7 +489,7 @@ fn start(cli: Cli, flags: Flags) !void {
         return error.Exists;
     };
     var env = try cli.environ.clone(cli.arena);
-    if (env.get("NODE_ENV") == null) try env.put("NODE_ENV", "production");
+    if (env.get("KZIG_ENV") == null and env.get("NODE_ENV") == null) try env.put("KZIG_ENV", "production");
     if (flags.port) |port| try env.put("PORT", port);
     const argv = try std.mem.concat(cli.arena, []const u8, &.{ &.{exe}, flags.rest });
     return std.process.replace(cli.io, .{ .argv = argv, .environ_map = &env });

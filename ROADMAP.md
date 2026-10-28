@@ -86,6 +86,7 @@ after M6.
 | D1 through a Workers binding (`env.DB`) | D1's REST API with an API token | kzig isn't a Worker |
 | Turso through `@libsql/client` (WebSocket or HTTP) | Hrana over HTTP only | One request per statement or batch, through `std.http.Client`, no dependency |
 | libsql migrations as one batch (async adapter) | In a transaction (one Hrana stream), as on a file | The stream supports it; D1 still gets batches |
+| `NODE_ENV` | `KZIG_ENV`, falling back to `NODE_ENV` | A Zig app shouldn't need a Node variable; KickJS configs still work |
 | A DB adapter always reports health | `onHealthCheck` may return null; no database configured, nothing on `/health/ready` | task-api runs without a database |
 
 Kept for parity even where Zig would allow otherwise: route middleware runs **after** validation.

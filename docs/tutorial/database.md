@@ -313,7 +313,7 @@ pub fn create(self: *BookmarkController, ctx: *kzig.Ctx, got: struct { body: rep
 ## Try it
 
 ```console
-$ NODE_ENV=development zig build run
+$ KZIG_ENV=development zig build run
 info: migration 20261028_024358_init applied
 info: listening on http://127.0.0.1:3000
 ```

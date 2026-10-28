@@ -5,7 +5,7 @@ Reads stay open; creating, changing and deleting need `Authorization: Bearer <AP
 ## The setting and the guard
 
 A settings struct reads `API_KEY` from the environment when the module that lists it mounts.
-`dev_defaults` apply only when `NODE_ENV` is `development` or `test`, so production can't start
+`dev_defaults` apply only when `KZIG_ENV` is `development` or `test`, so production can't start
 without a real key. The guard is middleware with a service's fields: the settings are injected.
 
 ```zig title="src/guards/api-key.guard.zig"
@@ -138,7 +138,7 @@ $ curl -H 'authorization: Bearer dev-api-key-change-me-0123456789ab' -H 'content
 {"id":2,"url":"https://x.dev","title":"x","notes":null,"createdAt":"…"}
 ```
 
-Without `NODE_ENV=development` there's no default key, and the app says so before it listens:
+Without `KZIG_ENV=development` there's no default key, and the app says so before it listens:
 
 ```console
 $ zig build run

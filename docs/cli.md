@@ -13,7 +13,7 @@ $ kzig g module task         # src/modules/tasks: REST CRUD with an in-memory re
 $ kzig g middleware audit    # also: controller, service, contributor, adapter, dto, guard, test
 $ kzig add httpz             # serve on http.zig; `kzig add swagger` puts Swagger back
 $ kzig build                 # zig build -Doptimize=ReleaseSafe
-$ kzig start --port 8080     # the built app, NODE_ENV=production
+$ kzig start --port 8080     # the built app, KZIG_ENV=production
 $ kzig rm module task
 $ kzig db migrate            # see Database
 ```
@@ -23,7 +23,7 @@ $ kzig db migrate            # see Database
 `contains`, `starts` and `ends`; another operator is a 400. task-api's `tasks` module was
 generated this way.
 
-`kzig dev` watches `src/`, `build.zig` and `build.zig.zon`, sets `NODE_ENV=development` unless
+`kzig dev` watches `src/`, `build.zig` and `build.zig.zon`, sets `KZIG_ENV=development` unless
 it is set, and passes arguments after `--` to the app. A build that fails leaves the running app
 up; Ctrl-C stops both. `kzig start` replaces itself with the app, so a supervisor's SIGTERM
 reaches the app and it drains. Names may be any case (`TaskList`, `task_list`, `HTTPClient`);
