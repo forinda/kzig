@@ -275,6 +275,8 @@ const FakeD1 = if (@import("kzig_options").sqlite) struct {
     listener: std.Io.net.Server,
     conn: *sqlite.Conn,
     fut: std.Io.Future(void) = undefined,
+    /// One answer at a time: they share the log (and the database).
+    mutex: std.Io.Mutex = .init,
     requests: std.atomic.Value(u32) = .init(0),
     /// Answer every request with this status (rate limits, outages).
     status: std.http.Status = .ok,
@@ -297,21 +299,34 @@ const FakeD1 = if (@import("kzig_options").sqlite) struct {
         return std.fmt.allocPrint(a, "d1://acct/dbid?token=secret&endpoint=http://127.0.0.1:{d}", .{f.listener.socket.address.getPort()});
     }
 
+    /// Each connection on its own task, as a real server: the client may
+    /// open a second one while the first is still open.
     fn serve(f: *FakeD1) void {
+        var group: std.Io.Group = .init;
+        defer group.cancel(testing.io);
         while (true) {
             const stream = f.listener.accept(testing.io) catch return;
-            defer stream.close(testing.io);
-            var rbuf: [16384]u8 = undefined;
-            var wbuf: [16384]u8 = undefined;
-            var sr = stream.reader(testing.io, &rbuf);
-            var sw = stream.writer(testing.io, &wbuf);
-            var server = std.http.Server.init(&sr.interface, &sw.interface);
-            while (true) {
-                var req = server.receiveHead() catch break;
-                var arena: std.heap.ArenaAllocator = .init(testing.allocator);
-                defer arena.deinit();
-                f.answer(&req, arena.allocator()) catch break;
-            }
+            group.concurrent(testing.io, connection, .{ f, stream }) catch {
+                stream.close(testing.io);
+                return;
+            };
+        }
+    }
+
+    fn connection(f: *FakeD1, stream: std.Io.net.Stream) void {
+        defer stream.close(testing.io);
+        var rbuf: [16384]u8 = undefined;
+        var wbuf: [16384]u8 = undefined;
+        var sr = stream.reader(testing.io, &rbuf);
+        var sw = stream.writer(testing.io, &wbuf);
+        var server = std.http.Server.init(&sr.interface, &sw.interface);
+        while (true) {
+            var req = server.receiveHead() catch break;
+            f.mutex.lockUncancelable(testing.io);
+            defer f.mutex.unlock(testing.io);
+            var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+            defer arena.deinit();
+            f.answer(&req, arena.allocator()) catch break;
         }
     }
 
