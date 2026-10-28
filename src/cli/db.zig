@@ -61,8 +61,10 @@ pub fn run(io: Io, gpa: Allocator, a: Allocator, environ: *const std.process.Env
     if (args.len != 1) return error.Usage;
     if (!std.mem.eql(u8, cmd, "migrate") and !std.mem.eql(u8, cmd, "rollback") and !std.mem.eql(u8, cmd, "status")) return error.Usage;
     const url = environ.get("DATABASE_URL") orelse return o.fail("DATABASE_URL is not set (postgres://user:password@host:5432/database)\n", .{});
-    var pool = kzig.db.Pool.init(io, gpa, .{ .url = url, .max_connections = 1 }) catch |err|
+    var pool = kzig.db.Pool.init(io, gpa, .{ .url = url, .max_connections = 1 }) catch |err| {
+        if (err == error.SqliteNotBuilt) return o.fail("DATABASE_URL: this kzig CLI can't open sqlite: files (it's built without SQLite). Let the app apply them at boot (kzig.db.migrate.onBoot), or build the CLI with zig build -Dsqlite\n", .{});
         return o.fail("DATABASE_URL: {t}\n", .{err});
+    };
     defer pool.deinit();
     const list = try kzig.db.migrate.load(io, a, dir);
     const m = kzig.db.migrate;
@@ -234,7 +236,7 @@ fn generate(io: Io, gpa: Allocator, a: Allocator, environ: *const std.process.En
     }
     const path = try std.fs.path.join(a, &.{ opts.dir, id });
     o.say("  create {s}/up.sql\n  create {s}/down.sql\n  create {s}/snapshot.json\n  create {s}/meta.json\n", .{ path, path, path, path });
-    o.say("{d} change(s). Review it, then: kzig db migrate\n", .{r.changes.len});
+    o.say("{d} change(s). Review it; `kzig db migrate` or the app at boot (kzig.db.migrate.onBoot) applies it\n", .{r.changes.len});
 }
 
 /// For CI: fails when the schema has changes no migration holds.
@@ -343,4 +345,19 @@ test "an app that never answers doesn't hang kzig db check" {
     _ = &env;
     try testing.expectError(error.Reported, run(testing.io, testing.allocator, a, &env, .{ .out = &out, .err = &err }, &.{"check"}, .{ .exe = exe, .answer_s = 1 }));
     try testing.expect(std.mem.find(u8, err.buffered(), "didn't print its schema within 1 s") != null);
+}
+
+test "kzig db migrate on a sqlite: URL, in a CLI built without SQLite, says how to apply them" {
+    if (kzig.db.sqlite_built) return error.SkipZigTest;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var out_buf: [512]u8 = undefined;
+    var out: Io.Writer = .fixed(&out_buf);
+    var err_buf: [512]u8 = undefined;
+    var err: Io.Writer = .fixed(&err_buf);
+    var env: std.process.Environ.Map = .init(a);
+    try env.put("DATABASE_URL", "sqlite:data/app.db");
+    try testing.expectError(error.Reported, run(testing.io, testing.allocator, a, &env, .{ .out = &out, .err = &err }, &.{"migrate"}, .{}));
+    try testing.expect(std.mem.find(u8, err.buffered(), "kzig.db.migrate.onBoot") != null);
 }
