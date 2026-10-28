@@ -342,8 +342,8 @@ fn applyBatch(pool: *db.Pool, a: Allocator, id: []const u8, sql: []const u8, rec
             .guard = true,
             .sql = try std.fmt.allocPrint(a, "SELECT CASE WHEN EXISTS (SELECT 1 FROM pragma_foreign_key_check WHERE \"table\" IN ({s}) OR \"parent\" IN ({s})) THEN json('not json') END", .{ marks.items, marks.items }),
             .params = blk: {
-                const ps = try a.alloc(?[]const u8, rebuilt.len);
-                for (rebuilt, ps) |t, *x| x.* = t;
+                const ps = try a.alloc(db.Param, rebuilt.len);
+                for (rebuilt, ps) |t, *x| x.* = .{ .value = t, .kind = .text };
                 break :blk ps;
             },
         });

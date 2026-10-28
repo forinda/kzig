@@ -13,7 +13,7 @@ const Allocator = std.mem.Allocator;
 const EnumLiteral = @TypeOf(.enum_literal);
 
 /// A query as written: SQL with `$n` placeholders and their values as text.
-pub const Sql = struct { sql: []const u8, params: []const ?[]const u8, dialect: Dialect = .postgres };
+pub const Sql = struct { sql: []const u8, params: []const dbm.Param, dialect: Dialect = .postgres };
 const Dialect = dbm.Dialect;
 
 /// Where queries run: the pool, or a transaction.
@@ -114,7 +114,7 @@ pub const Writer = struct {
     a: Allocator,
     dialect: Dialect = .postgres,
     buf: std.ArrayList(u8) = .empty,
-    params: std.ArrayList(?[]const u8) = .empty,
+    params: std.ArrayList(dbm.Param) = .empty,
 
     pub fn raw(w: *Writer, s: []const u8) !void {
         try w.buf.appendSlice(w.a, s);
@@ -1199,7 +1199,7 @@ fn expectSql(q: anytype, text: []const u8, params: []const ?[]const u8) !void {
     try testing.expectEqualStrings(text, got.sql);
     try testing.expectEqual(params.len, got.params.len);
     for (params, got.params) |want, have| {
-        if (want) |w| try testing.expectEqualStrings(w, have.?) else try testing.expectEqual(null, have);
+        if (want) |w| try testing.expectEqualStrings(w, have.value.?) else try testing.expectEqual(null, have.value);
     }
 }
 

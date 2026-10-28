@@ -4,6 +4,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const pg = @import("pg.zig");
+const Param = @import("db.zig").Param;
 const http_client = @import("../core/http_client.zig");
 
 const Allocator = std.mem.Allocator;
@@ -116,7 +117,7 @@ pub const Session = struct {
         }
     }
 
-    pub fn run(s: *Session, sql: []const u8, params: []const ?[]const u8, ctx: anytype, comptime row: anytype) Error!u64 {
+    pub fn run(s: *Session, sql: []const u8, params: []const Param, ctx: anytype, comptime row: anytype) Error!u64 {
         var arena: std.heap.ArenaAllocator = .init(s.client.gpa);
         defer arena.deinit();
         const a = arena.allocator();
@@ -240,11 +241,17 @@ fn fail(e: std.json.Value) Error {
     return error.DbError;
 }
 
-/// A text parameter as a Hrana value: a canonical integer as `integer`,
-/// as the local driver binds it.
-fn writeValue(w: *std.Io.Writer, p: ?[]const u8) !void {
-    const v = p orelse return w.writeAll("{\"type\":\"null\"}");
-    if (@import("sqlite_int.zig").canonicalInt(v) != null) return w.print("{{\"type\":\"integer\",\"value\":\"{s}\"}}", .{v});
+/// A parameter as a Hrana value, by its kind (raw text: a canonical
+/// integer as `integer`, as the local driver binds it).
+fn writeValue(w: *std.Io.Writer, p: Param) !void {
+    const v = p.value orelse return w.writeAll("{\"type\":\"null\"}");
+    const int = switch (p.kind) {
+        .integer => std.fmt.parseInt(i64, v, 10) catch null,
+        .auto => @import("sqlite_int.zig").canonicalInt(v),
+        .real, .text => null,
+    };
+    if (int) |n| return w.print("{{\"type\":\"integer\",\"value\":\"{d}\"}}", .{n});
+    if (p.kind == .real) if (std.fmt.parseFloat(f64, v) catch null) |f| if (std.math.isFinite(f)) return w.print("{{\"type\":\"float\",\"value\":{d}}}", .{f});
     // JSON text must be UTF-8: other bytes go as a blob.
     if (!std.unicode.utf8ValidateSlice(v)) {
         try w.writeAll("{\"type\":\"blob\",\"base64\":\"");
@@ -537,4 +544,15 @@ test "libsql: a server that never answers is ServiceUnavailable after request_ti
     const start = std.Io.Clock.awake.now(testing.io);
     try testing.expectError(error.ServiceUnavailable, pool.exec("SELECT 1", .{}));
     try testing.expect(start.durationTo(std.Io.Clock.awake.now(testing.io)).toMilliseconds() < 5000);
+}
+
+test "libsql: parameters by Zig type: a numeric-looking string is text, a float a float" {
+    var env: std.process.Environ.Map = undefined;
+    var pool = try testPool(&env);
+    defer env.deinit();
+    defer pool.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const J = struct { j: []const u8 };
+    try testing.expectEqualStrings("{\"k\":\"42\",\"n\":42,\"f\":1.5}", (try pool.queryOne(arena.allocator(), J, "SELECT json_object('k', ?1, 'n', ?2, 'f', ?3) AS j", .{ "42", 42, 1.5 })).?.j);
 }

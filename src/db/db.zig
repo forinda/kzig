@@ -75,6 +75,29 @@ pub const Options = struct {
 /// Which SQL a database speaks.
 pub const Dialect = enum { postgres, sqlite };
 
+/// A parameter: its text and what it was in Zig. Postgres reads only the
+/// text (it types parameters itself); SQLite binds by `kind`, so a string
+/// stays TEXT even when it looks like a number.
+pub const Param = struct {
+    value: ?[]const u8,
+    kind: Kind = .auto,
+
+    pub const Kind = enum {
+        /// Raw text from the caller: a canonical integer binds as INTEGER.
+        auto,
+        text,
+        integer,
+        real,
+    };
+
+    /// Raw text parameters (`.auto`).
+    pub fn texts(a: Allocator, values: []const ?[]const u8) ![]const Param {
+        const out = try a.alloc(Param, values.len);
+        for (values, out) |v, *o| o.* = .{ .value = v };
+        return out;
+    }
+};
+
 const has_sqlite = @import("kzig_options").sqlite;
 /// Built with `-Dsqlite`: `sqlite:` URLs open.
 pub const sqlite_built = has_sqlite;
@@ -91,7 +114,7 @@ const Conn = union(enum) {
     libsql: *libsql.Session,
     d1: *d1.Client,
 
-    fn run(c: Conn, text: []const u8, params: []const ?[]const u8, ctx: anytype, comptime row: anytype) pg.Error!u64 {
+    fn run(c: Conn, text: []const u8, params: []const Param, ctx: anytype, comptime row: anytype) pg.Error!u64 {
         return switch (c) {
             .pg => |p| p.run(text, params, ctx, row),
             .sqlite => |s| if (!has_sqlite) unreachable else s.run(text, params, ctx, row),
@@ -230,13 +253,13 @@ pub const Pool = struct {
     }
 
     /// `query` with parameters already encoded (the query builder's).
-    pub fn queryParams(p: *Pool, a: Allocator, comptime T: type, text: []const u8, params: []const ?[]const u8) ![]T {
+    pub fn queryParams(p: *Pool, a: Allocator, comptime T: type, text: []const u8, params: []const Param) ![]T {
         const c = try p.acquire();
         defer p.release(c);
         return rowsOn(c, a, T, text, params);
     }
 
-    pub fn execParams(p: *Pool, text: []const u8, params: []const ?[]const u8) !u64 {
+    pub fn execParams(p: *Pool, text: []const u8, params: []const Param) !u64 {
         const c = try p.acquire();
         defer p.release(c);
         return c.run(text, params, {}, ignoreRow);
@@ -314,11 +337,11 @@ pub const Tx = struct {
         return (t.conn orelse return error.TransactionDone).script(text);
     }
 
-    pub fn queryParams(t: *Tx, a: Allocator, comptime T: type, text: []const u8, params: []const ?[]const u8) ![]T {
+    pub fn queryParams(t: *Tx, a: Allocator, comptime T: type, text: []const u8, params: []const Param) ![]T {
         return rowsOn(t.conn orelse return error.TransactionDone, a, T, text, params);
     }
 
-    pub fn execParams(t: *Tx, text: []const u8, params: []const ?[]const u8) !u64 {
+    pub fn execParams(t: *Tx, text: []const u8, params: []const Param) !u64 {
         return (t.conn orelse return error.TransactionDone).run(text, params, {}, ignoreRow);
     }
 
@@ -360,7 +383,7 @@ fn queryOn(c: Conn, a: Allocator, comptime T: type, text: []const u8, args: anyt
 
 fn ignoreRow(_: void, _: []const []const u8, _: []const ?[]const u8) !void {}
 
-fn rowsOn(c: Conn, a: Allocator, comptime T: type, text: []const u8, params: []const ?[]const u8) ![]T {
+fn rowsOn(c: Conn, a: Allocator, comptime T: type, text: []const u8, params: []const Param) ![]T {
     if (@typeInfo(T) != .@"struct") @compileError("db: rows decode into a struct, not " ++ @typeName(T));
     const Rows = struct {
         a: Allocator,

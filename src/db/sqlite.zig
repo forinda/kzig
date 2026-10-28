@@ -7,14 +7,12 @@ const pg = @import("pg.zig");
 
 const Allocator = std.mem.Allocator;
 const Error = pg.Error;
+const Param = @import("db.zig").Param;
 
 /// One database handle. Not shared: the pool hands it to one task at a time.
 pub const Conn = struct {
     handle: *c.sqlite3,
     gpa: Allocator,
-    /// Tests' fake D1 binds as D1 does: these params as integers, the rest
-    /// as text (instead of the canonical-integer rule).
-    ints: ?[]const bool = null,
 
     /// `path` as SQLite takes it: a file, or `:memory:`.
     pub fn open(gpa: Allocator, path: []const u8) !*Conn {
@@ -57,7 +55,7 @@ pub const Conn = struct {
 
     /// One statement; each row to `row(ctx, names, values)`. Rows read for a
     /// query, rows changed otherwise.
-    pub fn run(conn: *Conn, sql: []const u8, params: []const ?[]const u8, ctx: anytype, comptime row: anytype) Error!u64 {
+    pub fn run(conn: *Conn, sql: []const u8, params: []const Param, ctx: anytype, comptime row: anytype) Error!u64 {
         var stmt: ?*c.sqlite3_stmt = null;
         var tail: [*c]const u8 = null;
         if (c.sqlite3_prepare_v2(conn.handle, sql.ptr, @intCast(sql.len), &stmt, &tail) != c.SQLITE_OK) return conn.fail();
@@ -77,10 +75,13 @@ pub const Conn = struct {
         for (params, 1..) |param, i| {
             const at: c_int = @intCast(i);
             // The params are alive until the statement is finalized: no copy.
-            const rc = if (param) |v|
-                (if ((if (conn.ints) |ints| (if (ints[i - 1]) canonicalInt(v) else null) else canonicalInt(v))) |n| c.sqlite3_bind_int64(st, at, n) else c.sqlite3_bind_text64(st, at, v.ptr, v.len, null, c.SQLITE_UTF8))
-            else
-                c.sqlite3_bind_null(st, at);
+            const rc = if (param.value) |v| switch (param.kind) {
+                .integer => if (std.fmt.parseInt(i64, v, 10)) |n| c.sqlite3_bind_int64(st, at, n) else |_| c.sqlite3_bind_text64(st, at, v.ptr, v.len, null, c.SQLITE_UTF8),
+                .real => if (std.fmt.parseFloat(f64, v)) |f| c.sqlite3_bind_double(st, at, f) else |_| c.sqlite3_bind_text64(st, at, v.ptr, v.len, null, c.SQLITE_UTF8),
+                .text => c.sqlite3_bind_text64(st, at, v.ptr, v.len, null, c.SQLITE_UTF8),
+                // Raw text: `LIMIT ?1` and integer comparisons work.
+                .auto => if (canonicalInt(v)) |n| c.sqlite3_bind_int64(st, at, n) else c.sqlite3_bind_text64(st, at, v.ptr, v.len, null, c.SQLITE_UTF8),
+            } else c.sqlite3_bind_null(st, at);
             if (rc != c.SQLITE_OK) return conn.fail();
         }
         const ncol: usize = @intCast(c.sqlite3_column_count(st));
@@ -319,4 +320,21 @@ test "sqlite: a transaction that reads then writes isn't undone by a writer from
     try tx.commit();
     other.await(testing.io);
     try testing.expectEqual(0, failed.load(.acquire));
+}
+
+test "sqlite: parameters bind by their Zig type: a numeric-looking string stays text everywhere" {
+    var pool: db.Pool = try .init(testing.io, testing.allocator, .{ .url = "sqlite::memory:" });
+    defer pool.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try pool.execScript("CREATE TABLE t (s text, b blob); INSERT INTO t VALUES ('42', '42')");
+    const N = struct { n: i64 };
+    // No column affinity in these comparisons: the string must be text.
+    try testing.expectEqual(1, (try pool.queryOne(a, N, "SELECT count(*) AS n FROM t WHERE lower(s) = ?1", .{"42"})).?.n);
+    try testing.expectEqual(1, (try pool.queryOne(a, N, "SELECT count(*) AS n FROM t WHERE b = ?1", .{"42"})).?.n);
+    const J = struct { j: []const u8 };
+    try testing.expectEqualStrings("{\"k\":\"42\",\"n\":42,\"f\":1.5}", (try pool.queryOne(a, J, "SELECT json_object('k', ?1, 'n', ?2, 'f', ?3) AS j", .{ "42", 42, 1.5 })).?.j);
+    // Integers still bind as integers (LIMIT).
+    try testing.expectEqual(1, (try pool.query(a, struct { s: []const u8 }, "SELECT s FROM t LIMIT ?1", .{1})).len);
 }

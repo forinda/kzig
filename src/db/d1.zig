@@ -5,6 +5,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const pg = @import("pg.zig");
+const Param = @import("db.zig").Param;
 const http_client = @import("../core/http_client.zig");
 
 const Allocator = std.mem.Allocator;
@@ -15,7 +16,7 @@ pub const max_params = 100;
 
 pub const Stmt = struct {
     sql: []const u8,
-    params: []const ?[]const u8 = &.{},
+    params: []const Param = &.{},
     /// A migration's foreign-key guard: its failure is ForeignKeyViolation.
     guard: bool = false,
 };
@@ -68,7 +69,7 @@ pub const Client = struct {
         c.gpa.destroy(c);
     }
 
-    pub fn run(c: *Client, sql: []const u8, params: []const ?[]const u8, ctx: anytype, comptime row: anytype) Error!u64 {
+    pub fn run(c: *Client, sql: []const u8, params: []const Param, ctx: anytype, comptime row: anytype) Error!u64 {
         var arena: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena.deinit();
         const a = arena.allocator();
@@ -173,24 +174,30 @@ pub const Client = struct {
     }
 };
 
-fn checkParams(params: []const ?[]const u8) Error!void {
+fn checkParams(params: []const Param) Error!void {
     if (params.len > max_params) {
         if (!builtin.is_test) std.log.err("db: d1: {d} parameters in one statement; D1 binds at most {d}", .{ params.len, max_params });
         return error.TooManyParameters;
     }
     // JSON carries text as UTF-8; D1's API has no way to send other bytes.
-    for (params) |p| if (p) |v| if (!std.unicode.utf8ValidateSlice(v)) {
+    for (params) |p| if (p.value) |v| if (!std.unicode.utf8ValidateSlice(v)) {
         if (!builtin.is_test) std.log.err("db: d1: a parameter isn't UTF-8 text (D1's API can't bind bytes)", .{});
         return error.DbError;
     };
 }
 
-/// A parameter: a canonical integer D1 can hold exactly as a JSON number
-/// (a string would bind as TEXT, and `LIMIT '5'` is a datatype mismatch),
-/// anything else as a string.
-fn writeParam(w: *std.Io.Writer, p: ?[]const u8) !void {
-    const v = p orelse return w.writeAll("null");
-    if (@import("sqlite_int.zig").canonicalInt(v)) |n| if (@abs(n) <= (1 << 53)) return w.writeAll(v);
+/// A parameter by its kind: an integer D1 can hold exactly, or a float, as
+/// a JSON number (a string binds as TEXT, and `LIMIT '5'` is a datatype
+/// mismatch); text as a string.
+fn writeParam(w: *std.Io.Writer, p: Param) !void {
+    const v = p.value orelse return w.writeAll("null");
+    const int = switch (p.kind) {
+        .integer => std.fmt.parseInt(i64, v, 10) catch null,
+        .auto => @import("sqlite_int.zig").canonicalInt(v),
+        .real, .text => null,
+    };
+    if (int) |n| if (@abs(n) <= (1 << 53)) return w.print("{d}", .{n});
+    if (p.kind == .real) if (std.fmt.parseFloat(f64, v) catch null) |f| if (std.math.isFinite(f)) return w.print("{d}", .{f});
     try std.json.Stringify.value(v, .{}, w);
 }
 
@@ -418,20 +425,15 @@ const FakeD1 = if (@import("kzig_options").sqlite) struct {
     /// One `{sql, params}`, answered as D1's `/raw` does.
     fn one(f: *FakeD1, a: std.mem.Allocator, stmt: std.json.Value, w: *std.Io.Writer) !void {
         const sql = stmt.object.get("sql").?.string;
-        var params: std.ArrayList(?[]const u8) = .empty;
-        var ints: std.ArrayList(bool) = .empty;
-        // As D1 binds them: a JSON string as TEXT, a number as INTEGER.
-        if (stmt.object.get("params")) |ps| for (ps.array.items) |p| {
-            try ints.append(a, p == .integer);
-            try params.append(a, switch (p) {
-                .null => null,
-                .string => |t| t,
-                .integer => |n| try std.fmt.allocPrint(a, "{d}", .{n}),
-                else => return error.BadParam,
-            });
-        };
-        f.conn.ints = ints.items;
-        defer f.conn.ints = null;
+        var params: std.ArrayList(Param) = .empty;
+        // As D1 binds them: a JSON string as TEXT, a number as a number.
+        if (stmt.object.get("params")) |ps| for (ps.array.items) |p| try params.append(a, switch (p) {
+            .null => .{ .value = null },
+            .string => |t| .{ .value = t, .kind = .text },
+            .integer => |n| .{ .value = try std.fmt.allocPrint(a, "{d}", .{n}), .kind = .integer },
+            .float => |x| .{ .value = try std.fmt.allocPrint(a, "{d}", .{x}), .kind = .real },
+            else => return error.BadParam,
+        });
         // `/raw`'s shape: column names once, rows as arrays.
         const Rows = struct {
             columns: std.Io.Writer.Allocating,
@@ -503,7 +505,7 @@ test "d1: no transactions; more than 100 parameters is refused before sending" {
     var pool = try fakePool(&fake, arena.allocator());
     defer pool.deinit();
     try testing.expectError(error.TransactionsUnsupported, pool.begin());
-    const params: [101]?[]const u8 = @splat("1");
+    const params: [101]Param = @splat(.{ .value = "1" });
     const before = fake.requests.load(.acquire);
     try testing.expectError(error.TooManyParameters, pool.execParams("SELECT 1", &params));
     try testing.expectEqual(before, fake.requests.load(.acquire));
@@ -632,4 +634,17 @@ test "d1: a rebuild that leaves a broken foreign key is ForeignKeyViolation, rol
     const dir = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     try testing.expectError(error.ForeignKeyViolation, migrate.latest(&pool, a, try migrate.load(testing.io, a, dir), .{ .table = "kzig_test_migrations" }));
     try testing.expectError(error.DbError, pool.exec("SELECT * FROM _kick_new_posts", .{}));
+}
+
+test "d1: parameters by Zig type: a numeric-looking string is text" {
+    if (FakeD1 == void) return error.SkipZigTest;
+    var fake: FakeD1 = undefined;
+    try fake.start();
+    defer fake.stop();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var pool = try fakePool(&fake, arena.allocator());
+    defer pool.deinit();
+    const J = struct { j: []const u8 };
+    try testing.expectEqualStrings("{\"k\":\"42\",\"n\":42}", (try pool.queryOne(arena.allocator(), J, "SELECT json_object('k', ?1, 'n', ?2) AS j", .{ "42", 42 })).?.j);
 }

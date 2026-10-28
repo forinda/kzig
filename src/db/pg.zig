@@ -10,6 +10,7 @@ const crl = @import("tls/crl.zig");
 const builtin = @import("builtin");
 const Timestamp = @import("timestamp.zig").Timestamp;
 const Dialect = @import("db.zig").Dialect;
+const Param = @import("db.zig").Param;
 
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -594,7 +595,7 @@ pub const Conn = struct {
     /// The extended protocol: Parse, Bind (text parameters), Describe,
     /// Execute, Sync. `row` gets each DataRow's values (null for NULL) with
     /// the column names; returns the affected-row count from the tag.
-    pub fn run(c: *Conn, sql: []const u8, params: []const ?[]const u8, ctx: anytype, comptime row: anytype) Error!u64 {
+    pub fn run(c: *Conn, sql: []const u8, params: []const Param, ctx: anytype, comptime row: anytype) Error!u64 {
         if (c.broken) return error.ServiceUnavailable;
         try c.begin('P');
         try c.cstr("");
@@ -606,7 +607,7 @@ pub const Conn = struct {
         try c.cstr("");
         try c.int16(0);
         try c.int16(@intCast(params.len));
-        for (params) |p| if (p) |v| {
+        for (params) |p| if (p.value) |v| {
             try c.int32(@intCast(v.len));
             try c.out.appendSlice(c.gpa, v);
         } else try c.int32(-1);
@@ -947,31 +948,31 @@ pub fn fromJson(comptime F: type, a: Allocator, v: std.json.Value) !F {
     }
 }
 
-/// A query's arguments (a tuple) as text parameters, in `a`.
-pub fn encodeArgs(a: Allocator, args: anytype, dialect: Dialect) ![]const ?[]const u8 {
+/// A query's arguments (a tuple) as parameters, in `a`.
+pub fn encodeArgs(a: Allocator, args: anytype, dialect: Dialect) ![]const Param {
     const info = @typeInfo(@TypeOf(args)).@"struct";
-    const out = try a.alloc(?[]const u8, info.field_names.len);
+    const out = try a.alloc(Param, info.field_names.len);
     inline for (info.field_names, 0..) |f, i| out[i] = try encodeValue(a, @field(args, f), dialect);
     return out;
 }
 
-/// A value as a text parameter. SQLite gets booleans as 1/0 and timestamps
-/// as kick/db stores them there.
-pub fn encodeValue(a: Allocator, v: anytype, dialect: Dialect) !?[]const u8 {
+/// A value as a parameter: its text, and its kind for SQLite. SQLite gets
+/// booleans as 1/0 and timestamps as kick/db stores them there.
+pub fn encodeValue(a: Allocator, v: anytype, dialect: Dialect) !Param {
     const T = @TypeOf(v);
-    if (T == std.json.Value) return try std.json.Stringify.valueAlloc(a, v, .{});
-    if (@typeInfo(T) == .@"struct" and @hasDecl(T, "toSqlite") and dialect == .sqlite) return try v.toSqlite(a);
-    if (@typeInfo(T) == .@"struct" and @hasDecl(T, "toPg")) return try v.toPg(a);
+    if (T == std.json.Value) return .{ .value = try std.json.Stringify.valueAlloc(a, v, .{}), .kind = .text };
+    if (@typeInfo(T) == .@"struct" and @hasDecl(T, "toSqlite") and dialect == .sqlite) return .{ .value = try v.toSqlite(a), .kind = .text };
+    if (@typeInfo(T) == .@"struct" and @hasDecl(T, "toPg")) return .{ .value = try v.toPg(a), .kind = .text };
     switch (@typeInfo(T)) {
-        .optional => return if (v) |x| try encodeValue(a, x, dialect) else null,
-        .null => return null,
-        .int, .comptime_int => return try std.fmt.allocPrint(a, "{d}", .{v}),
-        .float, .comptime_float => return try std.fmt.allocPrint(a, "{d}", .{v}),
-        .bool => return if (dialect == .sqlite) (if (v) "1" else "0") else if (v) "true" else "false",
-        .@"enum", .enum_literal => return @tagName(v),
+        .optional => return if (v) |x| try encodeValue(a, x, dialect) else .{ .value = null },
+        .null => return .{ .value = null },
+        .int, .comptime_int => return .{ .value = try std.fmt.allocPrint(a, "{d}", .{v}), .kind = .integer },
+        .float, .comptime_float => return .{ .value = try std.fmt.allocPrint(a, "{d}", .{v}), .kind = .real },
+        .bool => return if (dialect == .sqlite) .{ .value = if (v) "1" else "0", .kind = .integer } else .{ .value = if (v) "true" else "false", .kind = .text },
+        .@"enum", .enum_literal => return .{ .value = @tagName(v), .kind = .text },
         .pointer => |p| {
-            if (p.size == .slice and p.child == u8) return v;
-            if (p.size == .one and @typeInfo(p.child) == .array and @typeInfo(p.child).array.child == u8) return v;
+            if (p.size == .slice and p.child == u8) return .{ .value = v, .kind = .text };
+            if (p.size == .one and @typeInfo(p.child) == .array and @typeInfo(p.child).array.child == u8) return .{ .value = v, .kind = .text };
             @compileError("db: an argument can't be " ++ @typeName(T));
         },
         else => @compileError("db: an argument can't be " ++ @typeName(T)),
@@ -1031,13 +1032,16 @@ test "arguments encode as text" {
     const role: enum { admin } = .admin;
     const none: ?i32 = null;
     const p = try encodeArgs(arena.allocator(), .{ 7, "x", true, 1.5, none, role, @as(?[]const u8, "y") }, .postgres);
-    try testing.expectEqualStrings("7", p[0].?);
-    try testing.expectEqualStrings("x", p[1].?);
-    try testing.expectEqualStrings("true", p[2].?);
-    try testing.expectEqualStrings("1.5", p[3].?);
-    try testing.expectEqual(null, p[4]);
-    try testing.expectEqualStrings("admin", p[5].?);
-    try testing.expectEqualStrings("y", p[6].?);
+    try testing.expectEqualStrings("7", p[0].value.?);
+    try testing.expectEqual(.integer, p[0].kind);
+    try testing.expectEqualStrings("x", p[1].value.?);
+    try testing.expectEqual(.text, p[1].kind);
+    try testing.expectEqualStrings("true", p[2].value.?);
+    try testing.expectEqualStrings("1.5", p[3].value.?);
+    try testing.expectEqual(.real, p[3].kind);
+    try testing.expectEqual(null, p[4].value);
+    try testing.expectEqualStrings("admin", p[5].value.?);
+    try testing.expectEqualStrings("y", p[6].value.?);
 }
 
 test "Timestamp and JSON columns read and write" {
@@ -1051,8 +1055,8 @@ test "Timestamp and JSON columns read and write" {
     try testing.expectEqual(null, r.gone);
     try testing.expectError(error.DbDecode, decodeRow(Row, a, &.{ "at", "meta", "gone" }, &.{ "never", "{}", null }));
     const args = try encodeArgs(a, .{ Timestamp{ .us = 0 }, std.json.Value{ .bool = true } }, .postgres);
-    try testing.expectEqualStrings("1970-01-01T00:00:00Z", args[0].?);
-    try testing.expectEqualStrings("true", args[1].?);
+    try testing.expectEqualStrings("1970-01-01T00:00:00Z", args[0].value.?);
+    try testing.expectEqualStrings("true", args[1].value.?);
 }
 
 test "nested rows keep numbers exactly as Postgres wrote them" {

@@ -370,7 +370,7 @@ fn expectSql(q: anytype, opts: anytype, comptime first: bool, want: []const u8, 
     const got = try q.toSql(arena.allocator(), opts, first);
     try testing.expectEqualStrings(want, got.sql);
     try testing.expectEqual(params.len, got.params.len);
-    for (params, got.params) |p, g| try testing.expectEqualStrings(p, g.?);
+    for (params, got.params) |p, g| try testing.expectEqualStrings(p, g.value.?);
 }
 
 const test_client: query.Client(TestSchema) = .{ .conn = undefined };
