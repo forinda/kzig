@@ -1,5 +1,7 @@
 # kzig
 
+[Docs and API reference](https://forinda.github.io/kzig/)
+
 [KickJS](https://github.com/forinda/kick-js) for Zig: modules, controllers, services,
 middleware, context contributors and adapters, with KickJS's boot order and request pipeline —
 built on `comptime` instead of decorators, so a missing service or an unknown handler fails

@@ -37,6 +37,7 @@ zig build bench -Dhttpz -Doptimize=ReleaseFast && ./benchmarks/run.sh
 zig fmt build.zig src examples tests benchmarks              # Format
 zig fmt --check build.zig build.zig.zon src examples tests benchmarks      # Check formatting
 zig build --watch      # Rebuild on change
+zig build docs         # API reference (autodoc) into zig-out/docs; Pages publishes it with docs/index.html
 ```
 
 ## Repository Structure

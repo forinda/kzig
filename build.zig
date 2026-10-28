@@ -31,6 +31,11 @@ pub fn build(b: *std.Build) void {
     kzig_options.addOption(bool, "sqlite", sqlite);
     mod.addOptions("kzig_options", kzig_options);
 
+    // API reference (Zig's autodoc) in zig-out/docs; GitHub Pages publishes it.
+    const docs_obj = b.addObject(.{ .name = "kzig", .root_module = mod });
+    const docs_step = b.step("docs", "Build the API reference into zig-out/docs");
+    docs_step.dependOn(&b.addInstallDirectory(.{ .source_dir = docs_obj.getEmittedDocs(), .install_dir = .prefix, .install_subdir = "docs" }).step);
+
     const tests = b.addTest(.{ .root_module = mod });
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(runTests(b, tests));
