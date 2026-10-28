@@ -231,7 +231,8 @@ pub fn split(a: Allocator, sql: []const u8) ![]const []const u8 {
                 i = std.mem.findScalarPos(u8, sql, i, '\n') orelse sql.len;
             },
             '/' => if (i + 1 < sql.len and sql[i + 1] == '*') {
-                i = if (std.mem.findPos(u8, sql, i + 2, "*/")) |e| e + 1 else sql.len;
+                // From the `*` itself: `/*/` closes (kick/db scans so).
+                i = if (std.mem.findPos(u8, sql, i + 1, "*/")) |e| e + 1 else sql.len;
             },
             ';' => {
                 const s = std.mem.trim(u8, sql[start..i], " \t\r\n");
@@ -244,6 +245,14 @@ pub fn split(a: Allocator, sql: []const u8) ![]const []const u8 {
     const tail = std.mem.trim(u8, sql[@min(start, sql.len)..], " \t\r\n");
     if (tail.len > 0) try out.append(a, tail);
     return out.items;
+}
+
+test "split: `/*/` closes the comment it opens, as kick/db's scanner" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const got = try split(arena.allocator(), "SELECT 1 /*/ ; SELECT 2");
+    try std.testing.expectEqual(2, got.len);
+    try std.testing.expectEqualStrings("SELECT 1 /*/", got[0]);
 }
 
 test "split: at top-level semicolons only, as kick/db" {
