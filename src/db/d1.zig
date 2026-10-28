@@ -197,7 +197,14 @@ fn writeParam(w: *std.Io.Writer, p: Param) !void {
         .real, .text => null,
     };
     if (int) |n| if (@abs(n) <= (1 << 53)) return w.print("{d}", .{n});
-    if (p.kind == .real) if (std.fmt.parseFloat(f64, v) catch null) |f| if (std.math.isFinite(f)) return w.print("{d}", .{f});
+    if (p.kind == .real) if (std.fmt.parseFloat(f64, v) catch null) |f| if (std.math.isFinite(f)) {
+        // `2.0`, not `2`: D1 would read a whole number as an integer.
+        var buf: [64]u8 = undefined;
+        const text = try std.fmt.bufPrint(&buf, "{d}", .{f});
+        try w.writeAll(text);
+        if (std.mem.findAny(u8, text, ".eE") == null) try w.writeAll(".0");
+        return;
+    };
     try std.json.Stringify.value(v, .{}, w);
 }
 
@@ -675,4 +682,11 @@ test "d1: insertMany splits at D1's 100 parameters and runs as one batch" {
     for (rows[0..249], 0..) |*r, i| r.* = .{ .name = try std.fmt.allocPrint(a, "m{d}", .{i}) };
     try testing.expectError(error.Conflict, client.insertMany(a, .items, &rows, .{}));
     try testing.expectEqual(250, try client.selectFrom(.items).count(a));
+}
+
+test "d1 params: a whole float stays a float" {
+    var buf: [32]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeParam(&w, .{ .value = "2", .kind = .real });
+    try testing.expectEqualStrings("2.0", w.buffered());
 }

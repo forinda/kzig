@@ -961,13 +961,19 @@ pub fn encodeArgs(a: Allocator, args: anytype, dialect: Dialect) ![]const Param 
 pub fn encodeValue(a: Allocator, v: anytype, dialect: Dialect) !Param {
     const T = @TypeOf(v);
     if (T == std.json.Value) return .{ .value = try std.json.Stringify.valueAlloc(a, v, .{}), .kind = .text };
-    if (@typeInfo(T) == .@"struct" and @hasDecl(T, "toSqlite") and dialect == .sqlite) return .{ .value = try v.toSqlite(a), .kind = .text };
-    if (@typeInfo(T) == .@"struct" and @hasDecl(T, "toPg")) return .{ .value = try v.toPg(a), .kind = .text };
+    // A type's own text: what it is, only it knows (a decimal's digits bind
+    // as a number on SQLite, as before).
+    if (@typeInfo(T) == .@"struct" and @hasDecl(T, "toSqlite") and dialect == .sqlite) return .{ .value = try v.toSqlite(a) };
+    if (@typeInfo(T) == .@"struct" and @hasDecl(T, "toPg")) return .{ .value = try v.toPg(a) };
     switch (@typeInfo(T)) {
         .optional => return if (v) |x| try encodeValue(a, x, dialect) else .{ .value = null },
         .null => return .{ .value = null },
         .int, .comptime_int => return .{ .value = try std.fmt.allocPrint(a, "{d}", .{v}), .kind = .integer },
-        .float, .comptime_float => return .{ .value = try std.fmt.allocPrint(a, "{d}", .{v}), .kind = .real },
+        .float, .comptime_float => {
+            // SQLite has no NaN or infinity (a NaN binds as NULL there).
+            if (dialect == .sqlite and !std.math.isFinite(@as(f128, v))) return error.NonFiniteFloat;
+            return .{ .value = try std.fmt.allocPrint(a, "{d}", .{v}), .kind = .real };
+        },
         .bool => return if (dialect == .sqlite) .{ .value = if (v) "1" else "0", .kind = .integer } else .{ .value = if (v) "true" else "false", .kind = .text },
         .@"enum", .enum_literal => return .{ .value = @tagName(v), .kind = .text },
         .pointer => |p| {
@@ -1423,4 +1429,20 @@ test "channel_binding=require refuses a password request before sending anything
         try testing.expectError(error.ChannelBindingRequired, Conn.connect(testing.io, testing.allocator, cfg));
         try f.finish();
     }
+}
+
+test "parameters: a custom toPg type is raw text (its kind unknown); a non-finite float is refused for SQLite" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const Decimal = struct {
+        digits: []const u8,
+        pub fn toPg(d: @This(), _: Allocator) ![]const u8 {
+            return d.digits;
+        }
+    };
+    try testing.expectEqual(.auto, (try encodeValue(arena.allocator(), Decimal{ .digits = "123" }, .sqlite)).kind);
+    try testing.expectError(error.NonFiniteFloat, encodeValue(arena.allocator(), std.math.nan(f64), .sqlite));
+    try testing.expectError(error.NonFiniteFloat, encodeValue(arena.allocator(), std.math.inf(f64), .sqlite));
+    // Postgres has NaN and Infinity.
+    try testing.expectEqualStrings("nan", (try encodeValue(arena.allocator(), std.math.nan(f64), .postgres)).value.?);
 }
