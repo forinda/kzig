@@ -28,6 +28,7 @@ const kzig = b.dependency("kzig", .{ .target = target, .optimize = optimize });
 exe.root_module.addImport("kzig", kzig.module("kzig"));
 ```
 
-Then read [modules, controllers and services](guide/modules.md): it walks through the example
+The [tutorial](tutorial/index.md) takes it from there to a deployed app. Or read
+[modules, controllers and services](guide/modules.md): it walks through the example
 app, [`examples/task-api`](https://github.com/forinda/kzig/tree/main/examples/task-api), which
 ports the KickJS example apps module by module, with their tests.

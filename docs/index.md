@@ -30,6 +30,9 @@ pub const HelloModule = kzig.Module(.{
 });
 ```
 
+New here? The [tutorial](tutorial/index.md) builds a complete API, from `kzig new` to a Docker
+image: SQLite with migrations, validation, an API key, Swagger UI and tests.
+
 ## What's in it
 
 | | |

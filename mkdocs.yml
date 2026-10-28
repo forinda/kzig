@@ -41,6 +41,16 @@ extra:
 nav:
   - Home: index.md
   - Getting started: getting-started.md
+  - Tutorial:
+      - A bookmarks API: tutorial/index.md
+      - 1. Set up: tutorial/setup.md
+      - 2. A first module: tutorial/first-module.md
+      - 3. A database: tutorial/database.md
+      - 4. An API key: tutorial/api-key.md
+      - 5. API docs: tutorial/swagger.md
+      - 6. Tests: tutorial/tests.md
+      - 7. Production: tutorial/production.md
+      - 8. Docker: tutorial/docker.md
   - Guide:
       - Modules, controllers, services: guide/modules.md
       - Middleware and contributors: guide/middleware.md
