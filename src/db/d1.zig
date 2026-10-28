@@ -648,3 +648,31 @@ test "d1: parameters by Zig type: a numeric-looking string is text" {
     const J = struct { j: []const u8 };
     try testing.expectEqualStrings("{\"k\":\"42\",\"n\":42}", (try pool.queryOne(arena.allocator(), J, "SELECT json_object('k', ?1, 'n', ?2) AS j", .{ "42", 42 })).?.j);
 }
+
+test "d1: insertMany splits at D1's 100 parameters and runs as one batch" {
+    if (FakeD1 == void) return error.SkipZigTest;
+    var fake: FakeD1 = undefined;
+    try fake.start();
+    defer fake.stop();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var pool = try fakePool(&fake, a);
+    defer pool.deinit();
+    const schema = @import("schema.zig");
+    const items = schema.table("items", .{ .id = .{ .type = .serial, .primary_key = true }, .name = .{ .type = .text, .not_null = true, .unique = true } }, .{});
+    const S = schema.Schema(.{ .items = items }, .{ .dialect = .sqlite });
+    try pool.execScript("CREATE TABLE items (id integer PRIMARY KEY, name text NOT NULL UNIQUE)");
+    const client = @import("query.zig").Client(S).init(.{ .pool = &pool });
+    var rows: [250]S.Table(.items).Insert = undefined;
+    for (&rows, 0..) |*r, i| r.* = .{ .name = try std.fmt.allocPrint(a, "n{d}", .{i}) };
+    const before = fake.requests.load(.acquire);
+    try testing.expectEqual(250, try client.insertMany(a, .items, &rows, .{}));
+    try testing.expectEqual(before + 1, fake.requests.load(.acquire));
+    try testing.expectEqual(250, try client.selectFrom(.items).count(a));
+    // All or nothing: a duplicate in the last statement.
+    rows[249] = .{ .name = "n0" };
+    for (rows[0..249], 0..) |*r, i| r.* = .{ .name = try std.fmt.allocPrint(a, "m{d}", .{i}) };
+    try testing.expectError(error.Conflict, client.insertMany(a, .items, &rows, .{}));
+    try testing.expectEqual(250, try client.selectFrom(.items).count(a));
+}

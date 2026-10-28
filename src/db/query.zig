@@ -16,6 +16,13 @@ const EnumLiteral = @TypeOf(.enum_literal);
 pub const Sql = struct { sql: []const u8, params: []const dbm.Param, dialect: Dialect = .postgres };
 const Dialect = dbm.Dialect;
 
+pub const InsertManyOptions = struct {
+    /// Parameters one statement may bind; the database's limit by default.
+    max_params: ?usize = null,
+    /// Several statements in one transaction (D1: one batch).
+    atomic: bool = true,
+};
+
 /// Where queries run: the pool, or a transaction.
 pub const Conn = union(enum) { pool: *dbm.Pool, tx: *dbm.Tx };
 
@@ -52,6 +59,93 @@ pub fn Client(comptime S: type) type {
         /// with `columns`, `where`, `orderBy`, `limit`, `offset` and `with`.
         pub fn query(self: Self, comptime t: S.Tag) relational.Relational(S, @tagName(t)) {
             return .{ .conn = self.conn };
+        }
+
+        /// kick/db's `insertMany`: any number of rows, in as few statements as
+        /// the database's parameter limit allows (Postgres 65,535; SQLite
+        /// 32,766; D1 100), counted on the compiled SQL. With `.atomic` more
+        /// than one statement runs in one transaction (on D1: one batch).
+        /// The rows inserted.
+        pub fn insertMany(self: Self, a: Allocator, comptime t: S.Tag, rows: []const S.Table(t).Insert, opts: InsertManyOptions) !u64 {
+            const chunks = try self.chunksOf(a, t, rows, opts);
+            if (chunks.len > 1 and opts.atomic) switch (self.conn) {
+                .pool => |pool| if (pool.batchOnly()) {
+                    const stmts = try a.alloc(@import("d1.zig").Stmt, chunks.len);
+                    for (chunks, stmts) |chunk, *st| {
+                        const q = try self.insertInto(t).valuesMany(chunk).toSql(a);
+                        st.* = .{ .sql = q.sql, .params = q.params };
+                    }
+                    try pool.batch(stmts);
+                    return rows.len;
+                } else {
+                    var tx = try pool.begin();
+                    defer tx.deinit();
+                    const n = try Self.init(.{ .tx = &tx }).insertChunks(a, t, chunks);
+                    try tx.commit();
+                    return n;
+                },
+                .tx => {},
+            };
+            return self.insertChunks(a, t, chunks);
+        }
+
+        /// `insertMany`, the stored rows back in input order. On D1 more
+        /// than one statement can't be atomic (a batch's rows don't come
+        /// back): `.atomic = false`, or `error.TransactionsUnsupported`.
+        pub fn insertManyReturning(self: Self, a: Allocator, comptime t: S.Tag, rows: []const S.Table(t).Insert, opts: InsertManyOptions) ![]S.Table(t).Row {
+            const chunks = try self.chunksOf(a, t, rows, opts);
+            if (chunks.len > 1 and opts.atomic) switch (self.conn) {
+                .pool => |pool| {
+                    var tx = try pool.begin(); // D1: TransactionsUnsupported
+                    defer tx.deinit();
+                    const out = try Self.init(.{ .tx = &tx }).returningChunks(a, t, chunks);
+                    try tx.commit();
+                    return out;
+                },
+                .tx => {},
+            };
+            return self.returningChunks(a, t, chunks);
+        }
+
+        fn insertChunks(self: Self, a: Allocator, comptime t: S.Tag, chunks: []const []const S.Table(t).Insert) !u64 {
+            var n: u64 = 0;
+            for (chunks) |chunk| n += try self.insertInto(t).valuesMany(chunk).execute(a);
+            return n;
+        }
+
+        fn returningChunks(self: Self, a: Allocator, comptime t: S.Tag, chunks: []const []const S.Table(t).Insert) ![]S.Table(t).Row {
+            var out: std.ArrayList(S.Table(t).Row) = .empty;
+            for (chunks) |chunk| try out.appendSlice(a, try self.insertInto(t).valuesMany(chunk).returningAll().execute(a));
+            return out.items;
+        }
+
+        /// kick/db's `chunksFor`: a first guess of one parameter per column,
+        /// shrunk in proportion when a chunk's statement binds too many.
+        fn chunksOf(self: Self, a: Allocator, comptime t: S.Tag, rows: []const S.Table(t).Insert, opts: InsertManyOptions) ![]const []const S.Table(t).Insert {
+            const pool = switch (self.conn) {
+                .pool => |p| p,
+                .tx => |tx| tx.pool,
+            };
+            const max: usize = opts.max_params orelse if (pool.batchOnly()) @as(usize, @import("d1.zig").max_params) else switch (S.dialect) {
+                .postgres => 65_535,
+                .sqlite => 32_766,
+            };
+            if (max == 0) return error.MaxParamsTooSmall;
+            var size: usize = @max(1, max / @max(1, S.Table(t).column_keys.len));
+            var out: std.ArrayList([]const S.Table(t).Insert) = .empty;
+            var i: usize = 0;
+            while (i < rows.len) {
+                const chunk = rows[i..@min(rows.len, i + size)];
+                const n = (try self.insertInto(t).valuesMany(chunk).toSql(a)).params.len;
+                if (n > max) {
+                    if (chunk.len == 1) return error.MaxParamsTooSmall;
+                    size = @max(1, @min(chunk.len - 1, chunk.len * max / n));
+                    continue;
+                }
+                try out.append(a, chunk);
+                i += chunk.len;
+            }
+            return out.items;
         }
 
         /// kick/db's `upsert`: insert, or update the row whose `target` key
@@ -1311,6 +1405,32 @@ test "sqlite: the builder against a Postgres pool, or the reverse, is refused" {
     defer arena.deinit();
     const db: Client(Lite) = .init(.{ .pool = &pool });
     try testing.expectError(error.DialectMismatch, db.selectFrom(.teams).execute(arena.allocator()));
+}
+
+test "insertMany: rows split to fit max_params, in one transaction" {
+    if (!@import("kzig_options").sqlite) return error.SkipZigTest;
+    var pool: dbm.Pool = try .init(testing.io, testing.allocator, .{ .url = "sqlite::memory:" });
+    defer pool.deinit();
+    try setupLite(&pool);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const db: Client(Lite) = .init(.{ .pool = &pool });
+    const TeamInsert = Lite.Table(.teams).Insert;
+    var rows: [250]TeamInsert = undefined;
+    for (&rows, 0..) |*r, i| r.* = .{ .title = try std.fmt.allocPrint(a, "t{d}", .{i}) };
+    try testing.expectEqual(250, try db.insertMany(a, .teams, &rows, .{ .max_params = 100 }));
+    try testing.expectEqual(250, try db.selectFrom(.teams).count(a));
+    // A failure in the last statement takes the first ones with it.
+    var more: [150]TeamInsert = undefined;
+    for (&more, 0..) |*r, i| r.* = .{ .title = try std.fmt.allocPrint(a, "u{d}", .{i}) };
+    more[149] = .{ .title = "t0" }; // taken
+    try testing.expectError(error.Conflict, db.insertMany(a, .teams, &more, .{ .max_params = 100 }));
+    try testing.expectEqual(250, try db.selectFrom(.teams).count(a));
+    const back = try db.insertManyReturning(a, .teams, more[0..120], .{ .max_params = 50 });
+    try testing.expectEqual(120, back.len);
+    try testing.expectEqualStrings("u119", back[119].title);
+    try testing.expectError(error.MaxParamsTooSmall, db.insertMany(a, .people, &.{.{ .name = "a", .age = 1 }}, .{ .max_params = 1 }));
 }
 
 fn setupLite(pool: *dbm.Pool) !void {
