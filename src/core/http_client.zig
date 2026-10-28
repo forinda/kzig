@@ -50,7 +50,8 @@ pub const Reply = struct { status: std.http.Status, body: []u8 };
 
 /// POST `body` (JSON) and read the answer into `a`. A server silent for
 /// `timeout_ms` (0: none) is `error.Timeout`; no redirect is followed, so a
-/// token in `authorization` goes nowhere else.
+/// token in `authorization` goes nowhere else. A write that timed out may
+/// still have been applied by the server.
 // ponytail: as S3, the timeout starts once connected (Io.Threaded can't time
 // out a connect).
 pub fn postJson(h: *std.http.Client, io: Io, a: Allocator, url: []const u8, authorization: ?[]const u8, body: []const u8, timeout_ms: u32, max_bytes: usize) !Reply {
@@ -61,13 +62,17 @@ pub fn postJson(h: *std.http.Client, io: Io, a: Allocator, url: []const u8, auth
         .headers = .{
             .content_type = .{ .override = "application/json" },
             .authorization = if (authorization) |v| .{ .override = v } else .default,
-            .accept_encoding = .omit,
+            // Bodies are read as sent: ask for them uncompressed.
+            .accept_encoding = .{ .override = "identity" },
         },
     });
     defer req.deinit();
     var dog: Watchdog = .{ .io = io, .stream = req.connection.?.stream_reader.stream, .ms = timeout_ms };
     dog.arm();
-    var watching = if (timeout_ms > 0) io.concurrent(Watchdog.watch, .{&dog}) catch null else null;
+    var watching = if (timeout_ms > 0) io.concurrent(Watchdog.watch, .{&dog}) catch |err| blk: {
+        std.log.warn("http: no timeout for this request: {t}", .{err});
+        break :blk null;
+    } else null;
     defer {
         if (watching) |*w| w.cancel(io) catch {};
         if (dog.fired.load(.acquire)) req.connection.?.closing = true;
@@ -93,7 +98,8 @@ fn exchange(req: *std.http.Client.Request, dog: *Watchdog, a: Allocator, body: [
     var transfer: [8192]u8 = undefined;
     const rd = response.reader(&transfer);
     while (true) {
-        _ = rd.stream(&out.writer, .limited(64 * 1024)) catch |err| switch (err) {
+        // Small reads: a slow but steady answer keeps the watchdog armed.
+        _ = rd.stream(&out.writer, .limited(4096)) catch |err| switch (err) {
             error.EndOfStream => break,
             error.WriteFailed => return error.OutOfMemory,
             error.ReadFailed => |e| return e,
