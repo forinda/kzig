@@ -8,6 +8,7 @@ site_dir: _site
 
 theme:
   name: material
+  custom_dir: overrides # main.html: the Search Console meta tag
   features:
     - navigation.sections
     - navigation.top
