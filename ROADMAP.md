@@ -471,6 +471,10 @@ bind them either).
 - [x] S3's HTTP client refreshes its TLS clock too
 - [ ] A live D1 test (Cloudflare credentials in CI)
 
+Not covered: integers wider than i64 (and on D1 past 2^53) bind as text; the hourly TLS-clock
+refresh can race a handshake reading std's `now` without its lock (std's own TODO); on D1 any
+"malformed JSON" error in a migration batch reads as `ForeignKeyViolation`, as in kick/db.
+
 ### Later
 
 SSE, a WebSocket broker (Redis), serverless cron triggers,
