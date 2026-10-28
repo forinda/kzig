@@ -289,13 +289,8 @@ pub fn rollback(pool: *db.Pool, a: Allocator, list: []const Migration, o: Option
 fn applyOne(pool: *db.Pool, a: Allocator, id: []const u8, sql: []const u8, record: []const u8, args: anytype) !void {
     if (pool.batchOnly()) return applyBatch(pool, a, id, sql, record, args);
     const rebuilt = if (pool.dialect() == .sqlite) try rebuiltTables(a, sql) else &.{};
-    var triggers: []const []const u8 = &.{};
-    if (rebuilt.len > 0) {
-        var list: std.ArrayList([]const u8) = .empty;
-        for (rebuilt) |t| for (try pool.query(a, struct { sql: []const u8 }, "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ?1", .{t})) |r|
-            try list.append(a, r.sql);
-        triggers = list.items;
-    }
+    const triggers = try triggersOf(pool, a, rebuilt);
+    try checkTriggers(a, triggers, sql);
     var tx = if (rebuilt.len > 0)
         try pool.beginWith(.{ .before = "PRAGMA foreign_keys = OFF", .after = "PRAGMA foreign_keys = ON" })
     else
@@ -309,7 +304,7 @@ fn applyOne(pool: *db.Pool, a: Allocator, id: []const u8, sql: []const u8, recor
         if (!builtin.is_test) std.log.err("migration {s} failed; rolled back", .{id});
         return err;
     };
-    for (triggers) |t| try tx.execScript(t);
+    for (triggers) |t| try tx.execScript(t.sql);
     _ = try tx.exec(record, args);
     if (rebuilt.len > 0) {
         for (try tx.query(a, Broken, check, .{})) |r| for (rebuilt) |t| {
@@ -334,8 +329,9 @@ fn applyBatch(pool: *db.Pool, a: Allocator, id: []const u8, sql: []const u8, rec
     try refuseCascadingRebuild(pool, a, id, sql, rebuilt);
     var stmts: std.ArrayList(d1.Stmt) = .empty;
     for (try d1.split(a, sql)) |s| try stmts.append(a, .{ .sql = s });
-    for (rebuilt) |t| for (try pool.query(a, struct { sql: []const u8 }, "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ?1", .{t})) |r|
-        try stmts.append(a, .{ .sql = r.sql });
+    const triggers = try triggersOf(pool, a, rebuilt);
+    try checkTriggers(a, triggers, sql);
+    for (triggers) |t| try stmts.append(a, .{ .sql = t.sql });
     try stmts.append(a, .{ .sql = record, .params = try @import("pg.zig").encodeArgs(a, args, .sqlite) });
     if (rebuilt.len > 0) {
         // Fails the batch (json() of a non-JSON string) when a rebuilt table
@@ -343,6 +339,7 @@ fn applyBatch(pool: *db.Pool, a: Allocator, id: []const u8, sql: []const u8, rec
         var marks: std.ArrayList(u8) = .empty;
         for (rebuilt, 1..) |_, i| try marks.print(a, "{s}?{d}", .{ if (i > 1) ", " else "", i });
         try stmts.append(a, .{
+            .guard = true,
             .sql = try std.fmt.allocPrint(a, "SELECT CASE WHEN EXISTS (SELECT 1 FROM pragma_foreign_key_check WHERE \"table\" IN ({s}) OR \"parent\" IN ({s})) THEN json('not json') END", .{ marks.items, marks.items }),
             .params = blk: {
                 const ps = try a.alloc(?[]const u8, rebuilt.len);
@@ -401,6 +398,98 @@ pub fn droppedTables(a: Allocator, sql: []const u8) ![]const []const u8 {
 fn contains(list: []const []const u8, x: []const u8) bool {
     for (list) |y| if (std.mem.eql(u8, x, y)) return true;
     return false;
+}
+
+pub const TriggerRow = struct { name: []const u8, tbl_name: []const u8, sql: []const u8 };
+
+/// The rebuilt tables' triggers: a rebuild drops them with the old table.
+fn triggersOf(pool: *db.Pool, a: Allocator, rebuilt: []const []const u8) ![]const TriggerRow {
+    var list: std.ArrayList(TriggerRow) = .empty;
+    for (rebuilt) |t| try list.appendSlice(a, try pool.query(a, TriggerRow, "SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ?1", .{t}));
+    return list.items;
+}
+
+/// kick/db's `checkTriggers`: a trigger using `new.x` / `old.x` for a column
+/// the rebuilt table no longer has would be made again, then fail every
+/// write that fires it; the migration is refused first.
+pub fn checkTriggers(a: Allocator, triggers: []const TriggerRow, sql: []const u8) !void {
+    for (triggers) |t| {
+        const columns = try rebuiltColumns(a, sql, t.tbl_name) orelse continue;
+        const code = try withoutLiterals(a, t.sql);
+        var i: usize = 0;
+        while (i + 4 <= code.len) : (i += 1) {
+            const word = code[i..][0..4];
+            if (!(std.ascii.eqlIgnoreCase(word, "new.") or std.ascii.eqlIgnoreCase(word, "old."))) continue;
+            if (i > 0 and (std.ascii.isAlphanumeric(code[i - 1]) or code[i - 1] == '_')) continue;
+            var j = i + 4;
+            var column: std.ArrayList(u8) = .empty;
+            if (j < code.len and code[j] == '"') {
+                j += 1;
+                while (j < code.len) : (j += 1) {
+                    if (code[j] == '"') {
+                        if (j + 1 < code.len and code[j + 1] == '"') j += 1 else break;
+                    }
+                    try column.append(a, std.ascii.toLower(code[j]));
+                }
+            } else while (j < code.len and (std.ascii.isAlphanumeric(code[j]) or code[j] == '_')) : (j += 1) try column.append(a, std.ascii.toLower(code[j]));
+            if (column.items.len == 0 or contains(columns, column.items)) continue;
+            if (!builtin.is_test) std.log.err("trigger {s} on {s} uses {s}, which this migration's rebuild of {s} no longer has: drop or rewrite the trigger, then migrate", .{ t.name, t.tbl_name, column.items, t.tbl_name });
+            return error.TriggerUsesDroppedColumn;
+        }
+    }
+}
+
+/// A rebuilt table's columns (lowercased: SQLite ignores ASCII case), from
+/// the migration's `CREATE TABLE "_kick_new_<table>" (`.
+fn rebuiltColumns(a: Allocator, sql: []const u8, table: []const u8) !?[]const []const u8 {
+    var create: std.ArrayList(u8) = .empty;
+    try create.appendSlice(a, "CREATE TABLE \"_kick_new_");
+    for (table) |ch| try create.appendSlice(a, if (ch == '"') "\"\"" else &.{ch});
+    try create.appendSlice(a, "\" (");
+    const start = std.mem.find(u8, sql, create.items) orelse return null;
+    const end = std.mem.findPos(u8, sql, start, "\n);") orelse sql.len;
+    var out: std.ArrayList([]const u8) = .empty;
+    var lines = std.mem.splitScalar(u8, sql[start..end], '\n');
+    _ = lines.next();
+    while (lines.next()) |line| {
+        const l = std.mem.trimStart(u8, line, " \t");
+        if (l.len == line.len or l.len == 0 or l[0] != '"') continue;
+        var name: std.ArrayList(u8) = .empty;
+        var j: usize = 1;
+        while (j < l.len) : (j += 1) {
+            if (l[j] == '"') {
+                if (j + 1 < l.len and l[j + 1] == '"') j += 1 else break;
+            }
+            try name.append(a, std.ascii.toLower(l[j]));
+        }
+        try out.append(a, name.items);
+    }
+    return out.items;
+}
+
+/// String literals and comments blanked: `'new.removed'` in a message is text.
+fn withoutLiterals(a: Allocator, sql: []const u8) ![]const u8 {
+    const out = try a.dupe(u8, sql);
+    var i: usize = 0;
+    while (i < out.len) {
+        const from = i;
+        if (out[i] == '\'') {
+            i += 1;
+            while (i < out.len) : (i += 1) if (out[i] == '\'') {
+                if (i + 1 < out.len and out[i + 1] == '\'') i += 1 else break;
+            };
+            i = @min(i + 1, out.len);
+        } else if (std.mem.startsWith(u8, out[i..], "--")) {
+            i = std.mem.findScalarPos(u8, out, i, '\n') orelse out.len;
+        } else if (std.mem.startsWith(u8, out[i..], "/*")) {
+            i = if (std.mem.findPos(u8, out, i + 2, "*/")) |e| e + 2 else out.len;
+        } else {
+            i += 1;
+            continue;
+        }
+        @memset(out[from..i], ' ');
+    }
+    return out;
 }
 
 /// The tables a migration rebuilds: `ALTER TABLE "_kick_new_<t>" RENAME TO`.
@@ -779,4 +868,42 @@ test "libsql (LIBSQL_TEST_URL): migrations, a rebuild of a referenced table in o
     try testing.expectEqual(2, (try latest(&pool, a, list, opts)).applied);
     for (try status(&pool, a, list, opts)) |st| try testing.expectEqual(.applied, st.state);
     try testing.expectEqual(1, (try pool.queryOne(a, struct { n: i64 }, "SELECT count(*) AS n FROM posts", .{})).?.n);
+}
+
+test "SQLite: a rebuild that drops a column a trigger uses is refused, nothing applied" {
+    if (!@import("kzig_options").sqlite) return error.SkipZigTest;
+    var pool: db.Pool = try .init(testing.io, testing.allocator, .{ .url = "sqlite::memory:" });
+    defer pool.deinit();
+    try pool.execScript(
+        \\CREATE TABLE "users" ("id" INTEGER PRIMARY KEY, "name" TEXT, "nick" TEXT);
+        \\CREATE TABLE "audit" ("v" TEXT);
+        \\CREATE TRIGGER "users_nick" AFTER UPDATE ON "users" BEGIN INSERT INTO "audit" VALUES ('new.nick: ' || NEW."nick"); END;
+    );
+    var m = try TmpMigrations.init();
+    defer m.deinit();
+    try m.add("20260101_000000_a",
+        \\CREATE TABLE "_kick_new_users" (
+        \\  "id" INTEGER PRIMARY KEY,
+        \\  "name" TEXT
+        \\);
+        \\INSERT INTO "_kick_new_users" ("id", "name") SELECT "id", "name" FROM "users";
+        \\DROP TABLE "users";
+        \\ALTER TABLE "_kick_new_users" RENAME TO "users";
+    , "");
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectError(error.TriggerUsesDroppedColumn, latest(&pool, a, try load(testing.io, a, m.path), opts));
+    try testing.expectEqual(1, (try pool.queryOne(a, struct { n: i64 }, "SELECT count(*) AS n FROM pragma_table_info('users') WHERE name = 'nick'", .{})).?.n);
+}
+
+test "triggers: new./old. columns in code, not in strings or comments" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const sql = "CREATE TABLE \"_kick_new_t\" (\n  \"id\" INTEGER,\n  \"Name\" TEXT\n);";
+    try checkTriggers(a, &.{.{ .name = "ok", .tbl_name = "t", .sql = "CREATE TRIGGER ok AFTER INSERT ON t BEGIN SELECT new.name, OLD.\"id\", 'new.gone' -- old.gone\n; END" }}, sql);
+    try testing.expectError(error.TriggerUsesDroppedColumn, checkTriggers(a, &.{.{ .name = "bad", .tbl_name = "t", .sql = "CREATE TRIGGER bad AFTER INSERT ON t BEGIN SELECT new.gone; END" }}, sql));
+    // A table the migration doesn't rebuild isn't checked.
+    try checkTriggers(a, &.{.{ .name = "other", .tbl_name = "u", .sql = "CREATE TRIGGER other AFTER INSERT ON u BEGIN SELECT new.gone; END" }}, sql);
 }

@@ -131,6 +131,8 @@ pub const Error = error{
     TooManyParameters,
     /// The transaction can't go on: a remote SQLite's stream for it broke.
     TransactionAborted,
+    /// A migration left a foreign key pointing at a missing row (rolled back).
+    ForeignKeyViolation,
     /// SQLSTATE 23505: a unique constraint (409 through the framework).
     Conflict,
     /// The connection broke; it is not reused.

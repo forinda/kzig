@@ -13,7 +13,12 @@ const Error = pg.Error;
 /// D1 binds at most 100 parameters per statement.
 pub const max_params = 100;
 
-pub const Stmt = struct { sql: []const u8, params: []const ?[]const u8 = &.{} };
+pub const Stmt = struct {
+    sql: []const u8,
+    params: []const ?[]const u8 = &.{},
+    /// A migration's foreign-key guard: its failure is ForeignKeyViolation.
+    guard: bool = false,
+};
 
 pub const Client = struct {
     gpa: Allocator,
@@ -120,11 +125,28 @@ pub const Client = struct {
             w.writeAll("]}") catch |e| break :blk e;
         }) catch return error.OutOfMemory;
         for (stmts) |s| try checkParams(s.params);
-        _ = try c.post(arena.allocator(), body.written());
+        var message: []const u8 = "";
+        _ = c.postWith(arena.allocator(), body.written(), &message) catch |err| {
+            // The guard fails with SQLite's own "malformed JSON": say what it means.
+            const guarded = for (stmts) |s| {
+                if (s.guard) break true;
+            } else false;
+            if (err == error.DbError and guarded and std.ascii.findIgnoreCase(message, "malformed JSON") != null) {
+                if (!builtin.is_test) std.log.err("db: d1: the migration left rows whose foreign key points at a missing row; rolled back", .{});
+                return error.ForeignKeyViolation;
+            }
+            return err;
+        };
     }
 
     /// The request; its `result` array, or the error D1 reports.
     fn post(c: *Client, a: Allocator, body: []const u8) Error![]const std.json.Value {
+        var message: []const u8 = "";
+        return c.postWith(a, body, &message);
+    }
+
+    /// `post`, with D1's error message (in `a`) when it reports one.
+    fn postWith(c: *Client, a: Allocator, body: []const u8, message_out: *[]const u8) Error![]const std.json.Value {
         const res = http_client.postJson(&c.http, c.io, a, c.endpoint, c.authorization, body, c.timeout_ms, 64 << 20) catch |err| {
             if (!builtin.is_test) std.log.err("db: d1: {t}", .{err});
             return if (err == error.OutOfMemory) error.OutOfMemory else error.ServiceUnavailable;
@@ -137,6 +159,7 @@ pub const Client = struct {
         if (ok == null or ok.? != .bool or !ok.?.bool) {
             const errors = field(v, "errors") orelse .null;
             const message = if (errors == .array and errors.array.items.len > 0) (if (field(errors.array.items[0], "message")) |m| (if (m == .string) m.string else "") else "") else "";
+            message_out.* = message;
             if (!builtin.is_test) std.log.err("db: d1: HTTP {d}: {s}", .{ @backingInt(res.status), message });
             if (std.mem.find(u8, message, "UNIQUE constraint failed") != null) return error.Conflict;
             // Not a statement's error: the token, the database, the service.
@@ -577,4 +600,36 @@ test "d1: a server that never answers is ServiceUnavailable after request_timeou
     var pool: db.Pool = try .init(testing.io, testing.allocator, .{ .url = try fake.url(arena.allocator()), .request_timeout_ms = 200 });
     defer pool.deinit();
     try testing.expectError(error.ServiceUnavailable, pool.exec("SELECT 1", .{}));
+}
+
+test "d1: a rebuild that leaves a broken foreign key is ForeignKeyViolation, rolled back" {
+    if (FakeD1 == void) return error.SkipZigTest;
+    var fake: FakeD1 = undefined;
+    try fake.start();
+    defer fake.stop();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var pool = try fakePool(&fake, a);
+    defer pool.deinit();
+    // An orphan the copy carries over (keys off, so only the guard sees it).
+    try fake.conn.script(
+        \\PRAGMA foreign_keys = OFF;
+        \\CREATE TABLE "users" ("id" INTEGER PRIMARY KEY);
+        \\CREATE TABLE "posts" ("id" INTEGER PRIMARY KEY, "authorId" INTEGER REFERENCES "users" ("id"));
+        \\INSERT INTO "posts" VALUES (1, 99);
+    );
+    const migrate = @import("migrate.zig");
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "20260101_000000_a");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "20260101_000000_a/up.sql", .data =
+        \\CREATE TABLE "_kick_new_posts" ("id" INTEGER PRIMARY KEY, "authorId" INTEGER REFERENCES "users" ("id"));
+        \\INSERT INTO "_kick_new_posts" ("id", "authorId") SELECT "id", "authorId" FROM "posts";
+        \\DROP TABLE "posts";
+        \\ALTER TABLE "_kick_new_posts" RENAME TO "posts";
+    });
+    const dir = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    try testing.expectError(error.ForeignKeyViolation, migrate.latest(&pool, a, try migrate.load(testing.io, a, dir), .{ .table = "kzig_test_migrations" }));
+    try testing.expectError(error.DbError, pool.exec("SELECT * FROM _kick_new_posts", .{}));
 }
