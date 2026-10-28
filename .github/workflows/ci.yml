@@ -7,6 +7,7 @@ on:
 
 jobs:
   test:
+    timeout-minutes: 45
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
@@ -18,13 +19,15 @@ jobs:
         with:
           version: 0.17.0
       - run: zig fmt --check build.zig build.zig.zon src examples tests benchmarks
-      - run: zig build test -Dhttpz -Dsqlite -Doptimize=${{ matrix.optimize }} --summary all
+      # A stuck test is named and killed rather than hanging the job.
+      - run: zig build test -Dhttpz -Dsqlite -Doptimize=${{ matrix.optimize }} --summary all --test-timeout 3m
       - run: ./scripts/scaffold-check.sh
         if: matrix.optimize == 'Debug'
 
   # The S3 driver against a real S3 API (SeaweedFS checks SigV4 like AWS),
   # and kzig.db against Postgres and libsql.
   integration:
+    timeout-minutes: 45
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -95,7 +98,7 @@ jobs:
         run: |
           docker run -d --name libsql -p 8080:8080 ghcr.io/tursodatabase/libsql-server@sha256:6dd3eb276d9d3604e4a48ac4a999a2e267814732d57d7e94c04ba71482333a67
           for i in $(seq 60); do curl -s -o /dev/null -X POST localhost:8080/v2/pipeline -d '{"requests":[]}' && break; sleep 1; done
-      - run: zig build test --summary all
+      - run: zig build test --summary all --test-timeout 3m
         env:
           LIBSQL_TEST_URL: http://127.0.0.1:8080
           DATABASE_URL: postgres://kzig:kzigpass@localhost:5432/kzig_test
