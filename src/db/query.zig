@@ -89,7 +89,8 @@ pub fn Client(comptime S: type) type {
             return self.insertChunks(a, t, chunks);
         }
 
-        /// `insertMany`, the stored rows back in input order. On D1 more
+        /// `insertMany`, the stored rows back, chunk by chunk (within a
+        /// statement, in the order the database returns them). On D1 more
         /// than one statement can't be atomic (a batch's rows don't come
         /// back): `.atomic = false`, or `error.TransactionsUnsupported`.
         pub fn insertManyReturning(self: Self, a: Allocator, comptime t: S.Tag, rows: []const S.Table(t).Insert, opts: InsertManyOptions) ![]S.Table(t).Row {
@@ -131,7 +132,15 @@ pub fn Client(comptime S: type) type {
                 .sqlite => 32_766,
             };
             if (max == 0) return error.MaxParamsTooSmall;
-            var size: usize = @max(1, max / @max(1, S.Table(t).column_keys.len));
+            // The columns any row gives (kick/db's first guess), not every one.
+            var given: usize = 0;
+            inline for (S.Table(t).column_keys) |k| {
+                const gives = if (comptime @typeInfo(@FieldType(S.Table(t).Insert, k)) != .optional) rows.len > 0 else for (rows) |r| {
+                    if (@field(r, k) != null) break true;
+                } else false;
+                if (gives) given += 1;
+            }
+            var size: usize = @max(1, max / @max(1, given));
             var out: std.ArrayList([]const S.Table(t).Insert) = .empty;
             var i: usize = 0;
             while (i < rows.len) {
@@ -1431,6 +1440,17 @@ test "insertMany: rows split to fit max_params, in one transaction" {
     try testing.expectEqual(120, back.len);
     try testing.expectEqualStrings("u119", back[119].title);
     try testing.expectError(error.MaxParamsTooSmall, db.insertMany(a, .people, &.{.{ .name = "a", .age = 1 }}, .{ .max_params = 1 }));
+}
+
+test "insertMany: the first chunk guess counts the columns rows give, not the table's" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var pool: dbm.Pool = .{ .io = testing.io, .gpa = testing.allocator, .driver = .{ .pg = undefined }, .arena = .init(testing.allocator), .permits = .{ .permits = 0 } };
+    const db: Client(Lite) = .init(.{ .pool = &pool });
+    var rows: [100]Lite.Table(.people).Insert = undefined;
+    for (&rows) |*r| r.* = .{ .name = "x" };
+    try testing.expectEqual(1, (try db.chunksOf(a, .people, &rows, .{ .max_params = 100 })).len);
 }
 
 fn setupLite(pool: *dbm.Pool) !void {
